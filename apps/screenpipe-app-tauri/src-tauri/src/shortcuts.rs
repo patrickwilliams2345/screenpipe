@@ -32,7 +32,7 @@ struct ShortcutConfig {
 }
 
 impl ShortcutConfig {
-    async fn from_store(app: &AppHandle) -> Result<Self, String> {
+    fn from_store(app: &AppHandle) -> Result<Self, String> {
         let store = SettingsStore::get(app)
             .unwrap_or_default()
             .unwrap_or_default();
@@ -124,7 +124,12 @@ pub async fn update_global_shortcuts(
     stop_audio_shortcut: String,
     _profile_shortcuts: HashMap<String, String>,
 ) -> Result<(), String> {
-    let store_config = ShortcutConfig::from_store(&app).await?;
+    let app_clone = app.clone();
+    let store_config = tokio::task::spawn_blocking(move || {
+        ShortcutConfig::from_store(&app_clone)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     let config = ShortcutConfig {
         show: show_shortcut,
         start: start_shortcut,
@@ -140,7 +145,12 @@ pub async fn update_global_shortcuts(
 }
 
 pub async fn initialize_global_shortcuts(app: &AppHandle) -> Result<(), String> {
-    let config = ShortcutConfig::from_store(app).await?;
+    let app_clone = app.clone();
+    let config = tokio::task::spawn_blocking(move || {
+        ShortcutConfig::from_store(&app_clone)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     apply_shortcuts(app, &config).await
 }
 

@@ -497,7 +497,7 @@ async fn set_window_size(
 pub fn spawn_server(app_handle: tauri::AppHandle, port: u16) -> mpsc::Sender<()> {
     let (tx, mut rx) = mpsc::channel(1);
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         tokio::select! {
             _ = run_server(app_handle, port) => {},
             _ = rx.recv() => {
