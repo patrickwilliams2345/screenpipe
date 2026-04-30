@@ -143,6 +143,16 @@ commits: `28e5c247`
 - [ ] **Mic disconnect false-positives on sleep/wake** — Put the computer to sleep and wake it up. Verify that no false-positive mic disconnect notifications or logs are generated. (`796baa619`)
 
 
+#### Audio device hijacking detection
+
+commits: `a2e89b2ae`, `357e4dfcc`
+
+- [ ] **Zero-fill detection on input device** — Start recording, then use a third-party app (e.g., Proton Meet) to capture the microphone. Input device transitions to zero-fill. Verify screenpipe detects the hijack and auto-recovers within 30s. Log shows "zero-fill device hijack detected". (`a2e89b2ae`, `357e4dfcc`)
+- [ ] **Zero-fill detection on output device** — AirPods are recording, then captured by an app. Output device goes silent. Verify screenpipe detects and recovers. (`a2e89b2ae`)
+- [ ] **No false-positive watchdog on devices with no audio history** — Connect a USB device that is listed in CoreAudio but never produces real audio (e.g., unplugged mic input, USB hub). Watchdog should NOT fire repeatedly. Device stays quiet. (`357e4dfcc`)
+- [ ] **Zero-fill watchdog fires only after first real audio** — Device produces real audio, then goes silent 40s later. Watchdog fires and recovery happens. Verify: `grep "zero-fill watchdog" ~/.screenpipe/screenpipe-app.*.log`. (`357e4dfcc`)
+- [ ] **No recovery storm on never-healthy device** — Device never had real audio (Option<Instant> is None). It continues sending zeros. Watchdog does NOT fire, no rebuild loop. (`357e4dfcc`)
+
 #### Audio device recovery (monitor unplug / device switch)
 
 commits: device_monitor.rs atomic swap, tiered backoff, empty device list guard
@@ -773,7 +783,16 @@ commits: `fc830b43`
 
 ### 24. Data Management
 
+commits: `1f17cb6d5`, `ec610658a`, `b2c30627b`
+
+- [ ] **Retention mode CLI flag** — Run `screenpipe record --retention-mode media` (or `--retention-mode all`). Verify the engine respects the choice via `/retention/configure` endpoint. (`1f17cb6d5`)
+- [ ] **Retention media-only default** — Start screenpipe without specifying retention mode. Verify it defaults to `media` (keep audio/video, delete OCR/vision). (`1f17cb6d5`)
+- [ ] **Retention all mode** — Set `--retention-mode all`. Verify all data (audio, video, OCR, vision) is retained. (`1f17cb6d5`)
+- [ ] **One-click data delete UI** — In Settings → Storage, verify a "Delete all data" button appears. Clicking it deletes recorded data and resets the retention mode. (`ec610658a`, `b2c30627b`)
+- [ ] **Retention mode persists across restarts** — Set retention mode to `all`, restart the app. Verify the mode is still `all`. (`1f17cb6d5`)
+- [ ] **Retention endpoint respects local setting** — With media-only mode set, hit `/retention/configure?mode=all` via API. Verify it temporarily overrides but the local setting persists. (`1f17cb6d5`)
 - [ ] **Delete local data confirmation** — Use the "Delete device local data" feature. Verify an `AlertDialog` appears instead of a standard `window.confirm`. (`b5db080d6`)
+- [ ] **Storage settings reorganization** — Verify "Data directory" and retention settings appear under a new "Storage" tab (not Privacy). (`0d3ffe30a`)
 
 ### 25. Feedback & Support
 
@@ -859,6 +878,12 @@ commits: `cf2dcd5f8`, `ad1d00d8f`, `6f623b30a`, `aaf031169`
 
 ### 23. Notifications
 
+commits: `8db351cd3`
+
+- [ ] **Notification file link to in-app viewer** — Emit a notification with a markdown link like `[View log](/path/to/file.md)`. Click the link. Verify the file opens in the in-app viewer (standalone window) instead of the OS default app (Xcode, etc.). (`8db351cd3`)
+- [ ] **Inline viewer link icon** — In notifications with file links, verify an inline ↗ icon appears next to viewer-deeplinks. Clicking it should allow override to open in external app (Obsidian, Preview, etc.). (`8db351cd3`)
+- [ ] **Viewer supports multiple file types** — In the in-app viewer, verify support for markdown, JSON, 16+ code extensions (python, rust, typescript, etc.), plain text, images (with click-to-toggle fit/actual size), and binary files. (`8db351cd3`)
+- [ ] **Viewer keyboard shortcuts** — In the in-app viewer, test: ⌘E (edit in default), ⌘R (reveal in Finder), ⌘L (copy path), Esc (close). Verify all work. (`8db351cd3`)
 - [ ] **Restart notifications toggle** — Toggle "restart notifications" in settings. Verify notifications only appear when enabled. (`f82b4f350`)
 - [ ] **Notification text selection** — Verify that text can be selected in notification inbox messages. (`3449197c3`)
 - [ ] **macOS notification "Open" click** — Click "Open" on a macOS system notification. Verify it correctly brings the Screenpipe window to the front. (`3e86cebb0`)
@@ -897,15 +922,25 @@ commits: `c6a73b17e`, `945b687ec`
 
 ### 29. Browser Extension
 
+commits: `1510f260e`
+
+- [ ] **Pick any available window in browser** — In a browser with multiple windows open, use the browser extension. Verify it picks any available window (not requiring primary/owned). Fix for previously broken window parent selection. (`1510f260e`)
 - [ ] **Extension popup** — Open the browser extension popup. Verify connection status is displayed correctly. (`be7c9e8b5`)
-
-
 - [ ] **Browser extension token auth** — Open the browser extension options page. Verify that token-based authentication works and that it can successfully connect to the Screenpipe API. (`be14de544`)
 
 ### 30. CLI
 
 - [ ] **CLI logout** — Run `screenpipe logout`. Verify it clears local auth tokens. (`793c3d6e9`)
 - [ ] **CLI sync remote** — Verify `screenpipe sync remote` command and its configuration. (`f46e85cb1`)
+
+### 30.5. Chat Messages (Data Storage)
+
+commits: `8a13b0e4a`
+
+- [ ] **Chat messages mirrored to store** — Send messages via the chat API `/chat/{room_id}/send`. Verify messages appear in `store.bin` (queryable via `screenpipe` CLI or local app query tools). (`8a13b0e4a`)
+- [ ] **Message store persistence** — Send a message, quit the app, relaunch. Verify the message is still in the store. (`8a13b0e4a`)
+- [ ] **Message filtering by room** — With multiple chat rooms, verify that filtering messages by `room_id` returns only messages from that room. (`8a13b0e4a`)
+- [ ] **Bulk message export** — Export messages (via API or export feature). Verify all stored messages are included and correctly formatted. (`8a13b0e4a`)
 
 ### 31. Chat (Pi)
 
@@ -914,3 +949,39 @@ commits: `c6a73b17e`, `945b687ec`
 - [ ] **Persistent background chats** — Verify that chats continue to stream in the background even when navigating away from the chat view. (`0060ae9e5`, `ec5e80992`)
 - [ ] **Inline history in overlay** — Verify that inline history is restored in the overlay window. (`15b419ec7`)
 - [ ] **Notification URL actions** — Open a URL action from a native macOS notification when the overlay is not mounted. (`7fdcd2054`)
+
+### 32. AI Gateway & Connections
+
+commits: `bbbd4c3b6`, `c30cbf6f9`, `d42d9f5c1`
+
+- [ ] **Tinfoil E2EE proxy for LLM calls** — Configure an LLM connection via AI Gateway with Tinfoil encryption enabled. Send a query (e.g., "summarize my screen"). Verify the request is encrypted end-to-end and decrypted server-side. Logs should not show plaintext of user data. (`bbbd4c3b6`)
+- [ ] **Connections sidebar toggle** — In main window, verify a "Connections" sidebar button appears. Clicking it shows connected services and their status. Disabled services (invalid token, etc.) show a warning/reconnect button. (`c30cbf6f9`)
+- [ ] **Connection status icons** — Verify that each connection displays a status icon (green for connected, red for error, grey for disabled). Clicking a status icon shows debug info (last sync time, error message). (`c30cbf6f9`)
+- [ ] **Jira OAuth 2.0** — Disconnect and reconnect Jira using OAuth 2.0. Verify Jira data (issues, comments) sync correctly after re-authorization. (`d42d9f5c1`)
+- [ ] **Disable pipes when connection missing** — A pipe that requires Jira is shown as "disabled" in the pipe list if Jira is not connected. Attempting to run it shows a prompt to connect Jira first. (`c30cbf6f9`)
+- [ ] **MCP tool relative date parsing** — In an MCP tool (e.g., calendar query), use relative dates like "last week" or "tomorrow". Verify they are correctly parsed and converted to absolute dates. (`1f783a18f`)
+
+### 33. Theme & UI Consistency
+
+commits: `c930f864e`, `c56d90d0f`
+
+- [ ] **Dark/light mode toggle** — Toggle dark/light mode in preferences. Verify all UI elements correctly switch colors (background, text, borders, etc.) without visual glitches. (`c930f864e`)
+- [ ] **Theme consistency across windows** — Open main window and overlay. Switch theme. Verify both windows update consistently. (`c930f864e`)
+- [ ] **System theme follow** — Set macOS to dark mode. Verify screenpipe auto-switches to dark theme if "Follow system" is enabled. (`c930f864e`)
+
+### 34. Onboarding & Stream Fallback
+
+commits: `dec32b804`, `8331f21fc`
+
+- [ ] **Onboarding prose rendering** — Complete the onboarding flow. Verify prose/markdown is correctly rendered with proper formatting, line breaks, and emphasis. (`dec32b804`)
+- [ ] **Onboarding stream fallback** — If the onboarding stream is slow/fails, verify fallback to cached content appears instead of blank screen. User can still complete setup. (`8331f21fc`)
+- [ ] **Live feed during onboarding** — During onboarding, a live feed of your screen activity should appear (if recording is active). Verify it updates in real-time. (`dec32b804`)
+
+### 35. Tray & System Integration
+
+commits: `bf42a9128`, `dd8f3e0a9`
+
+- [ ] **Live tooltip in tray** — Hover over the screenpipe tray icon. Verify a tooltip appears showing "Recording...", current app, or status (paused, etc.). Tooltip updates in real-time. (`bf42a9128`)
+- [ ] **Pause/auto-resume in tray** — Click the tray icon to pause recording. Verify it shows "Paused". App automatically resumes recording after 15 minutes. (`bf42a9128`)
+- [ ] **Meeting recording stop button** — During a detected meeting call (Zoom, Google Meet, etc.), verify a "Stop recording" button appears in the overlay or tray menu. Clicking it stops the meeting-specific recording. (`dd8f3e0a9`)
+- [ ] **Push-driven meeting status stream** — Verify that meeting status updates (start, stop, participant changes) are pushed to the UI via a stream (not polled). Performance and responsiveness are improved. (`dd8f3e0a9`)
