@@ -914,3 +914,41 @@ commits: `c6a73b17e`, `945b687ec`
 - [ ] **Persistent background chats** — Verify that chats continue to stream in the background even when navigating away from the chat view. (`0060ae9e5`, `ec5e80992`)
 - [ ] **Inline history in overlay** — Verify that inline history is restored in the overlay window. (`15b419ec7`)
 - [ ] **Notification URL actions** — Open a URL action from a native macOS notification when the overlay is not mounted. (`7fdcd2054`)
+- [ ] **Chat streaming UX with grid dissolve loader** — Start a chat and send a message. Verify that the assistant response streams with a smooth state-aware grid dissolve loader animation. (`2fff98866`)
+- [ ] **Queued messages de-emphasis** — Send multiple messages quickly. Verify that queued/pending messages appear de-emphasized in the UI until they are actually sent. (`2fff98866`)
+- [ ] **Chat thinking block collapse by default** — Generate a response with thinking. Verify that the "thinking" block is collapsed by default with an expander to show it. (`c092166e0`)
+- [ ] **Persistent assistant message during streaming** — Send a message that triggers a long response stream. Close and reopen the chat. Verify the assistant message is persisted even if streaming hasn't finished. (`35a8cfc09`)
+- [ ] **Browser sidebar width persistence** — Open a browser panel in chat. Resize the sidebar. Close and reopen the chat. Verify the sidebar width is remembered. (`e972146e7`)
+- [ ] **Browser sidebar collapsed state persistence** — Open a browser panel and collapse it (Cmd+B or click toggle). Close and reopen the chat. Verify the collapsed state is persisted. (`e972146e7`)
+
+### 32. Privacy & Clipboard
+
+- [ ] **Disable clipboard capture toggle** — Go to Settings > Privacy. Toggle "capture clipboard" off. Verify the toggle is persisted. Check logs that clipboard capture is disabled. (`48fef33f1`)
+- [ ] **Clipboard capture default on** — Fresh install or reset settings. Verify "capture clipboard" is ON by default (no behavior change). (`48fef33f1`)
+- [ ] **CLI disable clipboard flag** — Run `screenpipe record --disable-clipboard-capture`. Verify the flag works and clipboard is not captured. (`48fef33f1`)
+- [ ] **CLI command dialog reflects clipboard setting** — Go to Settings and copy the CLI command. Verify the --disable-clipboard-capture flag appears if the setting is toggled off. (`48fef33f1`)
+
+### 33. Meeting Notes & Timeline
+
+- [ ] **Meeting notes sidebar expansion during focus mode** — In a focused meeting (e.g., call summary), press Cmd+B to expand the sidebar. Verify the sidebar expands and stays expanded (not immediately collapsed). (`205bf128f`)
+- [ ] **Meeting notes sidebar click toggle** — Click the sidebar expand/collapse button during a focused meeting. Verify it toggles smoothly without snapping back. (`205bf128f`)
+- [ ] **Retention delete last N minutes** — Go to Settings > Retention. Click "Delete last 15 minutes". Verify the toast shows files were removed and timeline refreshes (no ghost entries). (`328a3b48f`)
+- [ ] **Retention delete clears hot frame cache** — Delete a time range. Verify that /stream/frames no longer returns frames from the deleted range (no cached stale frames). (`328a3b48f`)
+
+### 34. Browser Control
+
+- [ ] **Browser /navigate endpoint** — Via the API or agent, POST to /connections/browsers/:id/navigate with a URL. Verify the browser navigates. (`27e7a28c9`)
+- [ ] **Browser /snapshot endpoint** — Via API, GET /connections/browsers/:id/snapshot. Verify it returns page accessibility outline (title, headings, links, buttons, form fields). (`27e7a28c9`)
+- [ ] **Browser navigation validates URL** — Send a malformed URL to /navigate. Verify a 400 error is returned (not 502). (`27e7a28c9`)
+- [ ] **Browser snapshot caps at 250 lines** — Load a very long page, get /snapshot. Verify the response is capped at 250 lines. (`27e7a28c9`)
+- [ ] **Auth resolver dedup (API key discovery)** — Set auth via SCREENPIPE_API_KEY env var. Verify /connections/browsers endpoint works (not 403). (`27e7a28c9`)
+
+### 35. Embedded Browser
+
+- [ ] **Embedded browser loads x.com** — Open an embedded browser and navigate to x.com (Twitter). Verify the page loads (does not stall on UA detection). (`4ce98c36e`)
+- [ ] **Embedded browser Safari UA** — In an embedded browser, open dev tools or check logs. Verify User-Agent is spoofed as desktop Safari (not WKWebView string). (`4ce98c36e`)
+
+### 36. Connections (Zoom)
+
+- [ ] **Zoom OAuth scaffold** — Go to Settings > Connections. Verify Zoom appears in the connection grid with OAuth flow. (`719f98500`)
+- [ ] **Zoom /users/me round-trip** — Connect to Zoom via OAuth. Verify "connected as <email>" is displayed on success. (`719f98500`)
