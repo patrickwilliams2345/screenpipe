@@ -97,6 +97,7 @@ pub async fn handle_new_transcript(
             // If current is empty after cleanup, the entire transcript was a duplicate - skip it
             if current.is_empty() {
                 metrics.record_duplicate_blocked();
+                metrics.record_dedup_skip();
                 info!(
                     "device {} skipping duplicate transcript (entire content overlaps with previous)",
                     transcription.input.device

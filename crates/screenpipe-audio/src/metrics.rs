@@ -187,6 +187,18 @@ impl AudioPipelineMetrics {
         self.db_duplicates_blocked.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record that a transcript was skipped due to dedup. Updates last_db_write_ts to
+    /// indicate the pipeline is healthy (dedup is working correctly) without counting
+    /// it as a real DB insert. This prevents false "audio DB stalled" alerts in the
+    /// health check when the system is correctly filtering duplicate transcriptions.
+    pub fn record_dedup_skip(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.last_db_write_ts.store(now, Ordering::Relaxed);
+    }
+
     pub fn record_overlap_trimmed(&self) {
         self.db_overlaps_trimmed.fetch_add(1, Ordering::Relaxed);
     }
