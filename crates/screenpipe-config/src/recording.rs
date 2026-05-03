@@ -208,6 +208,27 @@ pub struct RecordingSettings {
     #[serde(rename = "asyncPiiRedactionDestructive", default)]
     pub async_pii_redaction_destructive: bool,
 
+    /// Enable image-PII redaction on captured screen frames. When
+    /// `true`, the `screenpipe_redact::image::worker` runs alongside
+    /// the text reconciliation worker, scans the `frames` table, runs
+    /// the RF-DETR-Nano detector, and blacks out detected PII regions
+    /// in each JPG. Off by default — orthogonal to `async_pii_redaction`
+    /// (text path), independently togglable. Requires the
+    /// `screenpipe-redact` crate to be built with one of the `onnx-*`
+    /// cargo features and the `rfdetr_v8.onnx` model present at
+    /// `~/.screenpipe/models/`. Mirror flag for destructive mode is
+    /// [`Self::async_image_pii_redaction_destructive`].
+    #[serde(rename = "asyncImagePiiRedaction", default)]
+    pub async_image_pii_redaction: bool,
+
+    /// When `async_image_pii_redaction` is enabled and this is `true`,
+    /// the worker overwrites the source JPG in place. When `false`
+    /// (default), it writes `<stem>_redacted.<ext>` next to the
+    /// original. Same trade-off as the text variant — at-rest
+    /// protection vs. ability to re-redact when the model improves.
+    #[serde(rename = "asyncImagePiiRedactionDestructive", default)]
+    pub async_image_pii_redaction_destructive: bool,
+
     // ── Cloud / Auth ───────────────────────────────────────────────────
     /// Screenpipe cloud user ID. Empty string means not logged in.
     /// Kept as String (not Option) to match existing store.bin schema.
@@ -378,6 +399,8 @@ impl Default for RecordingSettings {
             use_pii_removal: false,
             async_pii_redaction: false,
             async_pii_redaction_destructive: false,
+            async_image_pii_redaction: false,
+            async_image_pii_redaction_destructive: false,
             user_id: String::new(),
             user_name: None,
             openai_compatible_endpoint: None,

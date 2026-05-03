@@ -16,7 +16,9 @@ edition.workspace = true
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
 futures = "0.3"
+image = "0.25"
 moka = { version = "0.12", features = ["future"] }
 once_cell = { workspace = true }
 regex = "1"
@@ -35,6 +37,7 @@ screenpipe-core = { path = "../screenpipe-core" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tempfile = "3"
+image = "0.25"
 
 # Optional ONNX-based local-model adapter. Off by default so the crate
 # builds without any heavy ML deps. Each platform feature picks the
@@ -43,8 +46,9 @@ tempfile = "3"
 [features]
 default = []
 
-# Enable the local-model adapter at all (CPU-only). Pulls `ort`.
-onnx-cpu = ["dep:ort", "dep:ndarray"]
+# Enable the local-model adapter at all (CPU-only). Pulls `ort` plus the
+# bundled ONNX Runtime binaries — no separate runtime install needed.
+onnx-cpu = ["dep:ort", "dep:ndarray", "ort/download-binaries"]
 
 # Mac: Apple's CoreML execution provider. Uses Metal + Apple Neural
 # Engine where available. No driver install required for end users.
@@ -55,8 +59,7 @@ onnx-coreml = ["onnx-cpu", "ort/coreml"]
 onnx-directml = ["onnx-cpu", "ort/directml"]
 
 [dependencies.ort]
-version = "2.0.0-rc.10"
-default-features = false
+version = "=2.0.0-rc.10"
 features = ["ndarray"]
 optional = true
 

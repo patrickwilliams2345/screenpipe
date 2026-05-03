@@ -1529,6 +1529,40 @@ async fn main() -> anyhow::Result<()> {
         // the shutdown_tx flow.
     }
 
+    // Image-PII reconciliation worker (issue #3185 follow-up).
+    // Independent of the text worker — users can toggle either one
+    // without the other. Requires the rfdetr_v8.onnx model present
+    // and at least one of the `onnx-*` cargo features built.
+    if record_args.async_image_pii_redaction {
+        use screenpipe_redact::adapters::rfdetr::{RfdetrConfig, RfdetrRedactor};
+        use screenpipe_redact::image::worker::{ImageWorker, ImageWorkerConfig};
+        use screenpipe_redact::ImageRedactor;
+        use std::sync::Arc;
+
+        match RfdetrRedactor::load(RfdetrConfig::default()) {
+            Ok(detector) => {
+                info!(
+                    "starting async image-PII reconciliation worker (destructive={})",
+                    record_args.async_image_pii_redaction_destructive
+                );
+                let cfg = ImageWorkerConfig {
+                    destructive: record_args.async_image_pii_redaction_destructive,
+                    ..Default::default()
+                };
+                let detector_arc = Arc::new(detector) as Arc<dyn ImageRedactor>;
+                let _img_handle = ImageWorker::new(db.pool.clone(), detector_arc, cfg).spawn();
+            }
+            Err(e) => {
+                // Loud-but-non-fatal: capture continues; user gets an
+                // explicit "model missing" message in the log.
+                tracing::warn!(
+                    "image-PII redaction enabled but model unavailable; skipping: {e}. \
+                     drop the rfdetr_v8.onnx file at ~/.screenpipe/models/ to enable."
+                );
+            }
+        }
+    }
+
     // Add auto-destruct watcher
     if let Some(pid) = record_args.auto_destruct_pid {
         info!("watching pid {} for auto-destruction", pid);

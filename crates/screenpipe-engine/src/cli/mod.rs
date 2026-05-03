@@ -340,6 +340,22 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub async_pii_redaction_destructive: bool,
 
+    /// Enable the async IMAGE-PII reconciliation worker. Independent
+    /// of `--async-pii-redaction` (text). Runs the rfdetr_v8 detector
+    /// over each captured frame, blacks out detected PII regions in
+    /// the JPG. Requires `rfdetr_v8.onnx` at `~/.screenpipe/models/`
+    /// and the binary built with one of the `onnx-*` cargo features.
+    /// Off by default.
+    #[arg(long, default_value_t = false)]
+    pub async_image_pii_redaction: bool,
+
+    /// When `--async-image-pii-redaction` is on, overwrite the source
+    /// JPG in place. When off (default), writes
+    /// `<stem>_redacted.<ext>` next to the original. Same trade-off
+    /// as the text variant.
+    #[arg(long, default_value_t = false)]
+    pub async_image_pii_redaction_destructive: bool,
+
     /// Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise)
     #[arg(long, default_value_t = false)]
     pub filter_music: bool,
@@ -490,6 +506,8 @@ impl RecordArgs {
             use_pii_removal: self.use_pii_removal,
             async_pii_redaction: self.async_pii_redaction,
             async_pii_redaction_destructive: self.async_pii_redaction_destructive,
+            async_image_pii_redaction: self.async_image_pii_redaction,
+            async_image_pii_redaction_destructive: self.async_image_pii_redaction_destructive,
             filter_music: self.filter_music,
             #[allow(deprecated)]
             enable_input_capture: true,

@@ -23,31 +23,46 @@
 //!
 //! ## Layout
 //!
-//! - [`Redactor`] — the core trait. Implementors take a batch of
-//!   strings and return a redacted version of each.
-//! - [`adapters`] — concrete implementations:
-//!     - [`adapters::regex`] — deterministic, on-device, free.
-//!       Catches emails / cards / phones / connection strings / common
-//!       API-key shapes / private-key block markers. Always runs first.
-//!     - [`adapters::tinfoil`] — HTTP client for the Tinfoil-hosted
-//!       confidential-compute enclave. Existing screenpipe deployment;
-//!       moved here from `screenpipe-engine::privacy_filter` so the
-//!       reconciliation worker and the search-time path share one
-//!       implementation.
-//!     - [`adapters::onnx`] (feature-gated) — local ONNX-runtime
-//!       inference of the `screenpipe-pii-redactor` model. Uses the
-//!       CoreML execution provider on Mac and the DirectML execution
-//!       provider on Windows. **No CUDA / Vulkan / GPU-vendor SDKs
-//!       bundled** — one of the goals of this work is to keep the
-//!       binary small and the runtime dependencies stock-OS.
-//! - [`pipeline`] — the [`Pipeline`] struct: a regex pre-pass plus an
-//!   AI fallback for residual text. Hash-cached per-string so repeated
-//!   UI chrome is free on the second pass.
-//! - [`worker`] — the background reconciliation loop. Polls the DB for
-//!   un-redacted rows on the four target tables (ocr_text,
-//!   audio_transcriptions, accessibility, clipboard), batches them per
-//!   provider call, writes results back, and respects pause/resume +
-//!   idle-aware scheduling.
+//! Two parallel modalities — text and image — sharing infra (error
+//! type, [`SpanLabel`] taxonomy, worker shape) but with separate
+//! inference paths so neither modality's hot-path latency budget
+//! bleeds into the other.
+//!
+//! ### Text
+//!
+//! - [`Redactor`] — text trait. Batch of strings → redacted strings.
+//! - [`adapters::regex`] — deterministic, on-device, free.
+//!   Emails / cards / phones / connection strings / common API-key
+//!   shapes / private-key block markers. Always runs first.
+//! - [`adapters::tinfoil`] — HTTP client for the Tinfoil-hosted
+//!   confidential-compute enclave. Used today by the search-time
+//!   filter; moved here so the reconciliation worker and the
+//!   search-time path share one implementation.
+//! - [`adapters::onnx`] (feature-gated) — local ONNX-runtime
+//!   inference of the text PII redactor. CoreML on Mac, DirectML on
+//!   Windows. **No CUDA / Vulkan / GPU-vendor SDKs bundled.**
+//! - [`pipeline`] — regex pre-pass plus AI fallback for residual
+//!   text. Hash-cached per-string so repeated UI chrome is free on
+//!   the second pass.
+//! - [`worker`] — text reconciliation loop. Polls the DB for
+//!   un-redacted rows on the four text-bearing tables (`ocr_text`,
+//!   `audio_transcriptions`, `accessibility`, `ui_events`).
+//!
+//! ### Image
+//!
+//! - [`ImageRedactor`] — image trait. JPG path → pixel-space bboxes.
+//!   Same canonical [`SpanLabel`] enum the text path uses.
+//! - [`adapters::rfdetr`] (feature-gated) — RF-DETR-Nano image PII
+//!   detector. Same EP chain as `adapters::onnx`.
+//! - [`image::frame_redactor`] — applies detected regions to a JPG.
+//!   Solid black (NOT blur — blur is reversible). Pure pixel pushing,
+//!   no model.
+//! - [`image::worker`] — image reconciliation loop. Scans the
+//!   `frames` table, calls `ImageRedactor::detect` +
+//!   `frame_redactor::redact_frame`, writes back the
+//!   `image_redacted_at` / `image_redaction_version` /
+//!   `image_redaction_regions` columns added by
+//!   `20260503_add_frames_image_redacted.sql`.
 //!
 //! ## Defaults
 //!
@@ -57,6 +72,7 @@
 #![warn(clippy::all)]
 
 pub mod adapters;
+pub mod image;
 pub mod pipeline;
 pub mod worker;
 
@@ -65,6 +81,7 @@ mod error;
 mod span;
 
 pub use error::RedactError;
+pub use image::{ImageRedactionPolicy, ImageRedactor, ImageRegion};
 pub use pipeline::{Pipeline, PipelineConfig};
 pub use span::{RedactedSpan, SpanLabel};
 
