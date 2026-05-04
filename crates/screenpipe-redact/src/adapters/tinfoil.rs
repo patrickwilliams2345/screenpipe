@@ -60,7 +60,14 @@ pub const MIN_FILTER_CHARS: usize = 8;
 
 const TINFOIL_REDACTOR_VERSION: u32 = 1;
 const DEFAULT_URL: &str = "https://pii.screenpipe.containers.tinfoil.dev";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
+// OPF inference latency on the Tinfoil enclave scales with sequence
+// length: short payloads (~50 chars) come back in ~1 s, but real OCR
+// rows (~2 kB / hundreds of tokens) routinely take 10-15 s. The
+// reconciliation worker is async background work — a long ceiling
+// here doesn't hurt UX, and a short one makes the worker drop every
+// real-sized row. Verified by running examples/tinfoil_probe with
+// 2 kB of repeated text.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Construct-time configuration.
 #[derive(Default, Clone)]

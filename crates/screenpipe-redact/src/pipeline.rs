@@ -146,9 +146,20 @@ impl Redactor for Pipeline {
                         // Transient failure — log via tracing, keep
                         // regex output. We do NOT fail the whole
                         // batch because that would block the
-                        // reconciliation worker.
+                        // reconciliation worker. Walk the error
+                        // chain so we surface the underlying cause
+                        // (TLS handshake / DNS / refused / etc.)
+                        // rather than just the catchall wrapper.
+                        let mut detail = format!("{}", e);
+                        let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+                        while let Some(s) = src {
+                            detail.push_str(" → ");
+                            detail.push_str(&s.to_string());
+                            src = s.source();
+                        }
                         tracing::warn!(
                             error = %e,
+                            detail = %detail,
                             "AI redactor failed; falling back to regex-only output"
                         );
                     }
