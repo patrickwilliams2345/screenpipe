@@ -72,6 +72,20 @@ the easiest way to search is the built-in search in the screenpipe desktop app:
 3. scroll through your day visually
 4. select content to chat with AI about it
 
+### chat mentions — filter what AI sees
+
+in the chat input box, type `@` to add mentions that filter what content the AI analyzes:
+
+| mention | shows | use case |
+| --- | --- | --- |
+| `@screen` | what was visible on screen (OCR text + screenshots) | "summarize my code changes" |
+| `@audio` | voice & meeting transcriptions | "what was said about the budget?" |
+| `@input` | clicks, keystrokes, app switches | "what apps did I use today?" |
+| `@today`, `@yesterday`, `@last-hour`, `@last-week` | time ranges | "changes this morning" |
+| `@app-name` | content from specific apps | "messages in Slack" |
+
+combine mentions: `@audio @last-hour` shows only voice data from the past hour. removing a mention: click the `×` on its pill or delete it from the text.
+
 ## search tips
 
 - **be specific**: "slack message from john about deployment" > "deployment"

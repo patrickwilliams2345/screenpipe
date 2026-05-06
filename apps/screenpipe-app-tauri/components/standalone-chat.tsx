@@ -170,7 +170,7 @@ function buildSystemPrompt(): string {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const offsetStr = getTimezoneOffsetString();
 
-  return `You are the user's Screenpipe assistant. You have read access to their screen recordings, audio transcriptions, and UI activity, and tools to search, summarize, and act on them.
+  return `You are the user's Screenpipe assistant. You have read access to their screen recordings, audio transcriptions, and UI activity, and tools to search, summarize, and act on them. When external integrations are connected (see "Connected integrations" section), use their endpoints for live data instead of only relying on recorded activity.
 
 # Voice and length — the most important rule
 
@@ -204,9 +204,14 @@ When summarizing what the user did, write like a friend recapping their day. Con
 - If a search returns empty, silently widen and retry. Don't enumerate possibilities or ask the user to choose.
 - Never say "no data found" after one filtered search — verify first with an unfiltered time-only search.
 
+# Connection write policy
+
+Never POST, PUT, or PATCH to a connection proxy unless the user explicitly asks you to create, write, or modify something in that service. For ambiguous requests, read first. Ask before writing.
+
 # Tool selection
 
-- "meeting / call / conversation / what did I/they say" → search with content_type: "audio", no q param
+- "upcoming meetings / calendar events / what's on my calendar / schedule" → if a calendar integration is connected (google-calendar, apple-calendar), call its events endpoint first; only fall back to audio search if no calendar is connected
+- "meeting / call / conversation / what did I/they say" → search with content_type: "audio", no q param (for past meetings/calls captured by screenpipe)
 - "how long / time spent / which apps / most used" → activity-summary (not raw frame counts or SQL)
 - "what was on screen / what was I reading" → search with content_type: "all" or "accessibility"
 - "what was I doing" → activity-summary first; the windows field usually has enough without further searches
@@ -260,6 +265,17 @@ Don't reach for these on short answers.
 Current time: ${now.toISOString()}
 User's timezone: ${timezone} (UTC${offsetStr})
 User's local time: ${now.toLocaleString()}`;
+}
+
+function buildConnectionsContext(
+  connections: Array<{ id: string; name: string; category?: string; description?: string }>
+): string {
+  const withDesc = connections.filter((c) => c.description);
+  if (withDesc.length === 0) return "";
+  const entries = withDesc
+    .map((c) => `## ${c.name} (${c.id})\n${c.description}`)
+    .join("\n\n");
+  return `\n\n# Connected integrations\n\nThe user has connected the following external services. Use the endpoints listed under each to fetch live data when relevant. All endpoints are on http://localhost:3030 and require \`-H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY"\`.\n\n${entries}`;
 }
 
 interface SearchResult {
@@ -1091,7 +1107,11 @@ function CollapsibleUserMessage({ label, fullContent }: { label: string; fullCon
       <div className="flex items-center gap-1.5">
         <span className="flex-1 text-sm font-medium">{label}</span>
         <button
-          onClick={() => setExpanded(!expanded)}
+          onClick={(e) => {
+            e.stopPropagation();
+            setExpanded(!expanded);
+          }}
+          onMouseUp={(e) => e.stopPropagation()}
           className="shrink-0 p-0.5 rounded hover:bg-background/20 text-background/60 hover:text-background/90 transition-colors"
           title={expanded ? "Collapse prompt" : "Show full prompt"}
         >
@@ -1300,7 +1320,7 @@ export function StandaloneChat({
   // filter popover so users can mention them directly with @id — helps the
   // agent pick the right connection for a query instead of having to guess.
   const [connections, setConnections] = useState<
-    Array<{ id: string; name: string; category?: string }>
+    Array<{ id: string; name: string; category?: string; description?: string }>
   >([]);
   // Watch the input section's width so suggestion chips can collapse into
   // a popover on narrow chat columns.
@@ -1321,11 +1341,11 @@ export function StandaloneChat({
         const res = await localFetch("/connections");
         if (!res.ok) return;
         const json = (await res.json()) as {
-          data?: Array<{ id: string; name: string; connected: boolean; category?: string }>;
+          data?: Array<{ id: string; name: string; connected: boolean; category?: string; description?: string }>;
         };
         const list = (json.data ?? [])
           .filter((c) => c.connected)
-          .map((c) => ({ id: c.id, name: c.name, category: c.category }));
+          .map((c) => ({ id: c.id, name: c.name, category: c.category, description: c.description }));
         if (!cancelled) setConnections(list);
       } catch {
         // silent — filter just won't surface connections, no UI regression
@@ -1334,6 +1354,29 @@ export function StandaloneChat({
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  // Re-fetch connections whenever the window becomes visible — picks up any
+  // integrations connected in Settings while the chat was open.
+  useEffect(() => {
+    const fetchConnections = async () => {
+      try {
+        const res = await localFetch("/connections");
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          data?: Array<{ id: string; name: string; connected: boolean; category?: string; description?: string }>;
+        };
+        const list = (json.data ?? [])
+          .filter((c) => c.connected)
+          .map((c) => ({ id: c.id, name: c.name, category: c.category, description: c.description }));
+        setConnections(list);
+      } catch { /* silent */ }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") fetchConnections();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   // Custom summary templates (persisted in settings)
@@ -2243,19 +2286,23 @@ export function StandaloneChat({
   // Remove a specific @mention from input
   const removeFilter = (filterType: "time" | "content" | "app" | "speaker", label?: string) => {
     let newInput = input;
-    if (filterType === "time" && label) {
+    if (filterType === "time") {
       // Remove time mentions like @today, @yesterday, @last-hour, etc.
-      const timePatterns: Record<string, RegExp> = {
-        "today": /@today\b/gi,
-        "yesterday": /@yesterday\b/gi,
-        "last week": /@last[- ]?week\b/gi,
-        "last hour": /@last[- ]?hour\b/gi,
-        "this morning": /@this[- ]?morning\b/gi,
-      };
-      const pattern = timePatterns[label];
-      if (pattern) newInput = newInput.replace(pattern, "").trim();
+      if(label){
+        const timePatterns: Record<string, RegExp> = {
+          "today": /@today\b/gi,
+          "yesterday": /@yesterday\b/gi,
+          "last week": /@last[- ]?week\b/gi,
+          "last hour": /@last[- ]?hour\b/gi,
+          "this morning": /@this[- ]?morning\b/gi,
+        };
+        const pattern = timePatterns[label];
+        if (pattern) newInput = newInput.replace(pattern, "").trim();
+      }else{
+        newInput = newInput.replace(/@(today|yesterday|last[- ]?week|last[- ]?hour|this[- ]?morning)\b/gi, "").trim();
+      }
     } else if (filterType === "content") {
-      newInput = newInput.replace(/@(audio|screen)\b/gi, "").trim();
+      newInput = newInput.replace(/@(audio|screen|input)\b/gi, "").trim();
     } else if (filterType === "app" && activeFilters.appName) {
       // Remove app mention - need to find the pattern
       const appPattern = new RegExp(`@${activeFilters.appName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi");
@@ -2534,7 +2581,8 @@ export function StandaloneChat({
     // This is passed via --append-system-prompt to Pi, enabling Anthropic prompt
     // caching (90% input cost reduction on subsequent messages).
     const presetPrompt = p.prompt || "";
-    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}`.trim() || null;
+    const connectionsCtx = buildConnectionsContext(connections);
+    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}${connectionsCtx}`.trim() || null;
     return {
       provider: p.provider,
       url: p.url || "",
@@ -2544,7 +2592,26 @@ export function StandaloneChat({
       systemPrompt,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt]);
+  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt, connections]);
+
+  // When connections change (e.g., user connected Google Calendar in Settings),
+  // silently restart Pi if the system prompt changed and no message is in-flight.
+  useEffect(() => {
+    if (connections.length === 0) return;
+    const config = buildProviderConfig();
+    if (!config) return;
+    const running = piRunningConfigRef.current;
+    if (!running || running.systemPrompt === config.systemPrompt) return;
+    if (piMessageIdRef.current) return; // don't interrupt an active turn
+    commands.piUpdateConfig(settings.user?.token ?? null, config)
+      .then(() => {
+        if (piRunningConfigRef.current) {
+          piRunningConfigRef.current = { ...piRunningConfigRef.current, systemPrompt: config.systemPrompt };
+        }
+      })
+      .catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connections]);
 
   // Check Pi status on mount — Pi is auto-started at app boot by Rust
   useEffect(() => {
@@ -5240,16 +5307,26 @@ export function StandaloneChat({
                 time
               </div>
               {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "time").map((s) => {
-                const isActive = activeFilters.timeRanges.some((r) => r.label === s.description);
+                const timeLabels: Record<string, string> = {
+                  "today's activity": "today",
+                  "yesterday": "yesterday",
+                  "past 7 days": "last week",
+                  "past hour": "last hour",
+                  "this morning": "this morning",
+                };
+                const isActive = activeFilters.timeRanges.some((r) => r.label === timeLabels[s.description]);
                 return (
                   <button
                     key={s.tag}
                     type="button"
                     onClick={() => {
                       if (isActive) {
-                        removeFilter("time", s.description);
+                        removeFilter("time", timeLabels[s.description]);
                       } else {
-                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        removeFilter("time");
+                        setTimeout(() => {
+                          setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        }, 0);
                       }
                       setAppFilterOpen(false);
                     }}
@@ -5280,8 +5357,10 @@ export function StandaloneChat({
                       if (isActive) {
                         removeFilter("content");
                       } else {
-                        if (activeFilters.contentType) removeFilter("content");
-                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        removeFilter("content");
+                        setTimeout(() => {
+                          setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        }, 0);
                       }
                       setAppFilterOpen(false);
                     }}

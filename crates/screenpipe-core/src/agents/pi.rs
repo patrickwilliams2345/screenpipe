@@ -463,28 +463,68 @@ impl PiExecutor {
                         "openai-completions"
                     };
 
-                    let user_provider = json!({
-                        "baseUrl": base_url,
-                        "api": wire_api,
-                        "apiKey": api_key,
-                        "models": [{
-                            "id": mdl,
-                            "name": mdl,
-                            "input": ["text", "image"],
-                            "maxTokens": 4096,
-                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
-                        }]
+                    let new_model = json!({
+                        "id": mdl,
+                        "name": mdl,
+                        "input": ["text", "image"],
+                        "maxTokens": 4096,
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
                     });
 
+                    // Field-level merge: preserve user-set baseUrl/apiKey when present
+                    // (e.g. jeffutter's `~/.pi/agent/models.json` "ollama" pointing at his
+                    // home server, or "openai-byok" with his real API key) and append our
+                    // model to `models[]` instead of clobbering the array.
+                    //
+                    // Only overwrite a field when (a) the pipe explicitly provided it
+                    // (e.g. `provider_url:` in pipe.md) or (b) no value exists yet.
                     if let Some(providers) = models_config
                         .get_mut("providers")
                         .and_then(|p| p.as_object_mut())
                     {
-                        providers.insert(pi_provider_name.to_string(), user_provider);
+                        let entry = providers
+                            .entry(pi_provider_name.to_string())
+                            .or_insert_with(|| json!({}));
+                        if let Some(obj) = entry.as_object_mut() {
+                            // baseUrl: respect user's existing unless the pipe gave a URL.
+                            let user_pinned_url = obj.contains_key("baseUrl")
+                                && obj.get("baseUrl").and_then(|v| v.as_str()).is_some()
+                                && provider_url.is_none();
+                            if !user_pinned_url {
+                                obj.insert("baseUrl".to_string(), json!(base_url));
+                            }
+                            // api (wire format): always set — it's a function of model
+                            // family, not a user preference.
+                            obj.insert("api".to_string(), json!(wire_api));
+                            // apiKey: respect user's existing if any.
+                            if !obj.contains_key("apiKey")
+                                || obj
+                                    .get("apiKey")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.is_empty())
+                                    .unwrap_or(true)
+                            {
+                                obj.insert("apiKey".to_string(), json!(api_key));
+                            }
+                            // models[]: append if our id isn't already there.
+                            let models_arr =
+                                obj.entry("models".to_string()).or_insert_with(|| json!([]));
+                            if !models_arr.is_array() {
+                                *models_arr = json!([]);
+                            }
+                            if let Some(arr) = models_arr.as_array_mut() {
+                                let already = arr
+                                    .iter()
+                                    .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(mdl));
+                                if !already {
+                                    arr.push(new_model);
+                                }
+                            }
+                        }
                     }
 
                     info!(
-                        "pi config: added provider '{}' with model '{}'",
+                        "pi config: merged provider '{}' (model '{}') into ~/.pi/agent/models.json",
                         pi_provider_name, mdl
                     );
                 }
@@ -930,16 +970,15 @@ impl AgentExecutor for PiExecutor {
             )
             .await?;
 
-        // Retry once on "model not found": delete stale models.json and rewrite
+        // Retry once on "model not found": re-merge our managed providers so
+        // any stale entry gets refreshed. Do NOT delete the file — that would
+        // also wipe user-managed providers (e.g. jeffutter's custom groq /
+        // bedrock entries in ~/.pi/agent/models.json).
         if !output.success && output.stderr.to_lowercase().contains("not found") {
             warn!(
-                "pi model not found, retrying with fresh models.json (stderr: {})",
+                "pi model not found, re-merging managed providers (stderr: {})",
                 output.stderr.trim()
             );
-            let config_dir = get_pi_config_dir()?;
-            let models_path = config_dir.join("models.json");
-            // Remove possibly-stale file so ensure_pi_config writes from scratch
-            let _ = std::fs::remove_file(&models_path);
             Self::ensure_pi_config(
                 self.user_token.as_deref(),
                 &self.api_url,
@@ -1022,15 +1061,13 @@ impl AgentExecutor for PiExecutor {
             )
             .await?;
 
-        // Retry once on "model not found"
+        // Retry once on "model not found": re-merge managed providers (don't
+        // delete the file — would wipe user-managed entries).
         if !output.success && output.stderr.to_lowercase().contains("not found") {
             warn!(
-                "pi model not found, retrying with fresh models.json (stderr: {})",
+                "pi model not found, re-merging managed providers (stderr: {})",
                 output.stderr.trim()
             );
-            let config_dir = get_pi_config_dir()?;
-            let models_path = config_dir.join("models.json");
-            let _ = std::fs::remove_file(&models_path);
             Self::ensure_pi_config(
                 self.user_token.as_deref(),
                 &self.api_url,

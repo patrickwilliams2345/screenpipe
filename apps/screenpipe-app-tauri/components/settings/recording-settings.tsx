@@ -692,10 +692,7 @@ export function RecordingSettings() {
           throw new Error(`Failed to fetch audio devices: ${audioResult.error}`);
         }
         const audioDevices = audioResult.data;
-        console.log("audioDevices", audioDevices);
         setAvailableAudioDevices(audioDevices);
-
-        console.log("settings", settings);
 
         // Update monitors — match by stable ID, with backward compat for old numeric IDs
         // and fuzzy fallback when only position changed (name+resolution still match)
@@ -767,7 +764,8 @@ export function RecordingSettings() {
           false
         );
       } catch (error) {
-        console.error("Failed to load devices:", error);
+        const msg = (error as Error)?.stack ?? (error as Error)?.message ?? String(error);
+        console.error("Failed to load devices:", msg);
       }
     };
 
@@ -812,8 +810,6 @@ export function RecordingSettings() {
     });
 
     try {
-      console.log("Applying settings:", settings);
-
       if (!settings.analyticsEnabled) {
         posthog.capture("telemetry", {
           enabled: false,

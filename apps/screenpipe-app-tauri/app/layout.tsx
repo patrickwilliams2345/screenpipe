@@ -133,16 +133,59 @@ export default function RootLayout({
     const originalConsole = { ...console };
     const debouncedWrite = createDebouncer(1000);
 
+    // Belt-and-suspenders: scrub well-known secret-bearing keys before they
+    // hit localStorage. Any `console.log(settings)` (recording page, agents,
+    // OAuth flows) used to leak deepgramApiKey, aiPresets[].apiKey,
+    // openaiCompatibleApiKey, and the user's Clerk JWT into feedback bundles.
+    // Scrubbing here means future debug logs can't reintroduce the leak even
+    // if someone forgets and dumps an object containing these keys.
+    const SECRET_KEYS = new Set([
+      "apiKey",
+      "deepgramApiKey",
+      "openaiCompatibleApiKey",
+      "openrouterApiKey",
+      "anthropicApiKey",
+      "openaiApiKey",
+      "geminiApiKey",
+      "groqApiKey",
+      "elevenLabsApiKey",
+      "token",
+      "accessToken",
+      "refreshToken",
+      "idToken",
+      "secret",
+      "clientSecret",
+      "password",
+      "authorization",
+    ]);
+    const stringifyRedacted = (arg: unknown): string => {
+      if (typeof arg !== "object" || arg === null) {
+        return String(arg);
+      }
+      try {
+        return JSON.stringify(arg, (key, value) => {
+          if (
+            SECRET_KEYS.has(key) &&
+            typeof value === "string" &&
+            value.length > 0
+          ) {
+            return "[redacted]";
+          }
+          return value;
+        });
+      } catch {
+        return "[unserializable]";
+      }
+    };
+
     ["log", "error", "warn", "info"].forEach((level) => {
       (console[level as keyof Console] as any) = (...args: any[]) => {
         // Call original first for performance
         (originalConsole[level as keyof Console] as Function)(...args);
 
-        // Add to memory buffer
+        // Add to memory buffer (with secret keys scrubbed)
         logs.push(
-          `[${level.toUpperCase()}] ${args
-            .map((arg) => (typeof arg === "object" ? JSON.stringify(arg) : arg))
-            .join(" ")}`
+          `[${level.toUpperCase()}] ${args.map(stringifyRedacted).join(" ")}`
         );
 
         // Trim buffer if needed

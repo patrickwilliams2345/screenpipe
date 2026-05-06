@@ -19,6 +19,7 @@ interface ListViewProps {
   activeId: number | null;
   activeMeeting: MeetingRecord | null;
   onSelect: (id: number) => void;
+  onDelete: (id: number) => void;
   onStart: () => void | Promise<void>;
   onStop: () => void | Promise<void>;
   onStartFromEvent: (event: CalendarEvent) => void | Promise<void>;
@@ -37,6 +38,7 @@ export function ListView({
   activeId,
   activeMeeting,
   onSelect,
+  onDelete,
   onStart,
   onStop,
   onStartFromEvent,
@@ -140,6 +142,7 @@ export function ListView({
             meetings={meetings}
             activeId={activeId}
             onSelect={onSelect}
+            onDelete={onDelete}
           />
         )}
 

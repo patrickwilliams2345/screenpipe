@@ -1125,12 +1125,19 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
             walk_duration
         );
 
+        // Per-app document_path resolution from on-disk state files
+        // (Obsidian config + VS Code-fork state.vscdb under
+        // `~/.config/`). Returns None for any unknown app, missing
+        // file, or read error — never panics. AT-SPI's Document
+        // interface is too uneven across toolkits to rely on.
+        let document_path = super::electron_docs::resolve_electron_doc_path(&app_lower);
         Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name: window_title,
             text_content,
             nodes: state.nodes,
             browser_url,
+            document_path,
             timestamp: Utc::now(),
             node_count: state.node_count,
             walk_duration,

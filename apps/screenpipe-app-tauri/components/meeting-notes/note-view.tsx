@@ -6,16 +6,28 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
-  ArrowUpRight,
   Calendar,
   Check,
   Clock,
+  Copy,
   Loader2,
+  Sparkles,
   Square,
   Trash2,
   Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { useToast } from "@/components/ui/use-toast";
 import { localFetch } from "@/lib/api";
 import { showChatWithPrefill } from "@/lib/chat-utils";
@@ -27,12 +39,15 @@ import {
 } from "@/lib/utils/meeting-format";
 import {
   buildEnrichedSummarizePrompt,
+  buildMeetingMarkdown,
+  fetchMeetingAudio,
   fetchMeetingContext,
   type MeetingContext,
 } from "@/lib/utils/meeting-context";
 import { cn } from "@/lib/utils";
 import { Receipts } from "./receipts";
 import { ReplayStrip } from "./replay-strip";
+import { NoteEditor } from "./note-editor";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
@@ -66,8 +81,9 @@ export function NoteView({
   const [attendees, setAttendees] = useState(meeting.attendees ?? "");
   const [note, setNote] = useState(meeting.note ?? "");
   const [saveState, setSaveState] = useState<SaveState>({ kind: "idle" });
-  const [confirmDelete, setConfirmDelete] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [meetingCtx, setMeetingCtx] = useState<MeetingContext | null>(null);
 
   const lastSavedRef = useRef({
@@ -82,7 +98,6 @@ export function NoteView({
     setAttendees(meeting.attendees ?? "");
     setNote(meeting.note ?? "");
     setSaveState({ kind: "idle" });
-    setConfirmDelete(false);
     setMeetingCtx(null);
     lastSavedRef.current = {
       title: meeting.title ?? "",
@@ -235,6 +250,52 @@ export function NoteView({
     }
   };
 
+  const handleCopy = async () => {
+    if (copying) return;
+    setCopying(true);
+    try {
+      const fresh: MeetingRecord = {
+        ...meeting,
+        title: title || null,
+        attendees: attendees || null,
+        note: note || null,
+      };
+      // Always re-fetch context + transcript on copy so the clipboard reflects
+      // what the user sees right now (live meetings update; speaker rename can
+      // happen without re-rendering ReplayStrip).
+      const [ctx, transcript] = await Promise.all([
+        fetchMeetingContext(fresh),
+        fetchMeetingAudio(
+          new Date(meeting.meeting_start).toISOString(),
+          (meeting.meeting_end
+            ? new Date(meeting.meeting_end)
+            : new Date()
+          ).toISOString(),
+        ).catch(() => []),
+      ]);
+      setMeetingCtx(ctx);
+
+      const md = buildMeetingMarkdown({
+        meeting: fresh,
+        context: ctx,
+        transcript,
+      });
+      await navigator.clipboard.writeText(md);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+      toast({ title: "copied to clipboard" });
+    } catch (err) {
+      console.error("failed to copy meeting", err);
+      toast({
+        title: "couldn't copy",
+        description: String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setCopying(false);
+    }
+  };
+
   const handleDelete = async () => {
     try {
       const res = await localFetch(`/meetings/${meeting.id}`, {
@@ -270,12 +331,45 @@ export function NoteView({
             <ArrowLeft className="h-3.5 w-3.5" />
             meetings
           </Button>
-          {isLive && (
-            <span className="flex items-center gap-2 text-xs uppercase tracking-[0.15em] text-foreground">
-              <span className="h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
-              recording
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleCopy}
+              disabled={copying}
+              title="copy meeting + transcript to clipboard"
+              className="h-8 w-8 p-0"
+            >
+              {copying ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : copied ? (
+                <Check className="h-3.5 w-3.5" />
+              ) : (
+                <Copy className="h-3.5 w-3.5" />
+              )}
+            </Button>
+            {isLive ? (
+              <span className="flex items-center gap-2 text-xs uppercase tracking-[0.15em] text-foreground">
+                <span className="h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
+                recording
+              </span>
+            ) : (
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleSummarize}
+              disabled={summarizing}
+              className="gap-2"
+            >
+              {summarizing ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Sparkles className="h-3.5 w-3.5" />
+              )}
+              summarize with AI
+            </Button>
+            )}
+          </div>
         </div>
 
         <input
@@ -308,19 +402,15 @@ export function NoteView({
 
         <div className="my-6 border-t border-border" />
 
-        <textarea
+        <NoteEditor
+          key={meeting.id}
           value={note}
-          onChange={(e) => setNote(e.target.value)}
+          onChange={setNote}
           placeholder={
             isLive
               ? "take notes here. they save automatically."
               : "write your notes here…"
           }
-          spellCheck
-          className={cn(
-            "w-full min-h-[40vh] bg-transparent resize-none focus:outline-none",
-            "text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/40",
-          )}
         />
 
         {meetingCtx?.activity && (
@@ -340,39 +430,39 @@ export function NoteView({
             <SaveIndicator state={saveState} />
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            {!isLive &&
-              (confirmDelete ? (
-                <div className="flex items-center gap-1">
+            {!isLive && (
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
                   <Button
                     variant="ghost"
                     size="sm"
-                    onClick={handleDelete}
-                    className="h-8 px-2 text-destructive hover:text-destructive normal-case tracking-normal"
+                    title="delete this meeting"
+                    className="h-8 w-8 p-0"
                   >
-                    delete?
+                    <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
                   </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setConfirmDelete(false)}
-                    className="h-8 px-2 normal-case tracking-normal"
-                  >
-                    cancel
-                  </Button>
-                </div>
-              ) : (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setConfirmDelete(true)}
-                  title="delete this meeting"
-                  className="h-8 w-8 p-0"
-                >
-                  <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
-                </Button>
-              ))}
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>delete meeting</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      your notes and transcript will be permanently deleted.
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>cancel</AlertDialogCancel>
+                    <AlertDialogAction
+                      variant="destructive"
+                      onClick={() => void handleDelete()}
+                    >
+                      delete
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            )}
 
-            {isLive ? (
+            {isLive && (
               <Button
                 variant="outline"
                 size="sm"
@@ -386,21 +476,6 @@ export function NoteView({
                   <Square className="h-3.5 w-3.5" />
                 )}
                 stop meeting
-              </Button>
-            ) : (
-              <Button
-                variant="default"
-                size="sm"
-                onClick={handleSummarize}
-                disabled={summarizing}
-                className="gap-2"
-              >
-                {summarizing ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <ArrowUpRight className="h-3.5 w-3.5" />
-                )}
-                summarize
               </Button>
             )}
           </div>

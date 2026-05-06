@@ -348,6 +348,7 @@ export function MeetingNotesSection({
       activeId={activeId}
       activeMeeting={activeMeeting}
       onSelect={setSelectedId}
+      onDelete={handleDeleted}
       onStart={() => handleStart()}
       onStop={handleStop}
       onStartFromEvent={handleStartFromEvent}

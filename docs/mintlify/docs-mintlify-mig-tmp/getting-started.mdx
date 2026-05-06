@@ -1,5 +1,5 @@
 ---
-title: "install screenpipe"
+title: "install screenpipe on macOS, Windows, and Linux"
 sidebarTitle: "installation"
 description: "Install screenpipe on macOS, Windows, or Linux. Record everything on screen and search screen history on Mac, Windows, and Linux. Start recording in minutes."
 icon: "rocket"
@@ -100,6 +100,29 @@ curl http://localhost:3030/health
 
 # search your screen history
 curl "http://localhost:3030/search"
+```
+
+### API authentication (required)
+
+the search endpoint requires an API key. get your key by running:
+
+```bash
+screenpipe auth token
+```
+
+then use it in curl:
+
+```bash
+curl "http://localhost:3030/search?q=example" \
+  -H "Authorization: Bearer <your-api-key>"
+```
+
+or set it as an environment variable:
+
+```bash
+export SCREENPIPE_API_KEY=$(screenpipe auth token)
+curl "http://localhost:3030/search?q=example" \
+  -H "Authorization: Bearer $SCREENPIPE_API_KEY"
 ```
 
 ## connect to AI

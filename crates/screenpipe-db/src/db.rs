@@ -31,8 +31,8 @@ use crate::{
     text_similarity::is_similar_transcription, AudioChunksResponse, AudioDevice, AudioEntry,
     AudioResult, AudioResultRaw, ContentType, DeviceType, Element, ElementRow, ElementSource,
     FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord,
-    MemoryRecord, OCREntry, OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, SearchMatch,
-    SearchMatchGroup, SearchResult, Speaker, TagContentType, TextBounds, TextPosition,
+    MemoryRecord, MemorySyncRow, OCREntry, OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order,
+    SearchMatch, SearchMatchGroup, SearchResult, Speaker, TagContentType, TextBounds, TextPosition,
     TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
 };
 
@@ -369,6 +369,11 @@ impl DatabaseManager {
         // so we check pragma_table_info and add missing columns in Rust.
         Self::ensure_event_driven_columns(pool).await?;
 
+        // Same self-heal pattern for the cross-device memories sync columns
+        // (added in 20260506120000_add_memories_sync_columns.sql). Older DBs
+        // upgraded across that migration boundary may have skipped it.
+        Self::ensure_memories_sync_columns(pool).await?;
+
         Ok(())
     }
 
@@ -464,6 +469,10 @@ impl DatabaseManager {
             ("content_hash", "INTEGER DEFAULT NULL"),
             ("simhash", "INTEGER DEFAULT NULL"),
             ("elements_ref_frame_id", "INTEGER DEFAULT NULL"),
+            // Absolute path of the document open in the focused window, when
+            // platform exposes it (macOS via AXDocument). NULL for non-file
+            // contexts (browsers, OS chrome, terminals).
+            ("document_path", "TEXT DEFAULT NULL"),
         ];
 
         for (col_name, col_type) in missing_columns {
@@ -495,6 +504,34 @@ impl DatabaseManager {
             );
         }
 
+        Ok(())
+    }
+
+    /// Self-heal the `memories.sync_uuid` and `memories.sync_modified_by`
+    /// columns + uuid index. Mirror of [`ensure_event_driven_columns`] for
+    /// the cross-device memories sync feature, so DBs that upgraded across
+    /// the migration boundary without applying it converge on next launch.
+    async fn ensure_memories_sync_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+        let cols: &[(&str, &str)] = &[("sync_uuid", "TEXT"), ("sync_modified_by", "TEXT")];
+        for (col_name, col_type) in cols {
+            let row: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1",
+            )
+            .bind(col_name)
+            .fetch_one(pool)
+            .await?;
+            if row.0 == 0 {
+                tracing::info!("Adding missing column memories.{}", col_name);
+                let sql = format!("ALTER TABLE memories ADD COLUMN {} {}", col_name, col_type);
+                sqlx::query(&sql).execute(pool).await?;
+            }
+        }
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_sync_uuid \
+             ON memories(sync_uuid) WHERE sync_uuid IS NOT NULL",
+        )
+        .execute(pool)
+        .await?;
         Ok(())
     }
 
@@ -1887,6 +1924,7 @@ impl DatabaseManager {
             app_name,
             window_name,
             browser_url,
+            None, // document_path — legacy callers don't carry it
             focused,
             capture_trigger,
             accessibility_text,
@@ -2316,6 +2354,13 @@ impl DatabaseManager {
     /// Insert a snapshot frame AND optional OCR text positions in a single transaction.
     /// This avoids opening two separate transactions per capture which doubles pool pressure.
     #[allow(clippy::too_many_arguments)]
+    /// Insert a snapshot frame plus optional OCR text/json.
+    ///
+    /// `document_path` is the absolute filesystem path of the document open in
+    /// the focused window, when the platform exposes one (macOS via
+    /// AXDocument). Distinct from `browser_url` — the latter is for http(s),
+    /// the former for file://.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_snapshot_frame_with_ocr(
         &self,
         device_name: &str,
@@ -2324,6 +2369,7 @@ impl DatabaseManager {
         app_name: Option<&str>,
         window_name: Option<&str>,
         browser_url: Option<&str>,
+        document_path: Option<&str>,
         focused: bool,
         capture_trigger: Option<&str>,
         accessibility_text: Option<&str>,
@@ -2379,6 +2425,7 @@ impl DatabaseManager {
                 app_name: app_name.map(String::from),
                 window_name: window_name.map(String::from),
                 browser_url: browser_url.map(String::from),
+                document_path: document_path.map(String::from),
                 focused,
                 capture_trigger: capture_trigger.map(String::from),
                 accessibility_text: accessibility_text.map(String::from),
@@ -7262,6 +7309,7 @@ LIMIT ? OFFSET ?
             Some(app_name),
             Some(window_name),
             browser_url,
+            None, // document_path — legacy a11y-only test helper
             false,
             None,
             Some(text_content),
@@ -7495,7 +7543,59 @@ LIMIT ? OFFSET ?
         Ok(Some(format!("## typed during meeting\n\n{}", display)))
     }
 
-    /// End a meeting and optionally append typed text to its note.
+    /// Collect distinct absolute file paths the user had open in editors during
+    /// a meeting's time interval (from `frames.document_path`, populated on
+    /// macOS via AXDocument). Returns a markdown bullet list, deduplicated and
+    /// sorted alphabetically — or None when nothing qualifies.
+    ///
+    /// Edge cases handled:
+    /// * `document_path IS NULL` for browsers / OS chrome / terminals →
+    ///   filtered out by the WHERE clause.
+    /// * Same file appears in many frames (typical for the focused doc) →
+    ///   `DISTINCT` dedupes.
+    /// * Empty result → `Ok(None)` so caller skips emitting the section.
+    /// * 200-row cap (so a stray diff with thousands of distinct files
+    ///   doesn't explode the meeting note).
+    pub async fn get_meeting_edited_files(&self, id: i64) -> Result<Option<String>, SqlxError> {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT meeting_start, meeting_end FROM meetings WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let (start, end) = match row {
+            Some((s, Some(e))) => (s, e),
+            _ => return Ok(None),
+        };
+
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT DISTINCT document_path
+               FROM frames
+               WHERE timestamp >= ?1 AND timestamp <= ?2
+                 AND document_path IS NOT NULL
+                 AND document_path != ''
+               ORDER BY document_path ASC
+               LIMIT 200"#,
+        )
+        .bind(&start)
+        .bind(&end)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let bullets: Vec<String> = rows.iter().map(|(p,)| format!("- {}", p)).collect();
+        Ok(Some(format!(
+            "## files edited during meeting\n\n{}",
+            bullets.join("\n")
+        )))
+    }
+
+    /// End a meeting and optionally append auto-collected context (typed
+    /// text + edited files) to its note. Both blocks come from the same
+    /// `[meeting_start, meeting_end]` time window.
     pub async fn end_meeting_with_typed_text(
         &self,
         id: i64,
@@ -7509,22 +7609,38 @@ LIMIT ? OFFSET ?
             return Ok(());
         }
 
-        // Collect typed text
+        // Build the auto-injected suffix from the available signals. Each
+        // signal is independently optional — a meeting where the user only
+        // edited files but typed nothing still gets the files block, and
+        // vice-versa. Order matters for readability: typed text first
+        // (the user's actual prose), files second (context).
+        let mut sections: Vec<String> = Vec::new();
         if let Ok(Some(typed_text)) = self.get_meeting_typed_text(id).await {
-            // Append to existing note
-            let existing_note: Option<(Option<String>,)> =
-                sqlx::query_as("SELECT note FROM meetings WHERE id = ?1")
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            sections.push(typed_text);
+        }
+        if let Ok(Some(files)) = self.get_meeting_edited_files(id).await {
+            sections.push(files);
+        }
+        if sections.is_empty() {
+            return Ok(());
+        }
+        let suffix = sections.join("\n\n");
 
-            let new_note = match existing_note {
-                Some((Some(existing),)) if !existing.is_empty() => {
-                    format!("{}\n\n{}", existing, typed_text)
-                }
-                _ => typed_text,
-            };
+        // Append to existing note
+        let existing_note: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT note FROM meetings WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
 
+        let new_note = match existing_note {
+            Some((Some(existing),)) if !existing.is_empty() => {
+                format!("{}\n\n{}", existing, suffix)
+            }
+            _ => suffix,
+        };
+
+        {
             let mut tx = self.begin_immediate_with_retry().await?;
             sqlx::query("UPDATE meetings SET note = ?1 WHERE id = ?2")
                 .bind(&new_note)
@@ -7919,6 +8035,142 @@ LIMIT ? OFFSET ?
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    // -- memories cross-device sync helpers --
+    //
+    // The HTTP layer + background loop in screenpipe-engine/src/memories_sync.rs
+    // calls these to read all rows for the manifest, mint sync_uuids on first
+    // publish, and apply remote rows back into the local table. Conflict
+    // resolution (LWW) lives in screenpipe-core::memories::sync and is pure;
+    // these are the I/O endpoints.
+
+    /// Read every memory + its sync metadata for manifest building.
+    /// Returns the full row including sync_uuid (may be NULL for rows
+    /// born locally that haven't synced yet) and sync_modified_by.
+    pub async fn list_memories_for_sync(&self) -> Result<Vec<MemorySyncRow>, SqlxError> {
+        sqlx::query_as::<_, MemorySyncRow>(
+            "SELECT id, sync_uuid, content, source, source_context, tags, importance, \
+                    created_at, updated_at, sync_modified_by \
+             FROM memories",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Stamp a freshly-minted sync_uuid + machine id on a row that's
+    /// being published for the first time. No-op if the row was deleted
+    /// while the sync was in flight (id no longer exists).
+    pub async fn set_memory_sync_identity(
+        &self,
+        id: i64,
+        sync_uuid: &str,
+        machine_id: &str,
+    ) -> Result<(), SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query(
+            "UPDATE memories SET sync_uuid = ?1, sync_modified_by = ?2 \
+             WHERE id = ?3 AND sync_uuid IS NULL",
+        )
+        .bind(sync_uuid)
+        .bind(machine_id)
+        .bind(id)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Apply a memory pulled from a remote machine. INSERTs if the
+    /// sync_uuid is unknown locally, UPDATEs the existing row if not.
+    /// Caller is responsible for LWW: this just writes what it's given.
+    /// `frame_id` is intentionally not synced (it's a local FK), so
+    /// imported rows always have NULL frame_id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_synced_memory(
+        &self,
+        sync_uuid: &str,
+        content: &str,
+        source: &str,
+        source_context: Option<&str>,
+        tags: &str,
+        importance: f64,
+        created_at: &str,
+        updated_at: &str,
+        sync_modified_by: &str,
+    ) -> Result<(), SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        // SQLite's INSERT … ON CONFLICT (sync_uuid) is the cleanest path,
+        // but the unique index is partial (WHERE sync_uuid IS NOT NULL),
+        // and partial indexes can't drive ON CONFLICT in SQLite < 3.40
+        // we don't gate on. Two-step is safer and the table is small.
+        let existing: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM memories WHERE sync_uuid = ?1 LIMIT 1")
+                .bind(sync_uuid)
+                .fetch_optional(&mut **tx.conn())
+                .await?;
+        if let Some((id,)) = existing {
+            sqlx::query(
+                "UPDATE memories SET content = ?1, source = ?2, source_context = ?3, \
+                                     tags = ?4, importance = ?5, created_at = ?6, \
+                                     updated_at = ?7, sync_modified_by = ?8 \
+                 WHERE id = ?9",
+            )
+            .bind(content)
+            .bind(source)
+            .bind(source_context)
+            .bind(tags)
+            .bind(importance)
+            .bind(created_at)
+            .bind(updated_at)
+            .bind(sync_modified_by)
+            .bind(id)
+            .execute(&mut **tx.conn())
+            .await?;
+        } else {
+            sqlx::query(
+                "INSERT INTO memories (sync_uuid, content, source, source_context, tags, \
+                                       importance, created_at, updated_at, sync_modified_by) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind(sync_uuid)
+            .bind(content)
+            .bind(source)
+            .bind(source_context)
+            .bind(tags)
+            .bind(importance)
+            .bind(created_at)
+            .bind(updated_at)
+            .bind(sync_modified_by)
+            .execute(&mut **tx.conn())
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Apply a remote tombstone — delete the local row matching the
+    /// uuid. No-op if not found (already deleted, or never synced).
+    pub async fn delete_memory_by_sync_uuid(&self, sync_uuid: &str) -> Result<(), SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query("DELETE FROM memories WHERE sync_uuid = ?1")
+            .bind(sync_uuid)
+            .execute(&mut **tx.conn())
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Look up a memory's sync_uuid by local id. Used by the DELETE
+    /// route to know whether to record a tombstone (skip if NULL —
+    /// the row was never published, so no other device has it).
+    pub async fn get_memory_sync_uuid(&self, id: i64) -> Result<Option<String>, SqlxError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT sync_uuid FROM memories WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(u,)| u))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -304,12 +304,18 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         );
 
         // Windows walker doesn't have timeout-based truncation yet — report as complete
+        // Per-app document_path resolution from on-disk state files
+        // (Obsidian config + VS Code-fork state.vscdb). Returns None
+        // for any unknown app or any failure — never panics.
+        let document_path =
+            super::electron_docs::resolve_electron_doc_path(&app_name.to_lowercase());
         Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name,
             text_content: text_buffer,
             nodes,
             browser_url,
+            document_path,
             timestamp: Utc::now(),
             node_count,
             walk_duration,
@@ -779,7 +785,8 @@ mod tests {
             &mut buf,
             &mut nodes,
             &mut url,
-            &None,
+            &None, // monitor_rect
+            &None, // window_rect
             &[],
             &mut false,
         );
@@ -848,7 +855,8 @@ mod tests {
             &mut buf,
             &mut nodes,
             &mut url,
-            &None,
+            &None, // monitor_rect
+            &None, // window_rect
             &[],
             &mut false,
         );
@@ -938,7 +946,8 @@ mod tests {
             &mut buf,
             &mut nodes,
             &mut url,
-            &None,
+            &None, // monitor_rect
+            &None, // window_rect
             &ignored,
             &mut hit,
         );

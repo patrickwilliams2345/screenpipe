@@ -5,6 +5,12 @@
 //! Accessibility tree walker — periodically walks the macOS AX tree of the focused window,
 //! extracts all visible text, and stores it in the accessibility table.
 
+// Cross-platform: Obsidian + VS Code-fork state files live under
+// `dirs::config_dir()` on every supported OS (`~/Library/Application
+// Support` macOS, `%APPDATA%` Windows, `~/.config` Linux). Resolver
+// returns `None` for unknown apps, missing files, or any error — call
+// sites are safe to invoke for every focused frame.
+mod electron_docs;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -313,6 +319,14 @@ pub struct TreeSnapshot {
     /// Structured nodes preserving role and hierarchy from the accessibility tree.
     pub nodes: Vec<AccessibilityTreeNode>,
     pub browser_url: Option<String>,
+    /// Absolute filesystem path of the document the focused window is editing,
+    /// when the platform exposes one. macOS reads this from `AXDocument` when
+    /// it carries a `file://` URL (Obsidian, VS Code/Cursor, Xcode, TextEdit,
+    /// Pages, etc.). Browser URLs (http(s)) are stored separately in
+    /// `browser_url` — extractors here MUST skip non-file scheme so we don't
+    /// double-record. Windows/Linux currently always return `None`; UIA and
+    /// AT-SPI equivalents are tracked as follow-up.
+    pub document_path: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub node_count: usize,
     pub walk_duration: Duration,
