@@ -4,7 +4,7 @@
 import { Env, RequestBody } from '../types';
 import { createProvider, resolveModelAlias } from '../providers';
 import { addCorsHeaders } from '../utils/cors';
-import { logModelOutcome } from '../services/model-health';
+import { getModelHealth, logModelOutcome, ModelHealthStatus } from '../services/model-health';
 import { captureException } from '@sentry/cloudflare';
 
 // Auto model waterfall — ordered by quality/cost ratio (all free or near-free).
@@ -22,6 +22,43 @@ const AUTO_WATERFALL_VISION = [
   'llama-4-scout',    // free (Vertex MaaS), 109B MoE, decent vision fallback
   'gemini-2.5-flash', // backup vision option
 ];
+
+export function prioritizeHealthyModels(
+  chain: string[],
+  health: Record<string, ModelHealthStatus>,
+): string[] {
+  const rank = (model: string): number => {
+    const status = health[resolveModelAlias(model)]?.status;
+    if (status === 'down') return 2;
+    if (status === 'degraded') return 1;
+    return 0;
+  };
+
+  return chain
+    .map((model, index) => ({ model, index, rank: rank(model) }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map(({ model }) => model);
+}
+
+let autoHealthCache:
+  | { expiresAt: number; health: Record<string, ModelHealthStatus> }
+  | null = null;
+
+async function autoChain(baseChain: string[], env: Env): Promise<string[]> {
+  try {
+    const now = Date.now();
+    if (!autoHealthCache || autoHealthCache.expiresAt <= now) {
+      autoHealthCache = {
+        expiresAt: now + 5_000,
+        health: await getModelHealth(env),
+      };
+    }
+    return prioritizeHealthyModels(baseChain, autoHealthCache.health);
+  } catch (error) {
+    console.warn('auto: failed to load model health; using static chain', error);
+    return baseChain;
+  }
+}
 
 // Per-model fallback chains — when a user-selected model fails with a
 // transient/upstream error (524 timeout, 5xx, 429), we try comparable
@@ -291,7 +328,7 @@ export async function handleChatCompletions(body: RequestBody, env: Env): Promis
 
   // Auto model: smart waterfall through curated chain.
   if (body.model === 'auto') {
-    const chain = hasImages(body) ? AUTO_WATERFALL_VISION : AUTO_WATERFALL;
+    const chain = await autoChain(hasImages(body) ? AUTO_WATERFALL_VISION : AUTO_WATERFALL, env);
     const result = await runChain(chain, body, env, 'auto');
     if ('response' in result) {
       return addCorsHeaders(addModelHeader(result.response, result.model));

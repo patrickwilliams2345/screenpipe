@@ -122,6 +122,13 @@ pub async fn get_activity_summary(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ActivitySummaryQuery>,
 ) -> Result<JsonResponse<ActivitySummaryResponse>, (StatusCode, JsonResponse<Value>)> {
+    Ok(JsonResponse(collect_activity_summary(&state, query).await?))
+}
+
+pub async fn collect_activity_summary(
+    state: &AppState,
+    query: ActivitySummaryQuery,
+) -> Result<ActivitySummaryResponse, (StatusCode, JsonResponse<Value>)> {
     let start = query.start_time.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let end = query.end_time.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -386,7 +393,7 @@ pub async fn get_activity_summary(
         error!("activity summary: edited files query failed: {}", e);
     }
 
-    Ok(JsonResponse(ActivitySummaryResponse {
+    Ok(ActivitySummaryResponse {
         apps,
         windows,
         key_texts,
@@ -401,7 +408,7 @@ pub async fn get_activity_summary(
             start: start.clone(),
             end: end.clone(),
         },
-    }))
+    })
 }
 
 fn str_field(row: &Value, key: &str) -> String {

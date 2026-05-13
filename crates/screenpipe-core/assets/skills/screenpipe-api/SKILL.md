@@ -23,6 +23,27 @@ API responses can be large. Always write curl output to a file first (`curl ... 
 
 ---
 
+## 0. Agent Context — `GET /agent/context`
+
+Use this FIRST for broad chat questions like "what was I doing?", "show recent activity", "what happened in the meeting?", or any empty-result retry. It returns one bounded payload with activity summary, memories, small snippets, recording health, and a `data_status` so you don't mistake "empty query" for "nothing happened".
+
+```bash
+curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/agent/context?start_time=30m%20ago&end_time=now"
+```
+
+Important fields:
+- `data_status`: `ok`, `empty_but_recording`, `no_capture_in_range`, or `not_recording`
+- `query_status`: `not_requested`, `matched`, or `no_query_matches` for the optional `q` filter
+- `recording.last_frame_at` / `recording.last_audio_at`: use these before saying there is no data
+- `summary.windows`, `summary.key_texts`, `summary.audio_summary`: concise activity evidence
+- `memories`: durable user/project context
+- `snippets`: small bounded screen/audio excerpts
+- `guidance.next_best_query`: what to try next if empty
+
+Only drill into raw `/search` when `/agent/context` says `ok` but you need verbatim evidence, media paths, frame IDs, or a very specific content search.
+
+---
+
 ## 1. Search — `GET /search`
 
 ```bash
@@ -51,26 +72,28 @@ Don't jump to heavy `/search` calls. Escalate:
 
 | Step | Endpoint | When |
 |------|----------|------|
-| 0 | `GET /memories?q=...` | **Always query first/in parallel** — highest signal, lowest cost |
-| 1 | `GET /activity-summary?start_time=...&end_time=...` | Broad questions ("what was I doing?", "which apps?") |
-| 2 | `GET /search?...` | Need specific content |
-| 3 | `GET /elements?...` or `GET /frames/{id}/context` | UI structure, buttons, links |
-| 4 | `GET /frames/{frame_id}` (PNG) | Visual context needed |
+| 0 | `GET /agent/context?start_time=...&end_time=...` | **Default for chat** — broad activity, memories, snippets, and empty-state diagnosis |
+| 1 | `GET /memories?q=...` | Specific durable facts/preferences/decisions |
+| 2 | `GET /activity-summary?start_time=...&end_time=...` | Broad questions when you need the raw summary fields |
+| 3 | `GET /search?...` | Need specific content |
+| 4 | `GET /elements?...` or `GET /frames/{id}/context` | UI structure, buttons, links |
+| 5 | `GET /frames/{frame_id}` (PNG) | Visual context needed |
 
 Decision tree:
-- "What was I doing?" → Step 1 only
-- "Summarize my meeting" → Step 2 with `content_type=audio`, NO q param. Add `content_type=all` for screen context.
-- "How long on X?" → Step 1 (`/activity-summary` has `active_minutes`)
-- "Which apps today?" → Step 1 (do NOT use frame counts or SQL)
-- "What button did I click?" → Step 3 (`/elements` with role=AXButton)
-- "Show me what I saw" → Step 2 (find frame_id) → Step 4
+- "What was I doing?" → Step 0 only
+- "Summarize my meeting" → Step 0 first. If you need verbatim transcript, Step 3 with `content_type=audio`, NO q param.
+- "How long on X?" → Step 2 (`/activity-summary` has `minutes`)
+- "Which apps today?" → Step 2 (do NOT use frame counts or SQL)
+- "What button did I click?" → Step 4 (`/elements` with role=AXButton)
+- "Show me what I saw" → Step 3 (find frame_id) → Step 5
 
 ### Critical Rules
 
 1. **ALWAYS include `start_time`** — queries without time bounds WILL timeout
 2. **Use `app_name`** when user mentions a specific app (this is string contains)
 3. **"recent"** = 30 min. **"today"** = since midnight. **"yesterday"** = yesterday's range
-4. If timeout, narrow the time range
+4. If empty, check `/agent/context.data_status` before saying no data exists
+5. If timeout, narrow the time range
 
 ### Response Format
 
