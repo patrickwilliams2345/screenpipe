@@ -545,6 +545,20 @@ fn is_wasapi_unsupported_format(err: &anyhow::Error) -> bool {
 }
 
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+macro_rules! cpal_build_input_stream {
+    ($device:expr, $config:expr, $data_callback:expr, $error_callback:expr, $timeout:expr $(,)?) => {{
+        #[cfg(target_os = "macos")]
+        {
+            $device.build_input_stream($config, $data_callback, $error_callback, $timeout, None)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            $device.build_input_stream($config, $data_callback, $error_callback, $timeout)
+        }
+    }};
+}
+
+#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
@@ -555,56 +569,56 @@ fn build_input_stream(
 ) -> Result<cpal::Stream> {
     let stream_config = cpal_stream_config(config, windows_input_aec);
     match config.sample_format() {
-        cpal::SampleFormat::F32 => device
-            .build_input_stream(
-                &stream_config,
-                move |data: &[f32], _: &_| {
-                    let mono = audio_to_mono(data, channels);
-                    let _ = tx.send(mono);
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|e| anyhow!(e)),
-        cpal::SampleFormat::I16 => device
-            .build_input_stream(
-                &stream_config,
-                move |data: &[i16], _: &_| {
-                    let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                    let mono = audio_to_mono(&f32_data, channels);
-                    let _ = tx.send(mono);
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|e| anyhow!(e)),
-        cpal::SampleFormat::I32 => device
-            .build_input_stream(
-                &stream_config,
-                move |data: &[i32], _: &_| {
-                    let f32_data: Vec<f32> = data
-                        .iter()
-                        .map(|&s| (s as f64 / 2147483648.0) as f32)
-                        .collect();
-                    let mono = audio_to_mono(&f32_data, channels);
-                    let _ = tx.send(mono);
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|e| anyhow!(e)),
-        cpal::SampleFormat::I8 => device
-            .build_input_stream(
-                &stream_config,
-                move |data: &[i8], _: &_| {
-                    let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 128.0).collect();
-                    let mono = audio_to_mono(&f32_data, channels);
-                    let _ = tx.send(mono);
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|e| anyhow!(e)),
+        cpal::SampleFormat::F32 => cpal_build_input_stream!(
+            device,
+            &stream_config,
+            move |data: &[f32], _: &_| {
+                let mono = audio_to_mono(data, channels);
+                let _ = tx.send(mono);
+            },
+            error_callback,
+            None,
+        )
+        .map_err(|e| anyhow!(e)),
+        cpal::SampleFormat::I16 => cpal_build_input_stream!(
+            device,
+            &stream_config,
+            move |data: &[i16], _: &_| {
+                let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                let mono = audio_to_mono(&f32_data, channels);
+                let _ = tx.send(mono);
+            },
+            error_callback,
+            None,
+        )
+        .map_err(|e| anyhow!(e)),
+        cpal::SampleFormat::I32 => cpal_build_input_stream!(
+            device,
+            &stream_config,
+            move |data: &[i32], _: &_| {
+                let f32_data: Vec<f32> = data
+                    .iter()
+                    .map(|&s| (s as f64 / 2147483648.0) as f32)
+                    .collect();
+                let mono = audio_to_mono(&f32_data, channels);
+                let _ = tx.send(mono);
+            },
+            error_callback,
+            None,
+        )
+        .map_err(|e| anyhow!(e)),
+        cpal::SampleFormat::I8 => cpal_build_input_stream!(
+            device,
+            &stream_config,
+            move |data: &[i8], _: &_| {
+                let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 128.0).collect();
+                let mono = audio_to_mono(&f32_data, channels);
+                let _ = tx.send(mono);
+            },
+            error_callback,
+            None,
+        )
+        .map_err(|e| anyhow!(e)),
         _ => Err(anyhow!(
             "unsupported sample format: {}",
             config.sample_format()
@@ -617,12 +631,16 @@ fn cpal_stream_config(
     config: &cpal::SupportedStreamConfig,
     #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] windows_input_aec: bool,
 ) -> cpal::StreamConfig {
-    let mut stream_config = config.config();
     #[cfg(target_os = "windows")]
     {
+        let mut stream_config = config.config();
         stream_config.windows_input_aec = windows_input_aec;
+        stream_config
     }
-    stream_config
+    #[cfg(not(target_os = "windows"))]
+    {
+        config.config()
+    }
 }
 
 impl Drop for AudioStream {
