@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use ndarray::{ArrayBase, Axis, IxDyn, ViewRepr};
-use std::{cmp::Ordering, path::Path, sync::Arc, sync::Mutex};
+use std::{cmp::Ordering, collections::VecDeque, path::Path, sync::Arc, sync::Mutex};
 use tracing::error;
 
 use super::{embedding::EmbeddingExtractor, embedding_manager::EmbeddingManager};
+
+const MIN_EMBEDDING_SAMPLES: usize = 1600;
+const MAX_EMBEDDING_SEGMENT_SECONDS: f64 = 4.0;
+const MAX_SAME_SPEAKER_MERGE_GAP_SECONDS: f64 = 0.75;
 
 #[derive(Debug, Clone)]
 #[repr(C)]
@@ -29,38 +33,27 @@ fn find_max_index(row: ArrayBase<ViewRepr<&f32>, IxDyn>) -> Result<usize> {
     Ok(max_index)
 }
 
-fn create_speech_segment(
-    start_offset: f64,
-    offset: i32,
+fn create_speech_segment_from_range(
+    start_idx: usize,
+    end_idx: usize,
     sample_rate: u32,
-    samples: &[f32],
     padded_samples: &[f32],
     embedding_extractor: Arc<Mutex<EmbeddingExtractor>>,
     embedding_manager: &Arc<Mutex<EmbeddingManager>>,
 ) -> Result<SpeechSegment> {
-    let start = start_offset / sample_rate as f64;
-    let end = offset as f64 / sample_rate as f64;
-
-    let start_f64 = start * (sample_rate as f64);
-    let end_f64 = end * (sample_rate as f64);
-
-    let start_idx = start_f64.min((samples.len().saturating_sub(1600)) as f64) as usize;
-    let mut end_idx = end_f64.min(samples.len() as f64) as usize;
-
-    let min_length = 1600;
     let mut segment_vec;
 
-    let segment_samples = if end_idx.saturating_sub(start_idx) < min_length {
-        let diff = min_length - end_idx.saturating_sub(start_idx);
-        if end_idx + diff <= padded_samples.len() {
-            end_idx += diff;
-            &padded_samples[start_idx..end_idx]
+    let segment_samples = if end_idx.saturating_sub(start_idx) < MIN_EMBEDDING_SAMPLES {
+        let diff = MIN_EMBEDDING_SAMPLES - end_idx.saturating_sub(start_idx);
+        let extended_end_idx = end_idx.saturating_add(diff);
+        if extended_end_idx <= padded_samples.len() {
+            &padded_samples[start_idx..extended_end_idx]
         } else if start_idx >= diff {
-            let start_idx_new = start_idx - diff;
-            &padded_samples[start_idx_new..end_idx]
+            let extended_start_idx = start_idx - diff;
+            &padded_samples[extended_start_idx..end_idx]
         } else {
             segment_vec = padded_samples[start_idx..end_idx].to_vec();
-            segment_vec.resize(min_length, 0.0);
+            segment_vec.resize(MIN_EMBEDDING_SAMPLES, 0.0);
             segment_vec.as_slice()
         }
     } else {
@@ -86,13 +79,55 @@ fn create_speech_segment(
     };
 
     Ok(SpeechSegment {
-        start,
-        end,
+        start: start_idx as f64 / sample_rate as f64,
+        end: end_idx as f64 / sample_rate as f64,
         samples: segment_samples.to_vec(),
         speaker,
         embedding,
         sample_rate,
     })
+}
+
+fn create_speech_segments(
+    start_offset: f64,
+    offset: i32,
+    sample_rate: u32,
+    samples: &[f32],
+    padded_samples: &[f32],
+    embedding_extractor: Arc<Mutex<EmbeddingExtractor>>,
+    embedding_manager: &Arc<Mutex<EmbeddingManager>>,
+) -> Result<Vec<SpeechSegment>> {
+    let max_segment_samples = ((sample_rate as f64) * MAX_EMBEDDING_SEGMENT_SECONDS) as usize;
+    let mut start_idx = start_offset
+        .max(0.0)
+        .min((samples.len().saturating_sub(1)) as f64) as usize;
+    let end_idx = (offset.max(0) as usize).min(samples.len());
+    let mut segments = Vec::new();
+
+    while start_idx < end_idx {
+        let mut split_end_idx = (start_idx + max_segment_samples).min(end_idx);
+
+        if end_idx.saturating_sub(split_end_idx) < MIN_EMBEDDING_SAMPLES && split_end_idx < end_idx
+        {
+            split_end_idx = end_idx;
+        }
+
+        if split_end_idx <= start_idx {
+            break;
+        }
+
+        segments.push(create_speech_segment_from_range(
+            start_idx,
+            split_end_idx,
+            sample_rate,
+            padded_samples,
+            embedding_extractor.clone(),
+            embedding_manager,
+        )?);
+        start_idx = split_end_idx;
+    }
+
+    Ok(segments)
 }
 
 fn handle_new_segment(
@@ -101,7 +136,10 @@ fn handle_new_segment(
     segments: &mut Vec<SpeechSegment>,
 ) -> Option<SpeechSegment> {
     if let Some(mut prev_segment) = current_segment {
-        if prev_segment.speaker == new_segment.speaker {
+        let gap_seconds = new_segment.start - prev_segment.end;
+        if prev_segment.speaker == new_segment.speaker
+            && gap_seconds <= MAX_SAME_SPEAKER_MERGE_GAP_SECONDS
+        {
             // Merge segments
             prev_segment.end = new_segment.end;
             prev_segment.samples.extend(new_segment.samples);
@@ -129,6 +167,7 @@ pub struct SegmentIterator {
     offset: i32,
     start_offset: f64,
     current_segment: Option<SpeechSegment>,
+    pending_segments: VecDeque<SpeechSegment>,
     padded_samples: Vec<f32>,
 }
 
@@ -162,11 +201,12 @@ impl SegmentIterator {
             offset: 721, // frame_start
             start_offset: 0.0,
             current_segment: None,
+            pending_segments: VecDeque::new(),
             padded_samples,
         })
     }
 
-    fn process_window(&mut self, window: &[f32]) -> Result<Option<SpeechSegment>> {
+    fn process_window(&mut self, window: &[f32]) -> Result<()> {
         let array = ndarray::Array1::from_vec(window.to_vec());
         let array = array
             .view()
@@ -185,8 +225,6 @@ impl SegmentIterator {
             .try_extract_array::<f32>()
             .context("Failed to extract tensor")?;
 
-        let mut result = None;
-
         for row in ort_out.outer_iter() {
             for sub_row in row.axis_iter(Axis(0)) {
                 let max_index = find_max_index(sub_row)?;
@@ -197,7 +235,7 @@ impl SegmentIterator {
                         self.is_speeching = true;
                     }
                 } else if self.is_speeching {
-                    let new_segment = match create_speech_segment(
+                    let new_segments = match create_speech_segments(
                         self.start_offset,
                         self.offset,
                         self.sample_rate,
@@ -215,12 +253,17 @@ impl SegmentIterator {
                         }
                     };
 
-                    let mut segments = Vec::new();
-                    self.current_segment =
-                        handle_new_segment(self.current_segment.take(), new_segment, &mut segments);
+                    for new_segment in new_segments {
+                        let mut segments = Vec::new();
+                        self.current_segment = handle_new_segment(
+                            self.current_segment.take(),
+                            new_segment,
+                            &mut segments,
+                        );
 
-                    if !segments.is_empty() {
-                        result = segments.pop();
+                        for segment in segments {
+                            self.pending_segments.push_back(segment);
+                        }
                     }
 
                     self.is_speeching = false;
@@ -229,7 +272,7 @@ impl SegmentIterator {
             }
         }
 
-        Ok(result)
+        Ok(())
     }
 }
 
@@ -237,7 +280,9 @@ impl Iterator for SegmentIterator {
     type Item = Result<SpeechSegment>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut result = None;
+        if let Some(segment) = self.pending_segments.pop_front() {
+            return Some(Ok(segment));
+        }
 
         while self.current_position < self.padded_samples.len() - 1 {
             let end = (self.current_position + self.window_size).min(self.padded_samples.len());
@@ -249,24 +294,16 @@ impl Iterator for SegmentIterator {
             };
 
             // Process the window
-            match self.process_window(&window) {
-                Ok(Some(segment)) => {
-                    result = Some(Ok(segment));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    result = Some(Err(e));
-                    break;
-                }
+            if let Err(e) = self.process_window(&window) {
+                return Some(Err(e));
             }
 
             // Update current_position after processing the window
             self.current_position += self.window_size;
-        }
 
-        // If a segment was found, return it
-        if let Some(segment) = result {
-            return Some(segment);
+            if let Some(segment) = self.pending_segments.pop_front() {
+                return Some(Ok(segment));
+            }
         }
 
         // Return final segment if exists
@@ -308,7 +345,7 @@ pub fn get_speaker_from_embedding(
     embedding_manager: &mut EmbeddingManager,
     embedding: Vec<f32>,
 ) -> String {
-    let search_threshold = 0.45; // cosine similarity threshold (1 - distance), aligned with DB threshold of 0.55 distance
+    let search_threshold = 0.4; // cosine similarity threshold (1 - distance), aligned with DB threshold of 0.55 distance
 
     embedding_manager
         .search_speaker(embedding.clone(), search_threshold)
