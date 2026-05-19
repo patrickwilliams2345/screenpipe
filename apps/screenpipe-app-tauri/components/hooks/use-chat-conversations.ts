@@ -186,9 +186,33 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       return;
     }
 
+    // Re-open: re-fetch from disk so the drawer reflects any archive /
+    // delete actions that happened while the drawer was closed. Without
+    // this, `fileConversations` stayed at whatever the in-memory snapshot
+    // was when the drawer was last closed — so archiving every chat from
+    // the sidebar's Recents left the drawer still showing them on next
+    // open (#3345). The cross-window event listeners patch this state
+    // in-place, but rely on the listener actually being registered AND
+    // receiving every event between actions and re-open; refreshing on
+    // re-open is the cheap belt-and-suspenders guarantee.
     if (migrationDoneRef.current) {
-      setHistoryReady(true);
-      return;
+      let cancelled = false;
+      const requestId = ++historyRequestRef.current;
+      (async () => {
+        try {
+          const convs = await loadConversationMetas("");
+          if (cancelled || historyRequestRef.current !== requestId) return;
+          setFileConversations(convs);
+          lastHistoryQueryRef.current = "";
+        } catch {
+          // ignore: keep the previous snapshot rather than blanking the UI
+        } finally {
+          if (!cancelled) setHistoryReady(true);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
     }
     migrationDoneRef.current = true;
     (async () => {
