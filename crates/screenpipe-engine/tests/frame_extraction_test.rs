@@ -31,35 +31,6 @@ fn find_ffmpeg() -> String {
     "ffmpeg".to_string()
 }
 
-/// Simulate creating an incomplete MP4 file (still being written)
-async fn create_incomplete_mp4(path: &str) -> Result<tokio::process::Child, std::io::Error> {
-    let ffmpeg = find_ffmpeg();
-
-    // Start ffmpeg process that reads from stdin (simulating live encoding)
-    // This creates an MP4 file without a moov atom until the process finishes
-    let child = Command::new(&ffmpeg)
-        .args([
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=duration=10:size=320x240:rate=1", // 10 second test pattern
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-t",
-            "10",
-            "-y",
-            path,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    Ok(child)
-}
-
 /// Try to extract a frame from a video file
 async fn extract_frame(video_path: &str, output_path: &str) -> Result<(), String> {
     let ffmpeg = find_ffmpeg();
