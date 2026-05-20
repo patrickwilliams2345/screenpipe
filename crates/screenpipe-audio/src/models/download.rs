@@ -5,8 +5,36 @@
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+#[derive(Debug)]
+struct CooldownError {
+    filename: String,
+    wait: Duration,
+}
+
+impl std::fmt::Display for CooldownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} model download is in cooldown (wait {:?})",
+            self.filename, self.wait
+        )
+    }
+}
+
+impl std::error::Error for CooldownError {}
+
+static DOWNLOAD_COOLDOWNS: OnceLock<StdMutex<std::collections::HashMap<String, Instant>>> =
+    OnceLock::new();
+
+fn cooldowns() -> &'static StdMutex<std::collections::HashMap<String, Instant>> {
+    DOWNLOAD_COOLDOWNS.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
 
 /// Shared model download with retries, validation, and concurrent download handling.
 /// Uses atomic flag to prevent duplicate concurrent downloads and timeout for callers
@@ -62,7 +90,16 @@ impl ModelDownloader {
                             err
                         ));
                     }
-                    tokio::time::sleep(poll_interval).await;
+
+                    // If we recently failed to download this model, avoid tight loops that
+                    // continuously re-trigger background downloads (CPU + log spam).
+                    if let Some(cooldown) = err.downcast_ref::<CooldownError>() {
+                        // Clamp to keep responsive if cooldown is long, while still reducing churn.
+                        let wait = cooldown.wait.min(Duration::from_secs(5));
+                        tokio::time::sleep(wait).await;
+                    } else {
+                        tokio::time::sleep(poll_interval).await;
+                    }
                 }
             }
         }
@@ -108,6 +145,20 @@ impl ModelDownloader {
             return Ok(path);
         }
 
+        let cooldown_key = format!("{}|{}", self.filename, self.url);
+        if let Some(wait) = {
+            let now = Instant::now();
+            let guard = cooldowns().lock().expect("cooldown mutex poisoned");
+            guard
+                .get(&cooldown_key)
+                .and_then(|until| until.checked_duration_since(now))
+        } {
+            return Err(anyhow::Error::new(CooldownError {
+                filename: self.filename.clone(),
+                wait,
+            }));
+        }
+
         // Try to start download with atomic flag
         let started_download = self
             .downloading_flag
@@ -125,9 +176,11 @@ impl ModelDownloader {
             let cache_dir = self.cache_dir.clone();
             let flag = self.downloading_flag;
             let model_path_lock = self.model_path_lock;
+            let cooldown_key = cooldown_key.clone();
 
             tokio::spawn(async move {
                 const MAX_RETRIES: u32 = 3;
+                const RESTART_COOLDOWN: Duration = Duration::from_secs(5 * 60);
                 let mut last_err = None;
                 for attempt in 1..=MAX_RETRIES {
                     info!(
@@ -159,6 +212,13 @@ impl ModelDownloader {
                         "{} model download failed after {} retries: {}",
                         filename, MAX_RETRIES, e
                     );
+                    let until = Instant::now() + RESTART_COOLDOWN;
+                    let mut guard = cooldowns().lock().expect("cooldown mutex poisoned");
+                    guard.insert(cooldown_key, until);
+                } else {
+                    // Success: clear any prior cooldown so a future missing-file can re-download immediately.
+                    let mut guard = cooldowns().lock().expect("cooldown mutex poisoned");
+                    guard.remove(&cooldown_key);
                 }
                 flag.store(false, Ordering::SeqCst);
             });
@@ -233,6 +293,7 @@ async fn download_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::sync::OnceLock;
     use tempfile::tempdir;
 
@@ -321,6 +382,39 @@ mod tests {
             result.is_err(),
             "Should return error when file missing and download attempted"
         );
+    }
+
+    #[tokio::test]
+    async fn cooldown_blocks_immediate_redownload_attempts() {
+        let dir = tempdir().unwrap();
+
+        static COOLDOWN_FLAG: OnceLock<AtomicBool> = OnceLock::new();
+        static COOLDOWN_LOCK: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+        let flag = COOLDOWN_FLAG.get_or_init(|| AtomicBool::new(false));
+        let lock = COOLDOWN_LOCK.get_or_init(|| Mutex::const_new(None));
+
+        let url = "http://example.com/cooldown.onnx".to_string();
+        let filename = "cooldown_test.onnx".to_string();
+
+        let key = format!("{}|{}", filename, url);
+        {
+            let until = Instant::now() + Duration::from_secs(60);
+            let mut guard = cooldowns().lock().unwrap();
+            guard.insert(key.clone(), until);
+        }
+
+        let downloader = ModelDownloader::new(url, filename, dir.path().to_path_buf(), flag, lock);
+        let err = downloader
+            .get_or_download_model()
+            .await
+            .expect_err("should be in cooldown");
+        assert!(err.downcast_ref::<CooldownError>().is_some());
+        assert!(!flag.load(Ordering::SeqCst));
+
+        // cleanup for isolation
+        let mut guard = cooldowns().lock().unwrap();
+        guard.remove(&key);
     }
 
     #[test]
