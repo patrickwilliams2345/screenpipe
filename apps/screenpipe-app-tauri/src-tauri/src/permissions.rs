@@ -978,6 +978,6 @@ pub fn request_arc_automation_permission(_app: tauri::AppHandle) -> bool {
 // NOTE: Runtime permission monitoring is now handled by
 // `screenpipe-engine::permission_monitor` which emits `permission_lost` /
 // `permission_restored` events on the shared event bus. The Tauri app
-// subscribes via `crate::permission_events` over /ws/events. This module
+// subscribes via `crate::engine_events::permission` over /ws/events. This module
 // keeps the synchronous TCC/AV check helpers used by the onboarding UI
 // and the preflight startup check.
