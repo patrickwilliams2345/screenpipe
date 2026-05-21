@@ -100,34 +100,16 @@ async fn upsert_server(
     let store = state.store.lock().await;
     let existing = store.get(&id).await;
     let created_at = existing.as_ref().map(|c| c.created_at).unwrap_or_else(|| Utc::now().timestamp());
-    let header_names: Vec<String> = body
-        .headers
-        .iter()
-        .filter(|h| !h.name.trim().is_empty())
-        .map(|h| h.name.trim().to_string())
-        .collect();
 
-    // If the caller supplied only header names (empty values), reuse
-    // existing values where the name matches. This lets the UI re-save
-    // metadata (e.g. rename) without re-prompting the user for secrets.
-    let supplied_with_values: Vec<McpHeader> = body
-        .headers
-        .iter()
-        .filter(|h| !h.name.trim().is_empty() && !h.value.is_empty())
-        .cloned()
-        .collect();
+    let supplied = normalise_supplied(body.headers);
+    let header_names: Vec<String> = supplied.iter().map(|h| h.name.clone()).collect();
+    let existing_headers: Vec<McpHeader> = store.get_headers(&id).await;
+    let merged = merge_headers(&existing_headers, &supplied);
 
-    let header_values: Option<Vec<McpHeader>> = if supplied_with_values.is_empty() {
-        // No new values — leave whatever's in the secret store alone.
-        // But if all known names were removed, wipe.
-        if header_names.is_empty() {
-            Some(Vec::new())
-        } else {
-            None
-        }
-    } else {
-        Some(supplied_with_values)
-    };
+    // Always pass `Some(...)` — even when empty — so deleting the last
+    // header actually wipes the secret blob instead of silently
+    // preserving it.
+    let header_values: Option<Vec<McpHeader>> = Some(merged);
 
     let cfg = McpServerConfig {
         id: id.clone(),
@@ -154,6 +136,49 @@ async fn delete_server(
         Ok(()) => Json(json!({ "success": true })).into_response(),
         Err(e) => bad_request(&e.to_string()),
     }
+}
+
+/// Drop entries with blank names, trim names, keep values exactly as
+/// supplied. Pure for testability.
+fn normalise_supplied(headers: Vec<McpHeader>) -> Vec<McpHeader> {
+    headers
+        .into_iter()
+        .filter(|h| !h.name.trim().is_empty())
+        .map(|h| McpHeader {
+            name: h.name.trim().to_string(),
+            value: h.value,
+        })
+        .collect()
+}
+
+/// Merge `supplied` headers on top of what's already in the secret
+/// store. Wire convention: an empty value in `supplied` means "keep
+/// whatever is stored under this name." Without this, adding ONE
+/// header to an existing server would wipe every other secret because
+/// the UI sends placeholder text for the unchanged ones.
+fn merge_headers(existing: &[McpHeader], supplied: &[McpHeader]) -> Vec<McpHeader> {
+    let mut existing_map: std::collections::HashMap<&str, &str> =
+        existing.iter().map(|h| (h.name.as_str(), h.value.as_str())).collect();
+    supplied
+        .iter()
+        .filter_map(|h| {
+            if !h.value.is_empty() {
+                // New value supplied — use it and forget the old one
+                // for this name so we don't double-output if the same
+                // name appears twice.
+                existing_map.remove(h.name.as_str());
+                Some(McpHeader {
+                    name: h.name.clone(),
+                    value: h.value.clone(),
+                })
+            } else {
+                existing_map.remove(h.name.as_str()).map(|value| McpHeader {
+                    name: h.name.clone(),
+                    value: value.to_string(),
+                })
+            }
+        })
+        .collect()
 }
 
 /// POST /mcp-servers/:id/test — probe stored server.
@@ -249,4 +274,111 @@ where
             get(get_server).put(upsert_server).delete(delete_server),
         )
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(name: &str, value: &str) -> McpHeader {
+        McpHeader {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_preserves_existing_value_for_placeholder() {
+        // Bug fix: editing an MCP server to add a new header used to
+        // wipe the existing Authorization secret because the UI sends
+        // empty/placeholder values for unchanged entries.
+        let existing = vec![h("Authorization", "Bearer secret")];
+        let supplied = vec![h("Authorization", ""), h("X-New", "value")];
+
+        let merged = merge_headers(&existing, &supplied);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].name, "Authorization");
+        assert_eq!(merged[0].value, "Bearer secret");
+        assert_eq!(merged[1].name, "X-New");
+        assert_eq!(merged[1].value, "value");
+    }
+
+    #[test]
+    fn merge_overwrites_when_new_value_supplied() {
+        let existing = vec![h("Authorization", "Bearer old")];
+        let supplied = vec![h("Authorization", "Bearer new")];
+
+        let merged = merge_headers(&existing, &supplied);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].value, "Bearer new");
+    }
+
+    #[test]
+    fn merge_drops_header_not_in_supplied() {
+        // User deleted X-Custom; merge should not resurrect it.
+        let existing = vec![h("Authorization", "tok"), h("X-Custom", "abc")];
+        let supplied = vec![h("Authorization", "")];
+
+        let merged = merge_headers(&existing, &supplied);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "Authorization");
+        assert_eq!(merged[0].value, "tok");
+    }
+
+    #[test]
+    fn merge_drops_placeholder_with_no_existing_value() {
+        // Name in supplied with empty value and nothing stored — drop.
+        // The user will see "auth missing" on probe and re-enter.
+        let existing: Vec<McpHeader> = vec![];
+        let supplied = vec![h("Authorization", "")];
+
+        let merged = merge_headers(&existing, &supplied);
+
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_handles_duplicate_supplied_names() {
+        // Same name supplied twice — the second non-empty wins.
+        let existing = vec![h("Authorization", "old")];
+        let supplied = vec![h("Authorization", "first"), h("Authorization", "second")];
+
+        let merged = merge_headers(&existing, &supplied);
+
+        // Both supplied entries are non-empty, so both survive. This
+        // gives the user a way to send the same header twice if they
+        // really want to — and matches what reqwest does with
+        // duplicate `.header()` calls.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].value, "first");
+        assert_eq!(merged[1].value, "second");
+    }
+
+    #[test]
+    fn normalise_drops_blank_names_and_trims() {
+        let input = vec![
+            h("  Authorization  ", "tok"),
+            h("", "value"),
+            h("   ", "value"),
+            h("X-Custom", ""),
+        ];
+
+        let out = normalise_supplied(input);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "Authorization");
+        assert_eq!(out[1].name, "X-Custom");
+    }
+
+    #[test]
+    fn normalise_preserves_value_whitespace() {
+        // Trim names, not values — some tokens are space-sensitive
+        // (e.g. include a trailing newline pasted from a UI form).
+        let input = vec![h("X-Token", "  raw value  ")];
+        let out = normalise_supplied(input);
+        assert_eq!(out[0].value, "  raw value  ");
+    }
 }

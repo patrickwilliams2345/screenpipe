@@ -112,8 +112,13 @@ pub struct McpServerStore {
 
 impl McpServerStore {
     pub fn new(screenpipe_dir: PathBuf, secret_store: Option<Arc<SecretStore>>) -> Self {
+        // Client-level timeout is the long ceiling for tool calls — many
+        // real MCP tools (search, code analysis, RAG) routinely take
+        // 30-60s. Per-call sites use shorter `.timeout(...)` overrides
+        // for cheap operations like `initialize` / `tools/list`.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
+            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -296,6 +301,10 @@ async fn probe_mcp_server(
     url: &str,
     headers: &[McpHeader],
 ) -> Result<Vec<McpToolDescriptor>> {
+    // Probes are interactive — the user is waiting in the settings
+    // dialog. Cap each step short to fail loud rather than spin.
+    let probe_timeout = Duration::from_secs(20);
+
     // Step 1 — initialize. Some servers gate tool listing on this.
     let _ = send_jsonrpc(
         client,
@@ -307,11 +316,20 @@ async fn probe_mcp_server(
             "capabilities": {},
             "clientInfo": { "name": "screenpipe", "version": env!("CARGO_PKG_VERSION") },
         }),
+        Some(probe_timeout),
     )
     .await;
 
     // Step 2 — tools/list.
-    let response = send_jsonrpc(client, url, headers, "tools/list", json!({})).await?;
+    let response = send_jsonrpc(
+        client,
+        url,
+        headers,
+        "tools/list",
+        json!({}),
+        Some(probe_timeout),
+    )
+    .await?;
     let tools = response
         .get("tools")
         .and_then(|t| t.as_array())
@@ -347,15 +365,19 @@ async fn call_mcp_tool(
             "capabilities": {},
             "clientInfo": { "name": "screenpipe", "version": env!("CARGO_PKG_VERSION") },
         }),
+        Some(Duration::from_secs(20)),
     )
     .await;
 
+    // tools/call uses the client-level ceiling (5 min) — real MCP
+    // tools routinely take 30-60s.
     send_jsonrpc(
         client,
         url,
         headers,
         "tools/call",
         json!({ "name": tool, "arguments": args }),
+        None,
     )
     .await
 }
@@ -366,6 +388,7 @@ async fn send_jsonrpc(
     headers: &[McpHeader],
     method: &str,
     params: Value,
+    timeout: Option<Duration>,
 ) -> Result<Value> {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let body = json!({
@@ -380,6 +403,9 @@ async fn send_jsonrpc(
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .json(&body);
+    if let Some(t) = timeout {
+        req = req.timeout(t);
+    }
     for h in headers {
         if !h.name.is_empty() {
             req = req.header(h.name.as_str(), h.value.as_str());
@@ -406,14 +432,28 @@ async fn send_jsonrpc(
         return Err(anyhow!("MCP server returned {}: {}", status, truncate(&text, 400)));
     }
 
-    let payload = if content_type.starts_with("text/event-stream") {
-        // Streamable-HTTP: pick the first `data:` line that parses as
-        // JSON-RPC. We don't need streaming for probe/call — the
-        // server sends the final response in one event.
+    // Content-type sniffing: we accept either an explicit SSE
+    // content-type or a body whose first non-empty line looks like
+    // one. Some servers (especially behind reverse proxies) drop the
+    // `text/event-stream` header but still stream `event:`/`data:`
+    // frames.
+    let looks_like_sse = content_type.contains("event-stream")
+        || text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.starts_with("event:") || l.starts_with("data:"))
+            .unwrap_or(false);
+
+    let payload = if looks_like_sse {
         parse_sse_data(&text)?
     } else {
-        serde_json::from_str::<Value>(&text)
-            .map_err(|e| anyhow!("MCP server returned non-JSON body ({}): {}", e, truncate(&text, 200)))?
+        serde_json::from_str::<Value>(&text).map_err(|e| {
+            anyhow!(
+                "MCP server returned non-JSON body ({}): {}",
+                e,
+                truncate(&text, 200)
+            )
+        })?
     };
 
     if let Some(err) = payload.get("error") {
@@ -633,5 +673,209 @@ mod tests {
         let text = "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"ok\":true}}\r\n\r\n";
         let v = parse_sse_data(text).unwrap();
         assert_eq!(v["result"]["ok"], json!(true));
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end probe against an in-process MCP server (wiremock).
+    // These guard against regressions in the wire protocol — they're
+    // not a substitute for testing against a real Brave/Linear/etc.
+    // server, but they catch the JSON-RPC shape and SSE handling that
+    // pure unit tests can't see.
+    // -----------------------------------------------------------------
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn probe_against_mock_returns_tools() {
+        let server = MockServer::start().await;
+        // Generic responder — wiremock can't introspect the JSON-RPC
+        // method, so we return `tools/list` shape every time. The
+        // `initialize` call swallows the response anyway.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "test",
+                "result": {
+                    "tools": [
+                        { "name": "brave_web_search", "description": "Search the web" },
+                        { "name": "brave_news_search" },
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let tools = probe_mcp_server(&client, &server.uri(), &[])
+            .await
+            .unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "brave_web_search");
+        assert_eq!(tools[0].description.as_deref(), Some("Search the web"));
+        assert_eq!(tools[1].name, "brave_news_search");
+        assert!(tools[1].description.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_handles_sse_content_type() {
+        let server = MockServer::start().await;
+        let sse_body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"tools\":[{\"name\":\"sse_tool\"}]}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let tools = probe_mcp_server(&client, &server.uri(), &[])
+            .await
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "sse_tool");
+    }
+
+    #[tokio::test]
+    async fn probe_surfaces_jsonrpc_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "x",
+                "error": { "code": -32601, "message": "method not found" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = probe_mcp_server(&client, &server.uri(), &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("method not found"));
+    }
+
+    #[tokio::test]
+    async fn probe_surfaces_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("missing auth"))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = probe_mcp_server(&client, &server.uri(), &[])
+            .await
+            .unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("401"), "got: {}", s);
+        assert!(s.contains("missing auth"), "got: {}", s);
+    }
+
+    #[tokio::test]
+    async fn call_tool_forwards_arguments() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "x",
+                "result": {
+                    "content": [{ "type": "text", "text": "hello back" }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let result = call_mcp_tool(
+            &client,
+            &server.uri(),
+            &[],
+            "brave_web_search",
+            json!({ "query": "rust" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["content"][0]["text"], json!("hello back"));
+    }
+
+    // Round-trip the secret store with a real in-memory SecretStore.
+    // Proves that get_headers can read back what write_headers stored,
+    // which is the load-bearing contract behind the merge logic in
+    // mcp_servers_api.rs.
+    #[tokio::test]
+    async fn secret_store_round_trip() {
+        use sqlx::SqlitePool;
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let ss = Arc::new(SecretStore::new(pool, None).await.unwrap());
+
+        let dir = temp_dir();
+        let store = McpServerStore::new(dir.clone(), Some(ss.clone()));
+
+        let mut cfg = sample_config("brave");
+        cfg.header_names = vec!["Authorization".into(), "X-Custom".into()];
+        let headers = vec![
+            McpHeader {
+                name: "Authorization".into(),
+                value: "Bearer tok".into(),
+            },
+            McpHeader {
+                name: "X-Custom".into(),
+                value: "abc".into(),
+            },
+        ];
+        store.upsert(cfg, Some(headers)).await.unwrap();
+
+        let read = store.get_headers("brave").await;
+        assert_eq!(read.len(), 2);
+        let authz = read.iter().find(|h| h.name == "Authorization").unwrap();
+        assert_eq!(authz.value, "Bearer tok");
+        let custom = read.iter().find(|h| h.name == "X-Custom").unwrap();
+        assert_eq!(custom.value, "abc");
+
+        // Wipe and confirm gone.
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn auth_header_is_forwarded() {
+        // Guards the regression where multi-header storage drops the
+        // bearer token: register a server with an `Authorization`
+        // header, probe it, and assert the wiremock side observed the
+        // header on the wire.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer secret-xyz",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": "x",
+                "result": { "tools": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let tools = probe_mcp_server(
+            &client,
+            &server.uri(),
+            &[McpHeader {
+                name: "Authorization".to_string(),
+                value: "Bearer secret-xyz".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(tools.is_empty());
     }
 }
