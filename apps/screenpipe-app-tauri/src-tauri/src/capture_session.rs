@@ -302,18 +302,6 @@ async fn reconfigure_audio_manager(
     server: &ServerCore,
     config: &RecordingConfig,
 ) -> Result<(), String> {
-    // Symmetric with the CLI parse-time validation: refuse to start audio when
-    // meetings-only is requested but the meeting detector is disabled. Without
-    // this, the receiver fails closed (records nothing), but the UI shows the
-    // toggle as on — confusing for the user. Surface the misconfig loudly.
-    if config.audio_meetings_only && config.disable_meeting_detector {
-        return Err(
-            "audio_meetings_only requires the meeting detector; disable one of \
-             the two in Settings → Recording"
-                .to_string(),
-        );
-    }
-
     let openai_compatible_config =
         if config.audio_transcription_engine == AudioTranscriptionEngine::OpenAICompatible {
             Some(OpenAICompatibleConfig {
@@ -342,10 +330,19 @@ async fn reconfigure_audio_manager(
     let meeting_detector = if config.disable_audio {
         info!("meeting detector disabled because audio capture is disabled");
         None
-    } else if config.disable_meeting_detector {
+    } else if config.disable_meeting_detector && !config.audio_meetings_only {
         info!("meeting detector disabled by settings");
         None
     } else {
+        // audio_meetings_only IS the meeting detector's only consumer for many
+        // users — if they've opted into it, force the detector on regardless of
+        // the (advanced, task-mining-oriented) `disableMeetingDetector` flag.
+        // Otherwise the feature looks broken to anyone who flipped both.
+        if config.disable_meeting_detector && config.audio_meetings_only {
+            info!(
+                "meeting detector force-enabled by audio_meetings_only (overriding disable_meeting_detector)"
+            );
+        }
         Some(Arc::new(MeetingDetector::new()))
     };
 

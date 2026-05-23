@@ -867,16 +867,16 @@ impl RecordArgs {
             self.apply_explicit_overrides(&mut settings, sources);
         }
 
-        // Validate: meetings-only audio requires the v2 meeting detector.
-        // Refuse to start rather than silently degrading — the user explicitly
-        // opted into a privacy-shaped behavior; either fail-closed (record
-        // nothing) or fail-open (record everything) is worse than telling them
-        // the combo is invalid up-front.
+        // audio_meetings_only implies the meeting detector. The advanced
+        // `disable_meeting_detector` flag (intended for task-mining setups
+        // with no meeting workload) is overridden silently — if the user
+        // opted into meetings-only, refusing to start the binary because of
+        // a stale advanced flag would be hostile UX.
         if settings.audio_meetings_only && settings.disable_meeting_detector {
-            anyhow::bail!(
-                "--audio-meetings-only requires the v2 meeting detector; \
-                 cannot be combined with --disable-meeting-detector"
+            tracing::info!(
+                "audio_meetings_only overrides disable_meeting_detector — meeting detector will run"
             );
+            settings.disable_meeting_detector = false;
         }
 
         // First-launch tier detection for CLI users

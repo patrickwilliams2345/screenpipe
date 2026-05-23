@@ -2547,25 +2547,22 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div>
                   <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                     Only record audio during meetings
-                    <HelpTooltip text="Pauses 24/7 audio capture. Audio is only persisted while a meeting is detected (with a pre-roll buffer so the first words aren't lost and a grace tail for the end of the call). Live meeting notes are unaffected. Requires the meeting detector." />
+                    <HelpTooltip text="Pauses 24/7 audio capture. Audio is only persisted while a meeting is detected (with a pre-roll buffer so the first words aren't lost and a grace tail for the end of the call). Live meeting notes are unaffected." />
                   </h3>
                   <p className="text-xs text-muted-foreground">
-                    {settings.disableMeetingDetector
-                      ? "Disabled — the meeting detector is off, so meetings can't be detected"
-                      : "Skip background recording when no meeting is active"}
+                    Skip background recording when no meeting is active
                   </p>
                 </div>
               </div>
               <Switch
                 id="audioMeetingsOnly"
                 checked={settings.audioMeetingsOnly ?? false}
-                disabled={settings.disableMeetingDetector ?? false}
                 onCheckedChange={(checked) =>
                   handleSettingsChange({ audioMeetingsOnly: checked }, true)
                 }
               />
             </div>
-            {(settings.audioMeetingsOnly ?? false) && !(settings.disableMeetingDetector ?? false) && (
+            {(settings.audioMeetingsOnly ?? false) && (
               <div className="mt-2.5 ml-[26px] flex flex-col gap-2">
                 {/* Live status — driven by /health. Standby when meetings-only is
                     active but no meeting is detected; Recording when a meeting

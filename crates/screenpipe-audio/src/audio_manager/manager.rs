@@ -79,30 +79,6 @@ fn log_audio_process_error(e: &anyhow::Error) {
     }
 }
 
-/// Rate-limiter for the meetings-only "no detector" misconfiguration error.
-/// Same pattern as `log_audio_process_error` — once per 300s is enough to
-/// surface the problem without spamming Sentry on every audio manager start.
-static LAST_MEETINGS_ONLY_NO_DETECTOR_EPOCH_SECS: AtomicU64 = AtomicU64::new(0);
-const MEETINGS_ONLY_NO_DETECTOR_INTERVAL_SECS: u64 = 300;
-
-fn log_meetings_only_no_detector_once() {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let last = LAST_MEETINGS_ONLY_NO_DETECTOR_EPOCH_SECS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= MEETINGS_ONLY_NO_DETECTOR_INTERVAL_SECS {
-        LAST_MEETINGS_ONLY_NO_DETECTOR_EPOCH_SECS.store(now, Ordering::Relaxed);
-        error!(
-            "audio_meetings_only is enabled but no meeting detector is configured; \
-             no audio will be recorded until the detector is enabled"
-        );
-    } else {
-        debug!(
-            "audio_meetings_only without detector (rate-limited; see prior error for details)"
-        );
-    }
-}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AudioManagerStatus {
@@ -736,18 +712,12 @@ impl AudioManager {
         let shared_engine = self.engine.clone();
         let on_insert_session = self.on_transcription_insert.clone();
 
-        // Surface mode to /health regardless of detector availability — UI
-        // reads this to render the "standby / recording" status pill.
+        // Surface mode to /health so the UI can render the
+        // "standby / recording" status pill. Higher-level config layers
+        // (Tauri capture_session + CLI parse) guarantee the meeting
+        // detector is present whenever audio_meetings_only is true, so
+        // the gate's fail-closed branch is purely defensive here.
         metrics.set_meetings_only_active(audio_meetings_only);
-        if audio_meetings_only && meeting_detector.is_none() {
-            // Fail closed: privacy-conscious users explicitly opted into
-            // "only during meetings"; silently recording 24/7 would violate
-            // intent. The receiver loop will refuse to persist anything,
-            // and the UI surface (chunks_dropped_no_meeting) makes the
-            // misconfiguration visible. Rate-limited so an apply_options
-            // loop can't flood Sentry.
-            log_meetings_only_no_detector_once();
-        }
 
         // Build unified transcription engine — only loads the needed model
         let engine = TranscriptionEngine::new(
