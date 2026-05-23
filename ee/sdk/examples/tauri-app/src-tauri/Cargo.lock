@@ -6977,7 +6977,6 @@ dependencies = [
  "screenpipe-db",
  "screenpipe-screen",
  "serde",
- "serde_json",
  "tokio",
  "tracing",
 ]
@@ -7037,12 +7036,11 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-tauri"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "screenpipe-recorder",
  "serde",
- "serde_json",
  "tauri",
  "thiserror 2.0.18",
  "tokio",
