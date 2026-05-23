@@ -38,6 +38,66 @@ export type ScreenpipeStartOptions = Partial<RecorderOptions> & {
   filenamePrefix?: string;
 };
 
+/**
+ * Stable list of event names a `ScreenpipeSession` can emit. The taxonomy
+ * is the contract — adding a new name is backwards-compatible, but
+ * renaming or removing one requires a major SDK version bump. Allow-list
+ * downstream subscribers against this list rather than the EventEmitter
+ * surface so unknown future events fail loudly instead of silently.
+ */
+export type ScreenpipeEventName =
+  | "start"
+  | "stop"
+  | "recording_started"
+  | "recording_stopped"
+  | "paused"
+  | "resumed"
+  | "recording_paused"
+  | "recording_resumed"
+  | "app_switched"
+  | "frames_progress"
+  | "permissions_changed"
+  | "error";
+
+export type ScreenpipeFilterEventPayload = {
+  paused: boolean;
+  reason: string | null;
+};
+
+export type ScreenpipeAppSwitchedPayload = {
+  focused: FocusedApp | null;
+  previous: FocusedApp | null;
+};
+
+export type ScreenpipeFramesProgressPayload = {
+  frames: number;
+  bytes: number;
+  elapsedMs: number;
+  output: string | null;
+};
+
+export type ScreenpipePermissionsChangedPayload = {
+  current: PermissionStatus;
+  previous: PermissionStatus | null;
+};
+
+export type ScreenpipeErrorPayload = {
+  component: string;
+  name: string;
+  message: string;
+  fatal: boolean;
+};
+
+export type ScreenpipeEventPayload =
+  | ScreenpipeStatus
+  | ScreenpipeFilterEventPayload
+  | ScreenpipeAppSwitchedPayload
+  | ScreenpipeFramesProgressPayload
+  | ScreenpipePermissionsChangedPayload
+  | ScreenpipeErrorPayload;
+
+export const SCREENPIPE_EVENTS: ReadonlyArray<ScreenpipeEventName>;
+
 export type ScreenpipeSessionOptions = {
   app?: { getPath(name: string): string };
   shell?: { showItemInFolder(file: string): void };
@@ -45,10 +105,7 @@ export type ScreenpipeSessionOptions = {
   outputDir?: string | (() => string);
   permissionTimeoutMs?: number;
   recorderOptions?: Partial<RecorderOptions>;
-  onEvent?: (
-    event: "start" | "stop" | "paused" | "resumed",
-    payload: ScreenpipeStatus | FilterStatus,
-  ) => void;
+  onEvent?: (event: ScreenpipeEventName, payload: ScreenpipeEventPayload) => void;
   native?: {
     Recorder: new (options: RecorderOptions) => {
       start(): Promise<void>;
@@ -62,11 +119,6 @@ export type ScreenpipeSessionOptions = {
     };
     requestPermissions(): Promise<PermissionStatus>;
   };
-};
-
-export type ScreenpipeFilterEventPayload = {
-  paused: boolean;
-  reason: string | null;
 };
 
 export type ScreenpipeSession = Pick<EventEmitter, "on" | "off"> & {
@@ -85,6 +137,8 @@ export type ScreenpipeSession = Pick<EventEmitter, "on" | "off"> & {
   filterStatus(): Promise<ScreenpipeFilterEventPayload>;
   reveal(file?: string | null): Promise<boolean>;
   dispose(): Promise<void>;
+  /** Stable list of event names this session can emit. */
+  eventNames(): ScreenpipeEventName[];
 };
 
 export function createScreenpipeSession(options?: ScreenpipeSessionOptions): ScreenpipeSession;

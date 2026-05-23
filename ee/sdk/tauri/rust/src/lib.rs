@@ -5,14 +5,26 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
-use tauri::{plugin::TauriPlugin, Manager, Runtime, State};
+use tauri::{plugin::TauriPlugin, Emitter, Manager, Runtime, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
+
+/// Tauri event name used to forward every screenpipe session event to
+/// the frontend. Listen with `@tauri-apps/api/event`:
+///
+/// ```ts
+/// import { listen } from "@tauri-apps/api/event";
+/// listen<{ event: string; data: unknown }>("screenpipe://event", (e) => { ... });
+/// ```
+pub const SCREENPIPE_EVENT_CHANNEL: &str = "screenpipe://event";
 
 #[derive(Clone, Debug)]
 pub struct ScreenpipeConfig {
@@ -69,8 +81,6 @@ pub enum ScreenpipeTauriError {
     BridgeExited(String),
     #[error("screenpipe bridge returned invalid JSON: {0}")]
     InvalidJson(#[from] serde_json::Error),
-    #[error("screenpipe bridge returned response id {actual}, expected {expected}")]
-    MismatchedResponse { expected: u64, actual: u64 },
     #[error("{name}: {message}")]
     CommandFailed { name: String, message: String },
 }
@@ -87,16 +97,24 @@ impl ScreenpipeTauriError {
     }
 }
 
+/// Closure type used to forward notification frames from the JSON-line
+/// bridge to whatever event sink the host wires up. Captured once at
+/// plugin setup with the live `AppHandle<R>`; the bridge reader task
+/// never has to know what Runtime it's calling into.
+pub type EventEmitter = Arc<dyn Fn(EventPayload) + Send + Sync>;
+
 pub struct ScreenpipeState {
     config: ScreenpipeConfig,
     bridge: Mutex<Option<JsonLineBridge>>,
+    emitter: EventEmitter,
 }
 
 impl ScreenpipeState {
-    pub fn new(config: ScreenpipeConfig) -> Self {
+    pub fn new(config: ScreenpipeConfig, emitter: EventEmitter) -> Self {
         Self {
             config,
             bridge: Mutex::new(None),
+            emitter,
         }
     }
 
@@ -107,7 +125,7 @@ impl ScreenpipeState {
     ) -> Result<T, ScreenpipeTauriError> {
         let mut guard = self.bridge.lock().await;
         if guard.is_none() {
-            *guard = Some(JsonLineBridge::spawn(self.config.clone()).await?);
+            *guard = Some(JsonLineBridge::spawn(self.config.clone(), self.emitter.clone()).await?);
         }
         let result = guard
             .as_mut()
@@ -134,16 +152,22 @@ impl ScreenpipeState {
     }
 }
 
+type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, BridgeErrorPayload>>>>>;
+
 struct JsonLineBridge {
     child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    next_id: u64,
+    stdin: Mutex<ChildStdin>,
+    next_id: Mutex<u64>,
     command_timeout: Duration,
+    pending: PendingMap,
+    reader_task: JoinHandle<()>,
 }
 
 impl JsonLineBridge {
-    async fn spawn(config: ScreenpipeConfig) -> Result<Self, ScreenpipeTauriError> {
+    async fn spawn(
+        config: ScreenpipeConfig,
+        emitter: EventEmitter,
+    ) -> Result<Self, ScreenpipeTauriError> {
         let mut command = Command::new(&config.node_executable);
         command.arg(&config.bridge_script);
         command.stdin(Stdio::piped());
@@ -168,22 +192,30 @@ impl JsonLineBridge {
             .take()
             .ok_or(ScreenpipeTauriError::MissingStdout)?;
 
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let reader_task = spawn_reader(stdout, pending.clone(), emitter);
+
         Ok(Self {
             child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: 1,
+            stdin: Mutex::new(stdin),
+            next_id: Mutex::new(1),
             command_timeout: config.command_timeout,
+            pending,
+            reader_task,
         })
     }
 
     async fn call<T: DeserializeOwned>(
-        &mut self,
+        &self,
         method: &'static str,
         params: Value,
     ) -> Result<T, ScreenpipeTauriError> {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = {
+            let mut next_id = self.next_id.lock().await;
+            let id = *next_id;
+            *next_id += 1;
+            id
+        };
 
         let request = if params.is_null() {
             json!({ "id": id, "method": method })
@@ -193,42 +225,47 @@ impl JsonLineBridge {
         let mut line = serde_json::to_vec(&request)?;
         line.push(b'\n');
 
-        self.stdin.write_all(&line).await?;
-        self.stdin.flush().await?;
-
-        let mut response = String::new();
-        let bytes = timeout(self.command_timeout, self.stdout.read_line(&mut response))
-            .await
-            .map_err(|_| ScreenpipeTauriError::Timeout {
-                method: method.to_string(),
-                seconds: self.command_timeout.as_secs(),
-            })??;
-
-        if bytes == 0 {
-            return Err(ScreenpipeTauriError::BridgeExited(method.to_string()));
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(id, tx);
         }
 
-        let envelope: BridgeEnvelope = serde_json::from_str(&response)?;
-        let actual = envelope.id.unwrap_or(0);
-        if actual != id {
-            return Err(ScreenpipeTauriError::MismatchedResponse {
-                expected: id,
-                actual,
-            });
+        {
+            let mut stdin = self.stdin.lock().await;
+            if let Err(e) = stdin.write_all(&line).await {
+                self.pending.lock().await.remove(&id);
+                return Err(ScreenpipeTauriError::Spawn(e));
+            }
+            if let Err(e) = stdin.flush().await {
+                self.pending.lock().await.remove(&id);
+                return Err(ScreenpipeTauriError::Spawn(e));
+            }
         }
 
-        if envelope.ok {
-            serde_json::from_value(envelope.result.unwrap_or(Value::Null))
-                .map_err(ScreenpipeTauriError::InvalidJson)
-        } else {
-            let error = envelope.error.unwrap_or_else(|| BridgeErrorPayload {
-                name: "Error".to_string(),
-                message: "Unknown screenpipe bridge error".to_string(),
-            });
-            Err(ScreenpipeTauriError::CommandFailed {
+        let response = match timeout(self.command_timeout, rx).await {
+            Ok(Ok(payload)) => payload,
+            Ok(Err(_)) => {
+                // Sender dropped — reader task closed the channel because
+                // the bridge exited. Surface as a clean BridgeExited so
+                // the state layer can rebuild it on the next call.
+                return Err(ScreenpipeTauriError::BridgeExited(method.to_string()));
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(ScreenpipeTauriError::Timeout {
+                    method: method.to_string(),
+                    seconds: self.command_timeout.as_secs(),
+                });
+            }
+        };
+
+        match response {
+            Ok(value) => serde_json::from_value(value).map_err(ScreenpipeTauriError::InvalidJson),
+            Err(error) => Err(ScreenpipeTauriError::CommandFailed {
                 name: error.name,
                 message: error.message,
-            })
+            }),
         }
     }
 
@@ -238,16 +275,107 @@ impl JsonLineBridge {
     }
 
     async fn kill(&mut self) {
+        self.reader_task.abort();
         let _ = self.child.kill().await;
+        // Fail any still-pending callers so they don't hang forever.
+        let mut pending = self.pending.lock().await;
+        pending.clear();
     }
+}
+
+fn spawn_reader(
+    stdout: ChildStdout,
+    pending: PendingMap,
+    emitter: EventEmitter,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let read = match reader.read_line(&mut buf).await {
+                Ok(0) => {
+                    // EOF — bridge exited. Pending oneshot senders drop
+                    // when the map is cleared and the receivers wake up
+                    // with a closed channel.
+                    let mut pending = pending.lock().await;
+                    pending.clear();
+                    return;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    let mut pending = pending.lock().await;
+                    pending.clear();
+                    return;
+                }
+            };
+
+            if read == 0 {
+                return;
+            }
+
+            let trimmed = buf.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let envelope: BridgeEnvelope = match serde_json::from_str(trimmed) {
+                Ok(env) => env,
+                Err(_) => {
+                    // Garbage frame from the bridge — skip rather than
+                    // tear down the whole connection over one bad line.
+                    continue;
+                }
+            };
+
+            if let Some(event_name) = envelope.event.as_deref() {
+                // Notification frame — hand off to whatever sink the
+                // plugin's `init()` wired up. In normal operation that's
+                // `AppHandle::emit(SCREENPIPE_EVENT_CHANNEL, payload)`.
+                (emitter)(EventPayload {
+                    event: event_name.to_string(),
+                    data: envelope.data.unwrap_or(Value::Null),
+                });
+                continue;
+            }
+
+            let Some(id) = envelope.id else {
+                continue;
+            };
+            let Some(sender) = pending.lock().await.remove(&id) else {
+                continue;
+            };
+            if envelope.ok.unwrap_or(false) {
+                let _ = sender.send(Ok(envelope.result.unwrap_or(Value::Null)));
+            } else {
+                let error = envelope.error.unwrap_or_else(|| BridgeErrorPayload {
+                    name: "Error".to_string(),
+                    message: "Unknown screenpipe bridge error".to_string(),
+                });
+                let _ = sender.send(Err(error));
+            }
+        }
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventPayload {
+    pub event: String,
+    pub data: Value,
 }
 
 #[derive(Debug, Deserialize)]
 struct BridgeEnvelope {
+    /// RPC response frames carry this. Event notifications do not.
     id: Option<u64>,
-    ok: bool,
+    ok: Option<bool>,
     result: Option<Value>,
     error: Option<BridgeErrorPayload>,
+    /// Notification frames carry this — the session event name.
+    event: Option<String>,
+    /// Notification payload.
+    data: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -456,6 +584,14 @@ async fn screenpipe_dispose(state: State<'_, ScreenpipeState>) -> Result<bool, S
     Ok(true)
 }
 
+#[tauri::command]
+async fn screenpipe_events(state: State<'_, ScreenpipeState>) -> Result<Vec<String>, String> {
+    state
+        .call("events", Value::Null)
+        .await
+        .map_err(Into::into)
+}
+
 pub fn init<R: Runtime>(config: ScreenpipeConfig) -> TauriPlugin<R> {
     tauri::plugin::Builder::new("screenpipe")
         .invoke_handler(tauri::generate_handler![
@@ -465,10 +601,18 @@ pub fn init<R: Runtime>(config: ScreenpipeConfig) -> TauriPlugin<R> {
             screenpipe_status,
             screenpipe_snapshot,
             screenpipe_reveal,
-            screenpipe_dispose
+            screenpipe_dispose,
+            screenpipe_events
         ])
         .setup(move |app, _api| {
-            app.manage(ScreenpipeState::new(config.clone()));
+            // Capture the live AppHandle into the emitter closure so the
+            // bridge reader task (which is runtime-agnostic) can forward
+            // notification frames into Tauri's event bus.
+            let handle = app.app_handle().clone();
+            let emitter: EventEmitter = Arc::new(move |payload: EventPayload| {
+                let _ = handle.emit(SCREENPIPE_EVENT_CHANNEL, payload);
+            });
+            app.manage(ScreenpipeState::new(config.clone(), emitter));
             Ok(())
         })
         .build()
@@ -492,10 +636,6 @@ mod tests {
             },
             ScreenpipeTauriError::BridgeExited("status".to_string()),
             ScreenpipeTauriError::InvalidJson(json_error),
-            ScreenpipeTauriError::MismatchedResponse {
-                expected: 1,
-                actual: 2,
-            },
         ];
 
         for error in cases {
@@ -511,5 +651,24 @@ mod tests {
         };
 
         assert!(!error.invalidates_bridge());
+    }
+
+    #[test]
+    fn notification_envelope_parses_without_id() {
+        let frame = r#"{"event":"app_switched","data":{"focused":null,"previous":null}}"#;
+        let envelope: BridgeEnvelope = serde_json::from_str(frame).unwrap();
+        assert_eq!(envelope.event.as_deref(), Some("app_switched"));
+        assert!(envelope.id.is_none());
+        assert!(envelope.ok.is_none());
+        assert!(envelope.data.is_some());
+    }
+
+    #[test]
+    fn response_envelope_parses_without_event() {
+        let frame = r#"{"id":42,"ok":true,"result":{"recording":false}}"#;
+        let envelope: BridgeEnvelope = serde_json::from_str(frame).unwrap();
+        assert_eq!(envelope.id, Some(42));
+        assert_eq!(envelope.ok, Some(true));
+        assert!(envelope.event.is_none());
     }
 }
