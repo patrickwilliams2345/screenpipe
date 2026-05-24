@@ -522,31 +522,10 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 ],
                 browser_title_patterns: &[],
             },
-            // Use specific phrases ("leave call", "leave meeting", "leave
-            // room", "leave studio") instead of bare "leave". The generic
-            // profile catches niche video apps via broad URL patterns, and
-            // when the AX scan walks every window of a browser (e.g. Arc)
-            // looking for call controls, a bare "leave" matches everyday
-            // page UI like Instacart's "Leave at the door" delivery
-            // option — triggering a phantom meeting. The specific phrases
-            // still cover Skype, Whereby, Riverside, RingCentral, BlueJeans,
-            // GoToMeeting, Dialpad, Around, and recent Daily.co builds.
             call_signals: vec![
                 CallSignal::RoleWithName {
                     role: "AXButton",
-                    name_contains: "leave call",
-                },
-                CallSignal::RoleWithName {
-                    role: "AXButton",
-                    name_contains: "leave meeting",
-                },
-                CallSignal::RoleWithName {
-                    role: "AXButton",
-                    name_contains: "leave room",
-                },
-                CallSignal::RoleWithName {
-                    role: "AXButton",
-                    name_contains: "leave studio",
+                    name_contains: "leave",
                 },
                 CallSignal::RoleWithName {
                     role: "AXButton",
@@ -3404,58 +3383,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_generic_profile_leave_signals_reject_ecommerce_strings() {
-        // Regression: an Instacart checkout page exposed "Leave at the door"
-        // as an AXButton, which matched the generic profile's bare
-        // `name_contains: "leave"` signal and started a phantom meeting in
-        // Arc. Tightening to specific phrases ("leave call", "leave meeting",
-        // "leave room", "leave studio") preserves legitimate detection
-        // without catching everyday e-commerce / UX strings.
-        let profile = generic_profile();
-        for innocuous in [
-            "Leave at the door",
-            "Leave a review",
-            "Leave page",
-            "Leave feedback",
-            "Leave a tip",
-        ] {
-            for signal in &profile.call_signals {
-                assert!(
-                    !check_signal_match(signal, "AXButton", Some(innocuous), None, None),
-                    "generic profile signal {signal:?} must NOT match innocuous button {innocuous:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_generic_profile_leave_signals_still_match_real_call_controls() {
-        // Smoke test: legitimate call-leave buttons across the niche video
-        // apps the generic profile covers must still trigger detection.
-        let profile = generic_profile();
-        for real_button in [
-            "Leave Call",
-            "Leave call",
-            "Leave Meeting",
-            "Leave Room",
-            "Leave Studio",
-            "Hang Up",
-            "Hangup",
-            "End Call",
-            "End Meeting",
-            "Disconnect",
-        ] {
-            let matched = profile
-                .call_signals
-                .iter()
-                .any(|s| check_signal_match(s, "AXButton", Some(real_button), None, None));
-            assert!(
-                matched,
-                "generic profile should still match legitimate call-leave button {real_button:?}"
-            );
-        }
-    }
 
     // ── State machine tests ────────────────────────────────────────────
 
