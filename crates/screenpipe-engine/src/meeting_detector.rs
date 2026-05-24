@@ -502,7 +502,12 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                     "butter.us",
                     "livestorm.co",
                     "ping.gg",
-                    "cal.com",
+                    // Cal.com is primarily a scheduling product — its booking
+                    // dashboard (app.cal.com/event-types) and booking pages
+                    // (cal.com/{user}/{event}) aren't calls. Only Cal Video
+                    // (app.cal.com/video/{uid}) is a live meeting URL. Matching
+                    // bare "cal.com" caused false positives on the dashboard.
+                    "cal.com/video",
                     "daily.co",
                     "app.daily.co",
                     "pop.com",
@@ -517,10 +522,31 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 ],
                 browser_title_patterns: &[],
             },
+            // Use specific phrases ("leave call", "leave meeting", "leave
+            // room", "leave studio") instead of bare "leave". The generic
+            // profile catches niche video apps via broad URL patterns, and
+            // when the AX scan walks every window of a browser (e.g. Arc)
+            // looking for call controls, a bare "leave" matches everyday
+            // page UI like Instacart's "Leave at the door" delivery
+            // option — triggering a phantom meeting. The specific phrases
+            // still cover Skype, Whereby, Riverside, RingCentral, BlueJeans,
+            // GoToMeeting, Dialpad, Around, and recent Daily.co builds.
             call_signals: vec![
                 CallSignal::RoleWithName {
                     role: "AXButton",
-                    name_contains: "leave",
+                    name_contains: "leave call",
+                },
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "leave meeting",
+                },
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "leave room",
+                },
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "leave studio",
                 },
                 CallSignal::RoleWithName {
                     role: "AXButton",
@@ -3314,6 +3340,119 @@ mod tests {
             assert!(
                 mute_matches.is_empty(),
                 "profile should not match standalone 'Mute' button"
+            );
+        }
+    }
+
+    /// Returns the generic-fallback profile (the one with broad URL patterns
+    /// like `daily.co`, `cal.com/video`, `pop.com`). Picks it by detecting the
+    /// distinctive `meet.jit.si` URL pattern.
+    fn generic_profile() -> MeetingDetectionProfile {
+        load_detection_profiles()
+            .into_iter()
+            .find(|p| {
+                p.app_identifiers
+                    .browser_url_patterns
+                    .contains(&"meet.jit.si")
+            })
+            .expect("generic fallback profile present")
+    }
+
+    /// Mirrors the lowercase substring match used by `has_browser_meeting_url`
+    /// and `db_find_browser_meetings`.
+    fn url_matches_any_pattern(url: &str, patterns: &[&str]) -> bool {
+        let url_lower = url.to_lowercase();
+        patterns
+            .iter()
+            .any(|p| url_lower.contains(&p.to_lowercase()))
+    }
+
+    #[test]
+    fn test_generic_profile_rejects_cal_dashboard_url() {
+        // Regression: bare `cal.com` URL pattern matched the cal.com booking
+        // dashboard, which then put Arc into the "candidate browser" set and
+        // let an unrelated tab's "Leave at the door" button fire a phantom
+        // meeting. Dashboard URLs are not calls.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+        for url in [
+            "https://app.cal.com/event-types",
+            "https://app.cal.com/bookings/upcoming",
+            "https://cal.com/louis/30min",
+            "https://cal.com/pricing",
+        ] {
+            assert!(
+                !url_matches_any_pattern(url, patterns),
+                "cal.com dashboard URL {url:?} should NOT match a meeting profile"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_profile_matches_cal_video_url() {
+        // The actual Cal Video URL (live meeting) must still match.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+        for url in [
+            "https://app.cal.com/video/abc123",
+            "https://app.cal.com/video/8f3e-meeting-uid",
+        ] {
+            assert!(
+                url_matches_any_pattern(url, patterns),
+                "Cal Video URL {url:?} should match the generic profile"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_profile_leave_signals_reject_ecommerce_strings() {
+        // Regression: an Instacart checkout page exposed "Leave at the door"
+        // as an AXButton, which matched the generic profile's bare
+        // `name_contains: "leave"` signal and started a phantom meeting in
+        // Arc. Tightening to specific phrases ("leave call", "leave meeting",
+        // "leave room", "leave studio") preserves legitimate detection
+        // without catching everyday e-commerce / UX strings.
+        let profile = generic_profile();
+        for innocuous in [
+            "Leave at the door",
+            "Leave a review",
+            "Leave page",
+            "Leave feedback",
+            "Leave a tip",
+        ] {
+            for signal in &profile.call_signals {
+                assert!(
+                    !check_signal_match(signal, "AXButton", Some(innocuous), None, None),
+                    "generic profile signal {signal:?} must NOT match innocuous button {innocuous:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_generic_profile_leave_signals_still_match_real_call_controls() {
+        // Smoke test: legitimate call-leave buttons across the niche video
+        // apps the generic profile covers must still trigger detection.
+        let profile = generic_profile();
+        for real_button in [
+            "Leave Call",
+            "Leave call",
+            "Leave Meeting",
+            "Leave Room",
+            "Leave Studio",
+            "Hang Up",
+            "Hangup",
+            "End Call",
+            "End Meeting",
+            "Disconnect",
+        ] {
+            let matched = profile
+                .call_signals
+                .iter()
+                .any(|s| check_signal_match(s, "AXButton", Some(real_button), None, None));
+            assert!(
+                matched,
+                "generic profile should still match legitimate call-leave button {real_button:?}"
             );
         }
     }
