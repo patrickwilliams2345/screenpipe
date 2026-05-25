@@ -11,6 +11,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
@@ -83,6 +84,10 @@ struct CalendarEventSignal {
 #[derive(Clone, Debug, Default)]
 struct CalendarMatch {
     title: Option<String>,
+    /// RFC3339 start time of the matched event — paired with title in the
+    /// prewarm dedup key so recurring same-title meetings (the 9:00 and 9:30
+    /// standups) are tracked independently.
+    start: Option<String>,
 }
 
 impl From<crate::calendar::CalendarEventItem> for CalendarEventSignal {
@@ -159,7 +164,12 @@ pub fn start(app: AppHandle) {
     );
 
     let calendar_events = Arc::new(RwLock::new(Vec::<CalendarEventSignal>::new()));
+    // Flips to true on first publication from `start_calendar_events_publisher`,
+    // signalling the cache is authoritative (max ~60s stale). Until then,
+    // the started-toast handler does an inline re-fetch on cache miss.
+    let cache_initialized = Arc::new(AtomicBool::new(false));
     let calendar_events_for_sub = Arc::clone(&calendar_events);
+    let cache_initialized_for_sub = Arc::clone(&cache_initialized);
     tauri::async_runtime::spawn(async move {
         let mut sub =
             screenpipe_events::subscribe_to_event::<Vec<CalendarEventSignal>>("calendar_events");
@@ -170,6 +180,7 @@ pub fn start(app: AppHandle) {
                 .into_iter()
                 .filter(|event| !event.is_all_day)
                 .collect();
+            cache_initialized_for_sub.store(true, Ordering::Release);
         }
     });
 
@@ -234,6 +245,7 @@ pub fn start(app: AppHandle) {
     });
 
     let started_suppressed = Arc::clone(&suppressed_titles);
+    let cache_initialized_for_started = Arc::clone(&cache_initialized);
     tauri::async_runtime::spawn(async move {
         let mut sub =
             screenpipe_events::subscribe_to_event::<MeetingStartedEvent>("meeting_started");
@@ -263,14 +275,18 @@ pub fn start(app: AppHandle) {
                 find_calendar_match(&events, &event.data)
             };
 
-            // Re-fetch when we couldn't enrich a title — the only field the
-            // started toast still consumes from the calendar match. Title is
-            // also used for prewarm dedup, so a missing match can let a
-            // duplicate slip through.
-            if calendar_match
+            // Re-fetch when the cache hasn't been initialized yet (publisher
+            // hasn't completed its first cycle) AND we couldn't enrich a
+            // title. Once the publisher has run, the cache is authoritative
+            // (≤60s stale) and re-fetching just wastes API calls — most
+            // expensively for users with no calendar connected, where every
+            // `meeting_started` would otherwise fan out to native + ICS +
+            // Google for zero benefit.
+            let cache_ready = cache_initialized_for_started.load(Ordering::Acquire);
+            let needs_title = calendar_match
                 .as_ref()
-                .is_none_or(|m| m.title.as_deref().is_none_or(|t| t.trim().is_empty()))
-            {
+                .is_none_or(|m| m.title.as_deref().is_none_or(|t| t.trim().is_empty()));
+            if !cache_ready && needs_title {
                 let fresh_events = fetch_fresh_calendar_events(&app).await;
                 if !fresh_events.is_empty() {
                     calendar_match = find_calendar_match(&fresh_events, &event.data);
@@ -339,9 +355,10 @@ fn forward_screenpipe_event(app: AppHandle, source: &'static str, target: &'stat
 }
 
 /// Returns true when we have already prewarmed the live-note toast for the
-/// calendar event that this `meeting_started` corresponds to. Matches by
-/// both the calendar-enriched title and the raw display title (the prewarm
-/// suppression key is `title|start` from the events crate).
+/// calendar event that this `meeting_started` corresponds to. Prefers an
+/// exact `title|start` match when the start time is known so back-to-back
+/// same-title events (recurring standups) don't bleed into each other.
+/// Falls back to title-only when we couldn't enrich a start time.
 async fn was_prewarmed(
     suppressed: &Arc<RwLock<HashMap<String, Instant>>>,
     calendar_match: &Option<CalendarMatch>,
@@ -356,15 +373,29 @@ async fn was_prewarmed(
     let candidate_titles: Vec<String> = [
         Some(chosen_title.to_string()),
         Some(display_title.to_string()),
-        calendar_match
-            .as_ref()
-            .and_then(|m| m.title.clone()),
+        calendar_match.as_ref().and_then(|m| m.title.clone()),
     ]
     .into_iter()
     .flatten()
     .map(|s| s.trim().to_lowercase())
     .filter(|s| !s.is_empty())
     .collect();
+
+    // When we know the calendar event's start, suppress only on an exact
+    // `title|start` match — recurring same-title events must not bleed into
+    // each other (the 9:00 standup's prewarm doesn't dedup the 9:30 one).
+    if let Some(start) = calendar_match
+        .as_ref()
+        .and_then(|m| m.start.as_deref())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return candidate_titles
+            .iter()
+            .any(|t| guard.contains_key(&format!("{t}|{start}")));
+    }
+
+    // Fallback only when calendar enrichment failed — title is the best
+    // signal we have, accept the small risk of cross-instance suppression.
     guard.keys().any(|key| {
         let key_title = key.split('|').next().unwrap_or("");
         candidate_titles.iter().any(|t| t == key_title)
@@ -461,6 +492,7 @@ fn find_calendar_match(
 
     Some(CalendarMatch {
         title: Some(best_event.title.clone()).filter(|s| !s.trim().is_empty()),
+        start: Some(best_event.start.clone()).filter(|s| !s.trim().is_empty()),
     })
 }
 
@@ -605,5 +637,43 @@ mod tests {
         }];
 
         assert!(find_calendar_match(&events, &MeetingStartedEvent::default()).is_none());
+    }
+
+    #[tokio::test]
+    async fn dedup_distinguishes_recurring_same_title_events() {
+        let suppressed: Arc<RwLock<HashMap<String, Instant>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let nine_am = "2026-05-25T09:00:00+00:00";
+        let nine_thirty = "2026-05-25T09:30:00+00:00";
+
+        // Prewarm fired for the 9:00 standup only.
+        suppressed
+            .write()
+            .await
+            .insert(format!("standup|{nine_am}"), Instant::now());
+
+        // 9:00 started toast → should be suppressed (prewarm already fired).
+        let match_nine = Some(CalendarMatch {
+            title: Some("Standup".into()),
+            start: Some(nine_am.into()),
+        });
+        assert!(
+            was_prewarmed(&suppressed, &match_nine, "Standup", "Standup").await,
+            "9:00 started toast must be suppressed — its prewarm fired"
+        );
+
+        // 9:30 started toast (same title, different start) → should NOT be
+        // suppressed. The 9:30 prewarm hasn't fired (e.g., user hasn't
+        // returned to the calendar publisher's window yet, or it was
+        // skipped). Before this fix, the title-only fallback would have
+        // wrongly suppressed it.
+        let match_nine_thirty = Some(CalendarMatch {
+            title: Some("Standup".into()),
+            start: Some(nine_thirty.into()),
+        });
+        assert!(
+            !was_prewarmed(&suppressed, &match_nine_thirty, "Standup", "Standup").await,
+            "9:30 started toast must fire — its prewarm never did"
+        );
     }
 }
