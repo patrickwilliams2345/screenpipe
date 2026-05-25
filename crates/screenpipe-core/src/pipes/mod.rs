@@ -4245,6 +4245,15 @@ Pipe name: {}
 /// run "now" — they expected it then. Better to no-op than surprise them.
 const ONE_OFF_STALE_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
 
+/// Grace window for catching a missed cron slot. A cron schedule means
+/// wall-clock time — "every day at 7am" should fire at 7am, not "the moment
+/// the app notices it hasn't run today." Without this, a pipe installed at
+/// 6pm with a 7am cron fires immediately (cron.after(epoch).next() is a
+/// 1970 slot, now >= 1970 ⇒ fire); same trap when the app was off across
+/// a scheduled slot. We absorb scheduler-tick latency and brief downtime,
+/// but skip catch-up beyond that — wait for the next scheduled slot.
+const CRON_GRACE_WINDOW: chrono::Duration = chrono::Duration::minutes(5);
+
 /// Validate that a `schedule: at <iso>` timestamp isn't already stale.
 /// Returns `Ok(())` for any non-one-off schedule. Called from `install_pipe`
 /// and `enable_pipe` so a stale one-off never lands on disk in the active
@@ -4490,9 +4499,16 @@ fn should_run(schedule: &str, last_run: DateTime<Utc>) -> bool {
         }
         Some(ParsedSchedule::Cron(cron)) => {
             let now = Utc::now();
-            // Find the next occurrence after last_run — if it's in the past, we should run
-            match cron.after(&last_run).next() {
-                Some(next) => now >= next,
+            // Anchor at max(last_run, now - grace) so we only consider slots that
+            // (a) haven't already been claimed by a prior run, and (b) aren't so
+            // stale that firing now would surprise the user. Without the grace
+            // anchor, a newly-installed pipe (last_run = epoch) or one whose app
+            // was off across a scheduled slot would fire immediately on the next
+            // tick — wrong for wall-clock cron. With it, those cases wait for the
+            // next future slot, which is what "every day at 7am" actually means.
+            let search_from = std::cmp::max(last_run, now - CRON_GRACE_WINDOW);
+            match cron.after(&search_from).next() {
+                Some(next) => next <= now,
                 None => false,
             }
         }
@@ -4715,6 +4731,7 @@ impl Drop for PipeManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
 
     // -- scheduler lifecycle tests ------------------------------------------
 
@@ -5079,9 +5096,62 @@ mod tests {
 
     #[test]
     fn test_should_run_human_daily() {
-        // "every day at 9am" should fire if last run was yesterday
-        let yesterday = Utc::now() - chrono::Duration::hours(25);
-        assert!(should_run("every day at 9am", yesterday));
+        // Wall-clock cron only fires when we're actually inside the scheduled
+        // slot (within CRON_GRACE_WINDOW). Anchor to the current hour:minute
+        // so the slot is "right now" regardless of when the test runs.
+        let now = Utc::now();
+        let cron_str = format!("0 {} {} * * * *", now.minute(), now.hour());
+        let yesterday = now - chrono::Duration::hours(25);
+        // Last run was yesterday, current minute's slot just passed → fire.
+        assert!(should_run(&cron_str, yesterday));
+
+        // Same cron, but last_run is "right now" (this slot already claimed) →
+        // don't re-fire. `cron.after(last_run)` is strictly after, so the next
+        // candidate is tomorrow's slot.
+        assert!(!should_run(&cron_str, now));
+    }
+
+    #[test]
+    fn test_should_run_cron_fresh_install_waits() {
+        // Pipe just installed (last_run = epoch) — must NOT fire immediately
+        // just because today's cron slot already passed. Should wait until the
+        // next future slot. Regression test: a user reported creating an
+        // "every day at 7am" pipe at 5:39pm that fired 12 seconds later.
+        let now = Utc::now();
+        // Pick an hour that's unambiguously outside the grace window from now
+        // (6h away in either direction).
+        let safe_hour = (now.hour() + 6) % 24;
+        let cron_str = format!("0 0 {} * * * *", safe_hour);
+        assert!(
+            !should_run(&cron_str, DateTime::UNIX_EPOCH),
+            "newly-installed cron pipe must not fire immediately on install — \
+             should wait for the next scheduled slot, not catch up from 1970"
+        );
+    }
+
+    #[test]
+    fn test_should_run_cron_stale_last_run_waits() {
+        // App was off for days. On restart, a daily cron whose slot passed
+        // hours ago must NOT fire immediately — wait for the next slot.
+        let now = Utc::now();
+        let safe_hour = (now.hour() + 6) % 24;
+        let cron_str = format!("0 0 {} * * * *", safe_hour);
+        let three_days_ago = now - chrono::Duration::days(3);
+        assert!(
+            !should_run(&cron_str, three_days_ago),
+            "after extended downtime, cron must wait for the next slot \
+             instead of firing stale catch-up runs"
+        );
+    }
+
+    #[test]
+    fn test_should_run_cron_within_grace_fires() {
+        // Slot was hit moments ago (typical: scheduler tick lag, brief sleep).
+        // Within grace → fire even though last_run is far in the past.
+        let now = Utc::now();
+        let cron_str = format!("0 {} {} * * * *", now.minute(), now.hour());
+        let yesterday = now - chrono::Duration::hours(25);
+        assert!(should_run(&cron_str, yesterday));
     }
 
     #[test]
