@@ -20,8 +20,14 @@ edition = "2021"
 [workspace.dependencies]
 # AI
 tokenizers = "0.21.0"
+# native-tls (SChannel on Windows, Secure Transport on macOS, OpenSSL on Linux)
+# so the corp/managed root CAs in the OS trust store are honored.
+# rustls-tls only trusts webpki-roots baked into the binary, which breaks on
+# enterprise networks that MITM TLS with a Group-Policy-installed root CA
+# (e.g. ORNL → huggingface.co fails with `UnknownIssuer`, blocking the
+# whisper/parakeet/qwen3-asr model downloads).
 hf-hub = { version = "0.3.2", git = "https://github.com/neo773/hf-hub", default-features = false, features = [
-    "rustls-tls",
+    "native-tls",
     "tokio",
     "ureq",
 ] }
