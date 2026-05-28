@@ -3220,6 +3220,32 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </Card>
         )}
 
+        {/* Automatic meeting detection */}
+        {!settings.disableAudio && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Users className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                    Automatic meeting detection
+                    <HelpTooltip text="Detects meeting apps (Zoom, Teams, Meet, Discord calls, etc.) to start/stop meetings and live notes. Turn off if it triggers spuriously and split meetings manually. CLI equivalent: --disable-meeting-detector." />
+                  </h3>
+                  <p className="text-xs text-muted-foreground">Auto-start meetings when a call app is detected</p>
+                </div>
+              </div>
+              <ManagedSwitch
+                settingKey="disableMeetingDetector"
+                id="disableMeetingDetector"
+                checked={!settings.disableMeetingDetector}
+                onCheckedChange={(checked) => handleSettingsChange({ disableMeetingDetector: !checked }, true)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+        )}
+
       </div>
       </LockedSetting>
 
