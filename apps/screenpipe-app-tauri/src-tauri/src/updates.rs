@@ -164,6 +164,101 @@ pub struct PendingUpdateSnapshot {
     pub auth_required: bool,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Restart gate (#3622)
+//
+// Every code path that culminates in `process::exit` — the auto-update
+// restart, banner-triggered relaunch, rollback restart — must wait for
+// `ServerCore::start` to reach the "ready" phase first. Otherwise the OS
+// runs onnxruntime's C++ static destructors while `AudioManager::new` is
+// still mid-`create_session` on the server worker thread, and the global
+// DataTypeRegistry gets torn down under the still-running PlannerImpl,
+// segfaulting at 0x2c8. Stack: #3557. Sentry can't see this crash because
+// the Rust SDK dies before the event ships.
+//
+// `await_restart_gate` is the single internal entry point; the
+// `await_safe_restart` Tauri command exposes it to the frontend banner.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Outcome of `await_restart_gate`. Callers branch on this rather than a
+/// bool so an "errored" startup is never confused with a "ready" one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartGate {
+    /// Boot reached the "ready" phase — safe to call `process::exit` /
+    /// `app.restart()` / `download_and_install` on Windows.
+    Proceed,
+    /// Boot reached the "error" phase. Restarting won't fix it; defer
+    /// and let the user investigate the boot failure first.
+    Errored,
+    /// Boot was still pending when the timeout elapsed. Defer; the next
+    /// restart trigger (next periodic check, user action) will retry.
+    DeferPending,
+}
+
+impl RestartGate {
+    pub fn proceed(self) -> bool {
+        matches!(self, RestartGate::Proceed)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            RestartGate::Proceed => "proceed",
+            RestartGate::Errored => "errored",
+            RestartGate::DeferPending => "pending",
+        }
+    }
+}
+
+/// Cap for the auto-update restart wait. Production boot is well under a
+/// minute even on cold installs; a 5-minute cap covers slow first-time
+/// model downloads and large DB migrations without holding the CheckGuard
+/// forever on a stuck startup.
+const AUTO_UPDATE_GATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Frontend (banner) cap. Shorter than the internal one because the user
+/// is actively waiting after a click — better to surface "still starting,
+/// try again" than to block the click indefinitely.
+const BANNER_GATE_TIMEOUT_SECS: u64 = 60;
+
+/// Wait for boot to reach "ready" or "error", with timeout. Logs the
+/// outcome with `label` so deferrals are searchable in support logs.
+pub async fn await_restart_gate(timeout: Duration, label: &str) -> RestartGate {
+    let outcome = crate::health::wait_for_boot_ready(timeout).await;
+    match outcome {
+        crate::health::BootReadiness::Ready => RestartGate::Proceed,
+        crate::health::BootReadiness::Errored => {
+            warn!(
+                "{}: boot phase is 'error' — deferring restart (won't help) (#3622)",
+                label
+            );
+            RestartGate::Errored
+        }
+        crate::health::BootReadiness::Pending => {
+            warn!(
+                "{}: boot phase still pending after {}s — deferring restart to avoid \
+                 onnxruntime teardown race (#3622). current phase: {}",
+                label,
+                timeout.as_secs(),
+                crate::health::get_boot_phase_snapshot().phase
+            );
+            RestartGate::DeferPending
+        }
+    }
+}
+
+/// Frontend-callable gate. The banner awaits this before calling
+/// `downloadAndInstall` (Windows: triggers process::exit internally) or
+/// `relaunch`. Returns one of `"proceed"`, `"errored"`, or `"pending"`
+/// — frontend toasts on the latter two.
+#[tauri::command]
+pub async fn await_safe_restart(timeout_secs: Option<u64>) -> String {
+    let cap = Duration::from_secs(timeout_secs.unwrap_or(BANNER_GATE_TIMEOUT_SECS));
+    await_restart_gate(cap, "banner-triggered restart")
+        .await
+        .as_str()
+        .to_string()
+}
+
 fn auto_update_enabled_from_settings(settings: Result<Option<SettingsStore>, String>) -> bool {
     settings
         .ok()
@@ -641,24 +736,11 @@ impl UpdatesManager {
                     update.version
                 );
 
-                // #3622: don't call process::exit while AudioManager::new is mid-init.
-                // ORT's C++ static destructors race the still-running create_session
-                // and segfault (EXC_BAD_ACCESS inside PlannerImpl::GetElementSize, see
-                // duplicate #3557 for the full stack). Wait for boot phase == "ready"
-                // BEFORE the user-facing 30s countdown so the UI doesn't lie about
-                // when the restart will happen. In the common case boot is already
-                // ready and this returns immediately. If startup is genuinely stuck
-                // past 5 min, defer to the next check cycle — pending update remains
-                // downloaded, banner stays visible.
-                let restart_wait_cap = Duration::from_secs(5 * 60);
-                if !crate::health::wait_for_boot_ready(restart_wait_cap).await {
-                    warn!(
-                        "auto-update v{}: boot phase not ready after {}s — deferring restart \
-                         to avoid onnxruntime teardown race (#3622). current phase: {}",
-                        update.version,
-                        restart_wait_cap.as_secs(),
-                        crate::health::get_boot_phase_snapshot().phase
-                    );
+                // #3622: gate process::exit on boot-ready to avoid the ORT teardown
+                // race. In the common case boot is already ready and this returns
+                // immediately. See `await_restart_gate` for the full rationale.
+                let label = format!("auto-update v{}", update.version);
+                if !await_restart_gate(AUTO_UPDATE_GATE_TIMEOUT, &label).await.proceed() {
                     return Result::Ok(true);
                 }
 

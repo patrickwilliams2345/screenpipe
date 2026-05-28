@@ -111,29 +111,59 @@ pub fn get_boot_phase_snapshot() -> BootPhaseSnapshot {
     BOOT_PHASE.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// True once `ServerCore::start` has finished and the app reached the "ready" phase.
+/// Snapshot of where the boot lifecycle currently is.
 ///
-/// Lifecycle gate for actions that race process teardown against still-initializing
-/// native sessions — see #3622 (onnxruntime SIGSEGV during auto-updater restart while
-/// `AudioManager::new` is mid-`create_session`).
-pub fn is_boot_ready() -> bool {
-    BOOT_PHASE
-        .read()
-        .map(|g| g.phase == "ready")
-        .unwrap_or(false)
+/// Used as a gate before actions that race process teardown against
+/// still-initializing native sessions — see #3622 (onnxruntime SIGSEGV during
+/// auto-updater restart while `AudioManager::new` is mid-`create_session`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootReadiness {
+    /// Phase is still pre-ready (`starting`, `migrating_database`,
+    /// `building_audio`, `starting_pipes`). Process teardown is unsafe.
+    Pending,
+    /// Phase is `ready`. Safe to restart.
+    Ready,
+    /// Phase is `error`. Process is in a stuck state; restart won't help and
+    /// callers should fail fast rather than waiting.
+    Errored,
 }
 
-/// Block until the boot phase reaches "ready" or `timeout` elapses.
-/// Returns `true` if ready, `false` on timeout.
-pub async fn wait_for_boot_ready(timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if is_boot_ready() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+fn read_boot_phase() -> String {
+    // Match existing pattern in this file: recover from poisoning rather than
+    // silently returning a wrong answer (which would cause wait loops to spin
+    // until timeout on a poisoned lock).
+    BOOT_PHASE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .phase
+        .clone()
+}
+
+pub fn boot_readiness() -> BootReadiness {
+    match read_boot_phase().as_str() {
+        "ready" => BootReadiness::Ready,
+        "error" => BootReadiness::Errored,
+        _ => BootReadiness::Pending,
     }
-    is_boot_ready()
+}
+
+/// Block until boot reaches a terminal state (`Ready` or `Errored`) or `timeout`
+/// elapses, then return the final readiness. Callers decide what to do with
+/// `Errored` and timed-out `Pending`.
+pub async fn wait_for_boot_ready(timeout: Duration) -> BootReadiness {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match boot_readiness() {
+            BootReadiness::Ready => return BootReadiness::Ready,
+            BootReadiness::Errored => return BootReadiness::Errored,
+            BootReadiness::Pending => {
+                if Instant::now() >= deadline {
+                    return BootReadiness::Pending;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
 }
 
 // Shared recording status that can be read by the tray menu
@@ -1448,5 +1478,147 @@ mod tests {
             is_unhealthy_icon(status_to_icon_key(status)),
             "should show failed icon if server never started"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Boot-readiness gate (#3622)
+    //
+    // These tests mutate the process-wide BOOT_PHASE singleton. They share a
+    // mutex so they run serially even under `cargo test`'s default parallel
+    // runner — otherwise one test's `set_boot_phase("ready")` would race
+    // another's `set_boot_phase("error")` and flap.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use std::sync::Mutex as StdMutex;
+    static BOOT_PHASE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn with_boot_phase<F: FnOnce()>(phase: &str, body: F) {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase(phase, None);
+        body();
+        // Reset so other tests see a known-pending baseline.
+        set_boot_phase("idle", None);
+    }
+
+    #[test]
+    fn boot_readiness_ready_when_ready_phase() {
+        with_boot_phase("ready", || {
+            assert_eq!(boot_readiness(), BootReadiness::Ready);
+            assert_eq!(boot_readiness(), BootReadiness::Ready);
+        });
+    }
+
+    #[test]
+    fn boot_readiness_errored_when_error_phase() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // set_boot_error uses a different code path than set_boot_phase
+        set_boot_error("simulated boot failure");
+        assert_eq!(boot_readiness(), BootReadiness::Errored);
+        assert_ne!(boot_readiness(), BootReadiness::Ready);
+        set_boot_phase("idle", None);
+    }
+
+    #[test]
+    fn boot_readiness_pending_during_intermediate_phases() {
+        for phase in ["starting", "migrating_database", "building_audio", "starting_pipes"] {
+            with_boot_phase(phase, || {
+                assert_eq!(
+                    boot_readiness(),
+                    BootReadiness::Pending,
+                    "phase {phase} should be pending"
+                );
+                assert_ne!(
+                    boot_readiness(),
+                    BootReadiness::Ready,
+                    "phase {phase} should not be ready"
+                );
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_returns_immediately_when_ready() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("ready", None);
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_secs(5)).await;
+        assert_eq!(result, BootReadiness::Ready);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "should not poll when already ready (took {:?})",
+            start.elapsed()
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_fails_fast_on_error_phase() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_error("simulated startup failure");
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_secs(60)).await;
+        assert_eq!(
+            result,
+            BootReadiness::Errored,
+            "must short-circuit on error, not wait out full timeout"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "error phase must fail fast (took {:?})",
+            start.elapsed()
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_returns_pending_on_timeout() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("building_audio", None);
+        // 200 ms is long enough for the polling loop to make at least one
+        // pass (poll interval is 500 ms, deadline check fires first), short
+        // enough not to slow the suite.
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_millis(200)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            BootReadiness::Pending,
+            "timeout while still pending should return Pending"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "should not overshoot timeout by much (took {:?})",
+            elapsed
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_observes_transition_to_ready() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("building_audio", None);
+
+        // Flip to ready after 100 ms. The waiter polls every 500 ms, so
+        // worst case it observes the transition within ~500 ms of the flip.
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            set_boot_phase("ready", None);
+        });
+
+        let result = wait_for_boot_ready(Duration::from_secs(5)).await;
+        assert_eq!(result, BootReadiness::Ready);
+        set_boot_phase("idle", None);
     }
 }
