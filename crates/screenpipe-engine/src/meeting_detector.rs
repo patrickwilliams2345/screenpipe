@@ -27,7 +27,7 @@ use crate::meeting_telemetry::{capture_detection_decision, MeetingDetectionScanS
 use crate::routes::meetings::{emit_meeting_status_changed, resolve_meeting_status_from};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt};
-use screenpipe_db::DatabaseManager;
+use screenpipe_db::{DatabaseManager, MEETING_END_REASON_AUTO_END, MEETING_END_REASON_SHUTDOWN};
 use screenpipe_events::subscribe_to_event;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2366,6 +2366,15 @@ pub async fn run_meeting_detection_loop(
     let mut auto_end_sub =
         subscribe_to_event::<MeetingAutoEndRequest>("meeting_auto_end_requested");
 
+    // Defense-in-depth against the meeting-merge bug: the DB filter in
+    // `find_recent_meeting_for_app` already excludes explicit_stop rows, but
+    // there is a small race window between the API writing `end_reason` and
+    // the detector seeing the next StartMeeting. We also remember the most
+    // recently explicit-stopped meeting in memory and refuse to merge into
+    // it for the rest of this detector lifetime. Cleared on app restart,
+    // which is fine — the DB filter takes over from there.
+    let mut last_explicit_stop_id: Option<i64> = None;
+
     info!(
         "meeting v2: detection loop started (base_interval={:?}, profiles={})",
         base_interval,
@@ -2385,7 +2394,10 @@ pub async fn run_meeting_detection_loop(
                         let now = Utc::now()
                             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                             .to_string();
-                        if let Err(e) = db.end_meeting(*meeting_id, &now).await {
+                        if let Err(e) = db
+                            .end_meeting(*meeting_id, &now, Some(MEETING_END_REASON_SHUTDOWN))
+                            .await
+                        {
                             error!("meeting v2: failed to end meeting on shutdown: {}", e);
                         }
                     }
@@ -2419,6 +2431,7 @@ pub async fn run_meeting_detection_loop(
                     state = MeetingState::Idle;
                     current_interval = IDLE_APPS_SCAN_INTERVAL;
                     sync_meeting_flag(false, &in_meeting_flag, &detector);
+                    last_explicit_stop_id = Some(stop_signal.meeting_id);
                 }
             }
         }
@@ -2436,7 +2449,12 @@ pub async fn run_meeting_detection_loop(
             if manual_matches || detector_matches {
                 let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
                 match db
-                    .end_meeting_with_typed_text(request.meeting_id, &now, false)
+                    .end_meeting_with_typed_text(
+                        request.meeting_id,
+                        &now,
+                        false,
+                        Some(MEETING_END_REASON_AUTO_END),
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -2549,12 +2567,18 @@ pub async fn run_meeting_detection_loop(
         }
 
         if running_apps.is_empty() {
-            // No meeting apps running — handle fast path for process exit
+            // No meeting apps running — handle fast path for process exit.
+            // Treat as natural grace-timeout end (end_reason = NULL) since the
+            // detector decided to end it, not the user. Eligible for merge if
+            // a new meeting in the same app starts within the window.
             let (new_state, ended_id) = handle_no_apps_running(state);
             state = new_state;
             if let Some(meeting_id) = ended_id {
                 let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                match db.end_meeting_with_typed_text(meeting_id, &now, true).await {
+                match db
+                    .end_meeting_with_typed_text(meeting_id, &now, true, None)
+                    .await
+                {
                     Ok(()) => {
                         if let Err(e) = screenpipe_events::send_event(
                             "meeting_ended",
@@ -2656,11 +2680,23 @@ pub async fn run_meeting_detection_loop(
                         find_overlapping_calendar_event(&calendar_events);
                     let attendees_str = cal_attendees.as_ref().map(|a| a.join(", "));
 
-                    // Try to merge with recently-ended meeting
-                    let (meeting_id, decision_trigger) = match db
-                        .find_recent_meeting_for_app(&app, 120)
-                        .await
-                    {
+                    // Try to merge with recently-ended meeting. The DB query
+                    // already filters out explicit_stop rows; the
+                    // `last_explicit_stop_id` check below catches the race
+                    // where the API has not yet committed end_reason by the
+                    // time this scan tick runs.
+                    let merge_candidate = match db.find_recent_meeting_for_app(&app, 120).await {
+                        Ok(Some(recent)) if last_explicit_stop_id == Some(recent.id) => {
+                            info!(
+                                "meeting v2: skipping merge into explicitly-stopped meeting (id={}, app={})",
+                                recent.id, app
+                            );
+                            Ok(None)
+                        }
+                        other => other,
+                    };
+
+                    let (meeting_id, decision_trigger) = match merge_candidate {
                         Ok(Some(recent)) => match db.reopen_meeting(recent.id).await {
                             Ok(()) => {
                                 info!(
@@ -2765,8 +2801,15 @@ pub async fn run_meeting_detection_loop(
                 }
                 StateAction::EndMeeting { meeting_id } => {
                     if meeting_id >= 0 {
+                        // Natural grace-timeout end (controls disappeared and
+                        // the Ending grace period elapsed). Leave end_reason
+                        // NULL so the merge window still applies if the user
+                        // rejoins the same call within ~120s.
                         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                        match db.end_meeting_with_typed_text(meeting_id, &now, true).await {
+                        match db
+                            .end_meeting_with_typed_text(meeting_id, &now, true, None)
+                            .await
+                        {
                             Ok(()) => {
                                 info!("meeting v2: meeting ended (id={})", meeting_id);
                                 // Emit event so triggered pipes can react
