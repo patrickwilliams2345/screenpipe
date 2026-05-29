@@ -2571,7 +2571,20 @@ pub async fn run_meeting_detection_loop(
             // Treat as natural grace-timeout end (end_reason = NULL) since the
             // detector decided to end it, not the user. Eligible for merge if
             // a new meeting in the same app starts within the window.
-            let (new_state, ended_id) = handle_no_apps_running(state);
+            //
+            // Output audio is a liveness signal: a transient scan miss (browser
+            // extension websocket drop, app relaunch / PID change) must not end a
+            // call that is still audibly in progress. Only Active/Ending states
+            // can be kept alive by it.
+            let has_output_audio = if matches!(
+                state,
+                MeetingState::Active { .. } | MeetingState::Ending { .. }
+            ) {
+                db.has_recent_output_audio(30).await.unwrap_or(false)
+            } else {
+                false
+            };
+            let (new_state, ended_id) = handle_no_apps_running(state, has_output_audio);
             state = new_state;
             if let Some(meeting_id) = ended_id {
                 let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
@@ -2866,15 +2879,43 @@ fn get_active_tracking(
 
 /// Handle the case where no meeting apps are running.
 ///
+/// `has_output_audio`: when true, the audio output device has had recent data,
+/// so the user is still audibly in a call. A momentary failure to find the
+/// meeting-app process (browser-extension websocket drop, app relaunch / PID
+/// change, AX reflow) must not end a live call — this mirrors the audio-liveness
+/// guard in `advance_state`'s Ending→Active path.
+///
 /// Returns the new state and optionally a meeting ID that should be ended in the DB.
-fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
+fn handle_no_apps_running(
+    state: MeetingState,
+    has_output_audio: bool,
+) -> (MeetingState, Option<i64>) {
     match state {
         MeetingState::Active {
             meeting_id,
             app,
             started_at,
+            is_browser,
             ..
         } => {
+            // Output audio still flowing → the process scan missed transiently;
+            // keep the meeting alive rather than ending an in-progress call.
+            if has_output_audio {
+                info!(
+                    "meeting v2: no meeting app process found but output audio active — keeping meeting alive (app={}, id={})",
+                    app, meeting_id
+                );
+                return (
+                    MeetingState::Active {
+                        meeting_id,
+                        app,
+                        started_at,
+                        last_seen: Instant::now(),
+                        is_browser,
+                    },
+                    None,
+                );
+            }
             // When the app process exits, use a short timeout (not the browser one)
             // because the process is actually gone, not just a tab switch.
             info!(
@@ -2908,6 +2949,24 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
             is_browser,
             controls_seen_in_ending,
         } => {
+            // Audio still flowing → return to Active instead of ending, even
+            // though the app process scan came up empty. Mirrors advance_state.
+            if has_output_audio {
+                info!(
+                    "meeting v2: Ending -> Active (output audio still active, no app process, app={}, id={})",
+                    app, meeting_id
+                );
+                return (
+                    MeetingState::Active {
+                        meeting_id,
+                        app,
+                        started_at,
+                        last_seen: Instant::now(),
+                        is_browser,
+                    },
+                    None,
+                );
+            }
             let timeout = if is_browser {
                 ENDING_TIMEOUT_BROWSER
             } else {
@@ -3910,7 +3969,7 @@ mod tests {
             last_seen: Instant::now(),
             is_browser: false,
         };
-        let (new_state, ended_id) = handle_no_apps_running(state);
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
         assert!(matches!(new_state, MeetingState::Ending { .. }));
         assert!(ended_id.is_none()); // not ended yet, just transitioning
     }
@@ -3922,7 +3981,7 @@ mod tests {
             app: "Zoom".to_string(),
             profile_index: 0,
         };
-        let (new_state, ended_id) = handle_no_apps_running(state);
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
         assert!(matches!(new_state, MeetingState::Idle));
         assert!(ended_id.is_none());
     }
@@ -3939,7 +3998,7 @@ mod tests {
             is_browser: false,
             controls_seen_in_ending: 0,
         };
-        let (new_state, ended_id) = handle_no_apps_running(state);
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
         assert!(matches!(new_state, MeetingState::Idle));
         assert_eq!(ended_id, Some(42));
     }
@@ -3954,7 +4013,7 @@ mod tests {
             is_browser: false,
             controls_seen_in_ending: 0,
         };
-        let (new_state, ended_id) = handle_no_apps_running(state);
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
         assert!(matches!(new_state, MeetingState::Ending { .. }));
         assert!(ended_id.is_none());
     }
@@ -3972,8 +4031,53 @@ mod tests {
             is_browser: false,
             controls_seen_in_ending: 0,
         };
-        let (_, ended_id) = handle_no_apps_running(state);
+        let (_, ended_id) = handle_no_apps_running(state, false);
         assert!(ended_id.is_none(), "should not end meeting with id=-1");
+    }
+
+    #[test]
+    fn test_handle_no_apps_active_kept_alive_by_audio() {
+        // Process scan came up empty (e.g. browser-extension websocket drop /
+        // app relaunch) but output audio is still playing — the call is live,
+        // so the meeting must NOT begin ending.
+        let state = MeetingState::Active {
+            meeting_id: 42,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            last_seen: Instant::now(),
+            is_browser: true,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, true);
+        assert!(
+            matches!(new_state, MeetingState::Active { .. }),
+            "active meeting with live output audio should stay Active"
+        );
+        assert!(ended_id.is_none());
+    }
+
+    #[test]
+    fn test_handle_no_apps_ending_revived_by_audio() {
+        // Even past the ending timeout, live output audio revives the meeting
+        // rather than ending it when the app process scan is empty.
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
+            is_browser: true,
+            controls_seen_in_ending: 0,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, true);
+        assert!(
+            matches!(new_state, MeetingState::Active { .. }),
+            "ending meeting with live output audio should return to Active"
+        );
+        assert!(
+            ended_id.is_none(),
+            "must not end a meeting that still has audio"
+        );
     }
 
     #[test]
