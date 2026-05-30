@@ -165,6 +165,9 @@ export interface ChatConversation {
 		 *  "re-open" button is shown in the chat header). */
 		collapsed?: boolean;
 	};
+	/** Title source priority: user > ai > fallback. Used to prevent
+	 *  lower-priority titles from overwriting higher-priority ones. */
+	titleSource?: "user" | "ai" | "fallback";
 }
 
 export interface ChatHistoryStore {
@@ -274,6 +277,10 @@ export type Settings = SettingsStore & {
 	translucentSidebar?: boolean;
 	/** Hide model "thinking" reasoning blocks in chat (default: true) */
 	hideThinkingBlocks?: boolean;
+	/** Auto-generate chat titles with the LLM after the first message.
+	 *  Costs one extra inference per new chat. Disable to save tokens —
+	 *  chats fall back to a title derived from the first message (default: true) */
+	autoGenerateChatTitles?: boolean;
 	/** Notification preferences — which notification sources are enabled */
 	notificationPrefs?: {
 		captureStalls: boolean;
@@ -310,6 +317,19 @@ export type Settings = SettingsStore & {
 	}>;
 	apiAuth?: boolean;
 	apiKey?: string;
+	/** Default behavior when a meeting is detected.
+	 * - `"ask"` (default): the existing meeting-start notification grows
+	 *   a "+ HD" action. Click → starts a meeting-bound session that
+	 *   auto-stops when the call ends.
+	 * - `"always"`: every detected meeting auto-starts a session.
+	 * - `"never"`: no auto-action; only the manual tray timer can start
+	 *   one.
+	 * Indefinite manual mode does not exist — every session is bound to
+	 * either a meeting or a timer, both with hard-cap safety nets. */
+	hdRecordingDefault?: "ask" | "always" | "never";
+	/** Capture debounce (ms) installed while an HD session is active.
+	 * Default 100 ≈ 10 fps. Clamped to >= 33 ms (30 fps ceiling). */
+	hdRecordingIntervalMs?: number;
 	/**
 	 * When true the backend binds the HTTP API to 0.0.0.0 instead of 127.0.0.1
 	 * so other devices on the LAN can reach it. api_auth is force-enabled
@@ -396,7 +416,7 @@ export function makeDefaultPresets(isPro: boolean): AIPreset[] {
 				id: CHAT_PRESET_ID,
 				provider: "screenpipe-cloud",
 				url: "",
-				model: "claude-opus-4-7",
+				model: "claude-opus-4-8",
 				maxContextChars: 200000,
 				defaultPreset: true,
 				prompt: "",
@@ -551,6 +571,8 @@ let DEFAULT_SETTINGS: Settings = {
 			localRetentionDays: 14,
 			localRetentionMode: "media",
 			encryptStore: true,
+			hdRecordingDefault: "ask",
+			hdRecordingIntervalMs: 100,
 		};
 
 export function createDefaultSettingsObject(): Settings {
@@ -807,7 +829,7 @@ function createSettingsStore() {
 					p?.model === "claude-sonnet-4-5"
 				) {
 					upgraded = true;
-					return { ...p, model: "claude-opus-4-7" };
+					return { ...p, model: "claude-opus-4-8" };
 				}
 				return p;
 			});
@@ -1072,7 +1094,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		}
 
 		const nextPresets = settings.aiPresets.map((p: any, i: number) =>
-			i === idx ? { ...p, model: "claude-opus-4-7" } : p
+			i === idx ? { ...p, model: "claude-opus-4-8" } : p
 		);
 		settingsStore.set({
 			aiPresets: nextPresets,

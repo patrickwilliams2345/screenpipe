@@ -49,6 +49,16 @@ const DEDUP_TIME_WINDOW_SECS: i64 = 45;
 const DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
 const FRAMES_FTS_EXTERNAL_CONTENT_MIGRATION_VERSION: i64 = 20260415000000;
 
+/// User explicitly stopped a meeting (stop button in UI / stop API).
+/// Auto-merge MUST NOT reopen these — a new detected meeting in the same
+/// app should get its own row, even within the 120s merge window.
+pub const MEETING_END_REASON_EXPLICIT_STOP: &str = "explicit_stop";
+/// Server-side auto-end pipeline closed the meeting (e.g. inactivity finalize).
+/// Eligible for auto-merge if a new meeting is detected within the window.
+pub const MEETING_END_REASON_AUTO_END: &str = "auto_end";
+/// App shutdown closed an active meeting row. Eligible for auto-merge on next launch.
+pub const MEETING_END_REASON_SHUTDOWN: &str = "shutdown";
+
 fn normalize_timestamp_for_range_query(timestamp: &str) -> String {
     DateTime::parse_from_rfc3339(timestamp)
         .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
@@ -1176,16 +1186,19 @@ impl DatabaseManager {
     /// browser-based meetings alive when the user switches tabs but audio is
     /// still flowing (i.e. the meeting is still going).
     pub async fn has_recent_output_audio(&self, within_secs: i64) -> Result<bool, sqlx::Error> {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM audio_transcriptions
-             WHERE is_input_device = 0
-               AND timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
-             LIMIT 1",
+        // EXISTS short-circuits on the first matching row instead of scanning
+        // every transcription in the window like COUNT(*) would.
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM audio_transcriptions
+                 WHERE is_input_device = 0
+                   AND timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
+             )",
         )
         .bind(format!("-{} seconds", within_secs))
         .fetch_one(&self.pool)
         .await?;
-        Ok(count > 0)
+        Ok(exists != 0)
     }
 
     /// Returns recently transcribed chunks that still have no assigned speaker.
@@ -1838,6 +1851,29 @@ impl DatabaseManager {
         Ok(rows)
     }
 
+    /// Audio chunks for MP4 export: one row per physical chunk file (NOT joined to
+    /// `audio_transcriptions`, which would return a row per transcript segment and cause the same
+    /// file to be mixed in multiple times). Returns `(id, file_path, timestamp)` where `timestamp`
+    /// is the chunk's true file-start, so each chunk can be delayed onto the timeline exactly once.
+    pub async fn get_audio_chunks_in_range_for_export(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(i64, String, DateTime<Utc>)>, SqlxError> {
+        let rows = sqlx::query_as::<_, (i64, String, DateTime<Utc>)>(
+            r#"SELECT ac.id, ac.file_path, ac.timestamp
+               FROM audio_chunks ac
+               WHERE ac.timestamp >= ?1 AND ac.timestamp <= ?2
+                 AND ac.file_path NOT LIKE 'cloud://%'
+               ORDER BY ac.timestamp ASC"#,
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Get audio chunks by explicit IDs (used by re-transcribe when frontend sends chunk IDs).
     pub async fn get_audio_chunks_by_ids(
         &self,
@@ -2352,6 +2388,35 @@ impl DatabaseManager {
 
         tx.commit().await?;
 
+        Ok(id)
+    }
+
+    /// Insert a timeline index frame that points into an existing HD video
+    /// chunk. Unlike [`insert_frame`], `video_chunk_id` and `offset_index` are
+    /// explicit (no racy "latest chunk for device" lookup) and no OCR / app
+    /// metadata is attached — the HD recorder writes these as sparse scrub
+    /// markers into a chunk it owns. `snapshot_path` stays NULL so the timeline
+    /// and export resolve the image from `video_chunks.file_path` at
+    /// `offset_index` (the frame's 0-based decode position in the .mp4).
+    pub async fn insert_hd_index_frame(
+        &self,
+        video_chunk_id: i64,
+        offset_index: i64,
+        timestamp: DateTime<Utc>,
+        device_name: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let id = sqlx::query(
+            "INSERT INTO frames (video_chunk_id, offset_index, timestamp, focused, device_name) VALUES (?1, ?2, ?3, 1, ?4)",
+        )
+        .bind(video_chunk_id)
+        .bind(offset_index)
+        .bind(timestamp)
+        .bind(device_name)
+        .execute(&mut **tx.conn())
+        .await?
+        .last_insert_rowid();
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -4219,6 +4284,40 @@ impl DatabaseManager {
         .fetch_all(&self.pool)
         .await?;
         Ok(ids)
+    }
+
+    /// Get all frames within a time range for meeting/video export.
+    ///
+    /// Returns `(frame_id, file_path, offset_index, timestamp, is_snapshot)` ordered by
+    /// timestamp. `file_path` is the snapshot JPEG for snapshot frames, otherwise the backing
+    /// video chunk. Resolving everything in one query avoids an N+1 per-frame `get_frame` call
+    /// and gives the caller real per-frame timestamps to compute display durations.
+    pub async fn get_frames_in_range_for_export(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(i64, String, i64, DateTime<Utc>, bool)>, SqlxError> {
+        let rows = sqlx::query_as::<_, (i64, String, i64, DateTime<Utc>, bool)>(
+            r#"
+            SELECT
+                frames.id,
+                COALESCE(frames.snapshot_path, video_chunks.file_path) as file_path,
+                frames.offset_index,
+                frames.timestamp,
+                CASE WHEN frames.snapshot_path IS NOT NULL AND frames.snapshot_path != ''
+                     THEN 1 ELSE 0 END as is_snapshot
+            FROM frames
+            LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
+            WHERE frames.timestamp >= ?1 AND frames.timestamp <= ?2
+              AND COALESCE(frames.snapshot_path, video_chunks.file_path) IS NOT NULL
+            ORDER BY frames.timestamp ASC
+            "#,
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Get frames near a given frame_id for validation/fallback.
@@ -8281,6 +8380,12 @@ LIMIT ? OFFSET ?
     }
 
     // ── Meeting persistence ──────────────────────────────────────────
+    //
+    // `meetings.end_reason` distinguishes how a meeting was finalized so the
+    // auto-merge logic in `find_recent_meeting_for_app` can avoid re-attaching
+    // a brand-new meeting to a row the user just explicitly closed. See the
+    // `MEETING_END_REASON_*` constants below — these are the canonical values
+    // and the only strings that should be written to the column.
 
     pub async fn insert_meeting(
         &self,
@@ -8308,10 +8413,20 @@ LIMIT ? OFFSET ?
         Ok(id)
     }
 
-    pub async fn end_meeting(&self, id: i64, meeting_end: &str) -> Result<(), SqlxError> {
+    /// End a meeting and persist the reason it ended. `end_reason` should be
+    /// one of the `MEETING_END_REASON_*` constants (or `None` for legacy /
+    /// natural grace-timeout ends). The reason drives the auto-merge filter
+    /// in [`Self::find_recent_meeting_for_app`] — explicit stops are excluded.
+    pub async fn end_meeting(
+        &self,
+        id: i64,
+        meeting_end: &str,
+        end_reason: Option<&str>,
+    ) -> Result<(), SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
-        sqlx::query("UPDATE meetings SET meeting_end = ?1 WHERE id = ?2")
+        sqlx::query("UPDATE meetings SET meeting_end = ?1, end_reason = ?2 WHERE id = ?3")
             .bind(normalize_timestamp_for_range_query(meeting_end))
+            .bind(end_reason)
             .bind(id)
             .execute(&mut **tx.conn())
             .await?;
@@ -8436,14 +8551,19 @@ LIMIT ? OFFSET ?
     /// End a meeting and optionally append auto-collected context (typed
     /// text + edited files) to its note. Both blocks come from the same
     /// `[meeting_start, meeting_end]` time window.
+    ///
+    /// `end_reason` is one of the `MEETING_END_REASON_*` constants (or
+    /// `None`). Callers in routes/meetings.rs pass `Some(EXPLICIT_STOP)` so
+    /// the auto-merge logic skips this row on the next detection cycle.
     pub async fn end_meeting_with_typed_text(
         &self,
         id: i64,
         meeting_end: &str,
         append_typed_text: bool,
+        end_reason: Option<&str>,
     ) -> Result<(), SqlxError> {
         // First end the meeting so the time range is set
-        self.end_meeting(id, meeting_end).await?;
+        self.end_meeting(id, meeting_end, end_reason).await?;
 
         if !append_typed_text {
             return Ok(());
@@ -8493,9 +8613,15 @@ LIMIT ? OFFSET ?
         Ok(())
     }
 
+    /// Reopen a previously-ended meeting (clears both `meeting_end` and
+    /// `end_reason`). Used by the auto-merge path and the manual "resume
+    /// meeting" API. Clearing `end_reason` is intentional: if the user
+    /// explicitly stopped and then asked to resume, the explicit-stop tag
+    /// no longer applies — the row is active again and shouldn't be
+    /// excluded from future merges if it later ends naturally.
     pub async fn reopen_meeting(&self, id: i64) -> Result<(), SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
-        sqlx::query("UPDATE meetings SET meeting_end = NULL WHERE id = ?1")
+        sqlx::query("UPDATE meetings SET meeting_end = NULL, end_reason = NULL WHERE id = ?1")
             .bind(id)
             .execute(&mut **tx.conn())
             .await?;
@@ -8510,7 +8636,7 @@ LIMIT ? OFFSET ?
             .to_string();
         let rows = sqlx::query(
             "UPDATE meetings
-             SET meeting_end = ?1
+             SET meeting_end = ?1, end_reason = ?2
              WHERE meeting_end IS NULL
                AND (
                  detection_source != 'manual'
@@ -8518,6 +8644,7 @@ LIMIT ? OFFSET ?
                )",
         )
         .bind(&now)
+        .bind(MEETING_END_REASON_AUTO_END)
         .execute(&mut **tx.conn())
         .await?
         .rows_affected();
@@ -9174,6 +9301,17 @@ LIMIT ? OFFSET ?
         Ok((before, after))
     }
 
+    /// Find the most recent ended meeting in `app` whose `meeting_end` is
+    /// within `within_secs` and that did NOT end via explicit user stop.
+    ///
+    /// The `end_reason != 'explicit_stop'` filter is the load-bearing piece
+    /// of the meeting-merge fix: when a user clicks stop in the meeting note
+    /// UI and then joins a new call seconds later, the auto-detector used to
+    /// re-attach the new call to the just-stopped row, which made the live
+    /// note show the previous call's transcript tail and produced
+    /// "DUPLICATE: X" sync notifications. The detector loop also tracks
+    /// `last_explicit_stop_id` in memory as defense-in-depth, but this SQL
+    /// filter is the durable guarantee that survives restarts.
     pub async fn find_recent_meeting_for_app(
         &self,
         app: &str,
@@ -9189,11 +9327,13 @@ LIMIT ? OFFSET ?
              WHERE meeting_app = ?1 \
                AND meeting_end IS NOT NULL \
                AND meeting_end >= ?2 \
+               AND (end_reason IS NULL OR end_reason != ?3) \
              ORDER BY meeting_end DESC \
              LIMIT 1",
         )
         .bind(app)
         .bind(&cutoff)
+        .bind(MEETING_END_REASON_EXPLICIT_STOP)
         .fetch_optional(&self.pool)
         .await?;
         Ok(meeting)

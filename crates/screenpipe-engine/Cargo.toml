@@ -189,6 +189,14 @@ jemalloc = ["tikv-jemallocator"]
 name = "screenpipe"
 path = "src/bin/screenpipe-engine.rs"
 
+[[bench]]
+name = "hot_frame_cache"
+harness = false
+
+[[bench]]
+name = "alloc_counter"
+harness = false
+
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }

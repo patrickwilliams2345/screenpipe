@@ -1040,6 +1040,68 @@ pub fn get_capture_backend() -> &'static str {
     "xcap"
 }
 
+// ── High-FPS HD capture (macOS / ScreenCaptureKit) ─────────────────
+
+/// A running high-fps HD capture for one monitor: the live SCK stream handle
+/// (drop `stream` to stop) plus the channel of RGBA frames and the encode
+/// geometry. Used by the engine's HD recorder, fully decoupled from the
+/// screenshot/OCR path (it's a second SCStream).
+#[cfg(target_os = "macos")]
+pub struct HdCapture {
+    /// Live capture stream. Drop to stop the OS-level SCStream.
+    pub stream: sck_rs::HdCaptureStream,
+    /// Every captured frame (RGBA); newest dropped under backpressure.
+    pub frames: tokio::sync::mpsc::Receiver<image::RgbaImage>,
+    /// Capture width after the resolution cap.
+    pub width: u32,
+    /// Capture height after the resolution cap.
+    pub height: u32,
+    /// Frame rate the stream was actually started at (post-clamp).
+    pub fps: u32,
+}
+
+/// Cap target dims at `max_width` preserving aspect ratio (mirrors sck-rs's
+/// internal `scaled_dims`). `max_width == 0` or `>= src_w` means native.
+#[cfg(target_os = "macos")]
+fn hd_scaled_dims(src_w: u32, src_h: u32, max_width: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || max_width == 0 || max_width >= src_w {
+        return (src_w.max(1), src_h.max(1));
+    }
+    let target_h = ((max_width as u64 * src_h as u64) + (src_w as u64 / 2)) / src_w as u64;
+    (max_width, (target_h as u32).max(1))
+}
+
+#[cfg(target_os = "macos")]
+impl SafeMonitor {
+    /// Start a dedicated high-fps HD capture stream for this monitor at `fps`,
+    /// honoring the same resolution cap as screenshots
+    /// (`set_sck_capture_max_width`).
+    ///
+    /// Returns a live [`HdCapture`]: drain `frames` for RGBA frames, drop
+    /// `stream` to stop. This opens a SECOND ScreenCaptureKit stream alongside
+    /// the persistent screenshot stream, so it never disturbs the OCR/screenshot
+    /// path. `excluded_window_ids` are excluded at the OS level — ignored /
+    /// private windows never reach the recorder. Blocks briefly while the
+    /// stream starts; call from a blocking context.
+    pub fn start_hd_capture(&self, fps: u32, excluded_window_ids: &[u32]) -> Result<HdCapture> {
+        let (width, height) = hd_scaled_dims(
+            self.monitor_data.width,
+            self.monitor_data.height,
+            sck_capture_max_width(),
+        );
+        let (stream, frames) =
+            sck_rs::start_hd_capture(self.monitor_id, width, height, fps, excluded_window_ids)
+                .map_err(|e| anyhow::anyhow!("start_hd_capture failed: {e}"))?;
+        Ok(HdCapture {
+            fps: stream.fps(),
+            width,
+            height,
+            stream,
+            frames,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,8 +11,56 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { commands } from "@/lib/utils/tauri";
 import { useChatStore } from "@/lib/stores/chat-store";
 
-export function isConversationHistorySyncPrompt(value?: string | null): boolean {
+/**
+ * Detect if content is app-injected metadata (not real user content).
+ * Used to filter when deriving conversation titles and sanitizing display.
+ *
+ * Canonical implementation — imported by pi-event-router.ts and
+ * use-chat-conversations.ts. Update here only.
+ *
+ * Returns true for:
+ * - <conversation_history>...</conversation_history> (sync prompts)
+ * - <role>...</role> (bare metadata with no user content)
+ * - <role>...</role><system>...</system> (bare metadata)
+ *
+ * Returns false for:
+ * - <role>expert</role> analyze this (has user content after tags)
+ * - Normal user messages
+ */
+export function isInjectedTitleSourcePrompt(content?: string | null): boolean {
+  if (typeof content !== "string") return false;
+  const trimmed = content.trimStart();
+
+  // Skip <conversation_history> sync prompts
+  if (trimmed.startsWith("<conversation_history>")) return true;
+
+  // Skip ONLY bare role/system tags with no actual user content
+  // Pattern: <role>...</role> optionally followed by <system>...</system>, nothing else
+  const bareMetadataOnly = /^<role>[^<]*<\/role>\s*(<system>[^<]*<\/system>)?\s*$/;
+  if (bareMetadataOnly.test(trimmed)) return true;
+
+  // Any other content (including <role> with user text after it) is real
+  return false;
+}
+
+/**
+ * Detect `<conversation_history>` sync prompts that Pi echoes back as
+ * user events. Used by display code to hide these from the sidebar/title.
+ *
+ * This is intentionally narrow — only matches conversation_history tags.
+ * For broader title-derivation filtering (bare <role>/<system> tags),
+ * use `isInjectedTitleSourcePrompt` instead.
+ */
+export function isConversationHistorySyncPrompt(value?: string | null): value is string {
   return typeof value === "string" && value.startsWith("<conversation_history>");
+}
+
+export function extractConversationHistorySyncUserText(value?: string | null): string | null {
+  if (!isConversationHistorySyncPrompt(value)) return null;
+  const closingTag = "</conversation_history>";
+  const closingTagIndex = value.indexOf(closingTag);
+  if (closingTagIndex === -1) return "";
+  return value.slice(closingTagIndex + closingTag.length).replace(/^\s+/, "");
 }
 
 // ============================================================================
@@ -22,6 +70,8 @@ export function isConversationHistorySyncPrompt(value?: string | null): boolean 
 export interface ChatPrefillData {
   context: string;
   prompt?: string;
+  /** Short user-facing label shown in chat while `prompt` remains the payload sent to Pi. */
+  displayLabel?: string;
   frameId?: number;
   autoSend?: boolean;
   source?: string;
@@ -54,6 +104,33 @@ export function shouldActivateHomeSectionForChatLoadConversation(
   payload: ChatLoadConversationPayload | null | undefined,
 ): boolean {
   return shouldHandleChatLoadConversationForWindow(payload, "home");
+}
+
+/**
+ * Decide whether THIS window should act on a `chat-prefill` event.
+ *
+ * Both the home window and the chat overlay run a live chat panel. An
+ * `autoSend` prefill with no explicit `targetWindow` would be claimed by
+ * BOTH — each mints its own session id and calls `sendMessage`, producing
+ * two conversations for one intent. That is the root of the duplicate-chat
+ * bug for action/pipe-originated prompts.
+ *
+ * So an untargeted autoSend is pinned to the home window (the only surface
+ * that emits untargeted autoSends — the overlay path always sets a target),
+ * guaranteeing exactly one window sends. Non-autoSend prefills merely
+ * populate the input box, where double-handling is harmless, so they stay
+ * permissive.
+ */
+export function shouldHandleChatPrefillForWindow(
+  payload:
+    | { targetWindow?: string | null; autoSend?: boolean }
+    | null
+    | undefined,
+  windowLabel: string,
+): boolean {
+  if (!payload) return false;
+  const target = payload.targetWindow ?? (payload.autoSend ? "home" : null);
+  return !target || target === windowLabel;
 }
 
 const CHAT_READY_TIMEOUT_MS = 2500;

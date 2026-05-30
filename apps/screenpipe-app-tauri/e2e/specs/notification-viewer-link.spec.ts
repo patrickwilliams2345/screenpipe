@@ -24,8 +24,9 @@ import { existsSync } from "node:fs";
 import { saveScreenshot } from "../helpers/screenshot-utils.js";
 import { openHomeWindow, t, waitForAppReady } from "../helpers/test-utils.js";
 
-const NOTIFY_URL = "http://127.0.0.1:11435/notify";
-const NOTIFICATIONS_URL = "http://127.0.0.1:11435/notifications";
+const FOCUS_PORT = Number(process.env.SCREENPIPE_FOCUS_PORT ?? "11436");
+const NOTIFY_URL = `http://127.0.0.1:${FOCUS_PORT}/notify`;
+const NOTIFICATIONS_URL = `http://127.0.0.1:${FOCUS_PORT}/notifications`;
 
 interface NotificationHistoryEntry {
   id: string;

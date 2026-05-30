@@ -175,6 +175,13 @@ function navigateHomeAndPrefill(data: ChatPrefillData): void {
   window.location.href = url.toString();
 }
 
+function buildCreatePipeDisplayLabel(prompt: string): string {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  if (!normalized) return "Create pipe";
+  const compact = normalized.length > 60 ? `${normalized.slice(0, 57).trimEnd()}...` : normalized;
+  return `Create pipe: ${compact}`;
+}
+
 /** Convert a raw schedule string to a short human-readable label. */
 function humanizeSchedule(schedule: string | undefined): string {
   if (!schedule || schedule === "manual") return "manual";
@@ -270,6 +277,10 @@ follow these prompt engineering best practices (from anthropic's guide):
 - no error handling for empty API responses (agent exits successfully with no output)
 
 after analyzing, show me the improved pipe.md and explain what you changed and why.`;
+}
+
+function buildOptimizeDisplayLabel(pipeName: string): string {
+  return `Optimize pipe: ${pipeName.trim()}`;
 }
 
 function parsePipeError(stderr: string): {
@@ -1831,6 +1842,7 @@ export function PipesSection() {
                           navigateHomeAndPrefill({
                             context: "the user wants to optimize their pipe",
                             prompt: buildOptimizePrompt(pipe.config.name),
+                            displayLabel: buildOptimizeDisplayLabel(pipe.config.name),
                             autoSend: true,
                           });
                         }}
@@ -2762,6 +2774,7 @@ export function PipesSection() {
           navigateHomeAndPrefill({
             context: PIPE_CREATION_PROMPT,
             prompt: value,
+            displayLabel: buildCreatePipeDisplayLabel(value),
             autoSend: true,
           });
         }}

@@ -31,6 +31,7 @@ import {
   MemoizedReactMarkdown,
   chatUrlTransform,
   openScreenpipeViewerLink,
+  rewriteLocalMarkdownLinksForChat,
 } from "@/components/markdown";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
 import { AIPreset, PiQueuedPrompt } from "@/lib/utils/tauri";
@@ -45,7 +46,9 @@ import { commands } from "@/lib/utils/tauri";
 import { emit } from "@tauri-apps/api/event";
 import { useChatConversations } from "@/components/hooks/use-chat-conversations";
 import { useChatStore } from "@/lib/stores/chat-store";
+import { useFeedbackStore } from "@/lib/stores/feedback-store";
 import { statusForEvent } from "@/lib/stores/pi-event-router";
+import { deriveFallbackConversationTitle } from "@/lib/utils/chat-title";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { usePlatform } from "@/lib/hooks/use-platform";
@@ -59,9 +62,12 @@ import {
   buildAppMentionSuggestions,
   normalizeAppTag,
   formatShortcutDisplay,
+  extractConversationHistorySyncUserText,
+  isInjectedTitleSourcePrompt,
   isConversationHistorySyncPrompt,
   type ChatLoadConversationPayload,
   shouldHandleChatLoadConversationForWindow,
+  shouldHandleChatPrefillForWindow,
 } from "@/lib/chat-utils";
 import { sanitizeToolCallXml } from "@/lib/utils/sanitize-tool-call-xml";
 import { useAutoSuggestions, type Suggestion } from "@/lib/hooks/use-auto-suggestions";
@@ -584,7 +590,24 @@ function buildRateLimitMessage(errorStr: string): string {
     : "Rate limited — try again in a moment or switch to a different model.";
 }
 
-/** Extract the gateway-reported tier from an error string, if present. */
+/** How many times a single turn auto-retries on a 429 before giving up. */
+const PI_MAX_RATE_LIMIT_RETRIES = 3;
+
+/**
+ * Seconds to wait before retrying a rate-limited (429) request. Prefers the
+ * gateway's structured `reset_in` hint, falls back to the "wait N seconds"
+ * prose, then a safe default. Clamped to [1, 60].
+ */
+function parseRateLimitWaitSeconds(errorStr: string): number {
+  const DEFAULT_WAIT = 10;
+  const resetMatch = errorStr.match(/"reset_in"\s*:\s*(\d+)/i);
+  const waitMatch = errorStr.match(/wait (\d+) seconds/i);
+  const raw = resetMatch?.[1] ?? waitMatch?.[1];
+  const secs = raw ? parseInt(raw, 10) : DEFAULT_WAIT;
+  if (!Number.isFinite(secs) || secs <= 0) return DEFAULT_WAIT;
+  return Math.min(Math.max(secs, 1), 60);
+}
+
 // Helper to get timezone offset string (e.g., "+1" or "-5")
 function getTimezoneOffsetString(): string {
   const offsetMinutes = new Date().getTimezoneOffset();
@@ -1290,7 +1313,7 @@ function classifyCurl(cmd: string): CurlPresentation | null {
     return { label: `Pipe ${name}` };
   }
 
-  if (path === "/frames/export") return { label: "Exported video" };
+  if (path === "/export") return { label: "Exported video" };
   if (path === "/health") return { label: "Health check" };
   if (path === "/list-monitors") return { label: "Listed monitors" };
   if (path === "/list-audio-devices") return { label: "Listed audio devices" };
@@ -2036,7 +2059,9 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
   // Assistant messages occasionally contain raw tool-call XML the model emitted
   // as text — rewrite it to a fenced code block so rehypeRaw doesn't collapse
   // the unknown tags and bleed the args into the prose. See sanitize-tool-call-xml.ts.
-  const renderText = isUser ? text : sanitizeToolCallXml(text);
+  const renderText = rewriteLocalMarkdownLinksForChat(
+    isUser ? text : sanitizeToolCallXml(text),
+  );
   return (
     <MemoizedReactMarkdown
       className={cn(
@@ -2420,9 +2445,18 @@ function MessageContent({
     <SourceCitationFooter citations={sourceCitations} />
   ) : null;
 
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
+  const isErrorMessage = !isUser && (
+    !!message.retryPrompt ||
+    message.content.startsWith("Error:") ||
+    message.content.includes("Something went wrong") ||
+    message.content.includes("crashed") ||
+    message.content.includes("failed after retries")
+  );
+
   // Retry CTA — shown at the bottom of error messages that have a retryPrompt
   const retryCta = !isUser && message.retryPrompt ? (
-    <div className="mt-3 pt-3 border-t border-border/40 flex items-center gap-3">
+    <div className="mt-3 pt-3 border-t border-border/40 flex items-center gap-3 flex-wrap">
       <button
         type="button"
         onClick={() => onRetry?.(message.retryPrompt!)}
@@ -2432,6 +2466,24 @@ function MessageContent({
         Try again
       </button>
       <span className="text-xs text-muted-foreground">or edit your message above</span>
+      <button
+        type="button"
+        onClick={() => openFeedback(`AI error in chat: ${message.content.slice(0, 300)}`)}
+        className="ml-auto flex items-center gap-1 text-xs text-muted-foreground/60 hover:text-muted-foreground transition-colors"
+      >
+        report issue
+      </button>
+    </div>
+  ) : isErrorMessage ? (
+    <div className="mt-2 flex items-center gap-1.5">
+      <span className="text-xs text-destructive/60">still happening?</span>
+      <button
+        type="button"
+        onClick={() => openFeedback(`AI error in chat: ${message.content.slice(0, 300)}`)}
+        className="text-xs text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
+      >
+        report issue
+      </button>
     </div>
   ) : null;
 
@@ -2516,10 +2568,15 @@ function MessageContent({
       </div>
     );
   }
+  // Strip raw "Error:" prefix that leaks from backend — show only the human part
+  const displayText = !isUser && message.content.startsWith("Error: ")
+    ? message.content.slice("Error: ".length)
+    : message.content;
+
   return (
     <div className="space-y-2">
       {imageThumbs}
-      <MarkdownBlock text={message.content} isUser={isUser} />
+      <MarkdownBlock text={displayText} isUser={isUser} />
       {sourceFooter}
       {retryCta}
     </div>
@@ -2531,6 +2588,12 @@ function getMessageIntentLabel(message: Message): string | null {
     return "Steered conversation";
   }
   return null;
+}
+
+function isPlaceholderConversationTitle(value?: string | null): boolean {
+  if (!value) return true;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "" || normalized === "new chat" || normalized === "untitled";
 }
 
 function isSteeredAssistantMessage(message: Message): boolean {
@@ -2775,21 +2838,27 @@ function ChatTitleMenu({
   const storeTitle = useChatStore((s) =>
     conversationId ? s.sessions[conversationId]?.title : undefined
   );
+  const streamingTitle = useChatStore((s) =>
+    conversationId ? s.sessions[conversationId]?.streamingTitle : undefined
+  );
   const session = useChatStore((s) =>
     conversationId ? s.sessions[conversationId] : undefined
   );
   const isPinned = session?.pinned ?? false;
   const firstUserMsg = messages.find(
-    (m) => m.role === "user" && !isConversationHistorySyncPrompt(m.content)
+    (m) => m.role === "user" && !isInjectedTitleSourcePrompt(m.content)
   );
-  const derivedTitle = firstUserMsg?.content?.slice(0, 50);
+  const derivedTitle = firstUserMsg
+    ? deriveFallbackConversationTitle(firstUserMsg)
+    : undefined;
+  const hasMessages = messages.length > 0;
   const title =
-    storeTitle &&
-    storeTitle !== "new chat" &&
-    storeTitle !== "untitled" &&
-    !isConversationHistorySyncPrompt(storeTitle)
-      ? storeTitle
-      : derivedTitle || "";
+    streamingTitle ||
+    (storeTitle &&
+      !isPlaceholderConversationTitle(storeTitle) &&
+      !isConversationHistorySyncPrompt(storeTitle)
+        ? storeTitle
+        : derivedTitle || (hasMessages ? "untitled" : ""));
 
   // No conversation id OR no real content → don't render. The "+ New"
   // button on the right is enough; no point showing actions for a
@@ -3246,6 +3315,8 @@ export function StandaloneChat({
   const sendDispatchInFlightRef = useRef(false);
   const forceQueueModeRef = useRef(false);
   const piFirstCallRetried = useRef(false);
+  // Per-turn 429 auto-retry budget; reset on each new user send + on success.
+  const piRateLimitRetries = useRef(0);
   const sessionActivityLastEmitAtRef = useRef<Record<string, number>>({});
   const sessionActivityLastSigRef = useRef<Record<string, string>>({});
   const piStoppedIntentionallyRef = useRef(false);
@@ -3489,6 +3560,7 @@ export function StandaloneChat({
     setIsStreaming,
     setPastedImages,
     settings,
+    selectedPreset: activePreset ?? null,
     inlineHistoryEnabled: !hideInlineHistory,
   });
 
@@ -3615,8 +3687,15 @@ export function StandaloneChat({
       sessionStorage.removeItem("pendingChatPrefill");
       try {
         const data = JSON.parse(pending);
+        // Stamp targetWindow so an autoSend prefill is claimed by THIS window
+        // only. sessionStorage is per-window, so the window that stored the
+        // pending prefill (and navigated here) is the correct target. Without
+        // this, pipe-store / pipes-section store the prefill with no target,
+        // and the untargeted re-emit fires in BOTH windows → duplicate chat.
+        // An explicit targetWindow in `data` still wins (spread comes last).
+        const prefillData = { targetWindow: getCurrentWindow().label, ...data };
         // Small delay to let the chat fully initialize without showing setup flashes.
-        setTimeout(() => emit("chat-prefill", data), 120);
+        setTimeout(() => emit("chat-prefill", prefillData), 120);
       } catch {
         setIsPreparingPrefill(false);
       }
@@ -3701,11 +3780,14 @@ export function StandaloneChat({
 
   // Listen for chat-prefill events from search modal and pipe creation
   useEffect(() => {
-    const unlisten = listen<{ context: string; prompt?: string; frameId?: number; autoSend?: boolean; source?: string; targetWindow?: string }>("chat-prefill", (event) => {
-      const { context, prompt, frameId, autoSend, source, targetWindow } = event.payload;
+    const unlisten = listen<{ context: string; prompt?: string; displayLabel?: string; frameId?: number; autoSend?: boolean; source?: string; targetWindow?: string }>("chat-prefill", (event) => {
+      const { context, prompt, displayLabel, frameId, autoSend, source, targetWindow } = event.payload;
 
-      // Only process if this window is the intended target (or no target for backwards compat)
-      if (targetWindow && getCurrentWindow().label !== targetWindow) return;
+      // Route to exactly one window. An autoSend prefill with no targetWindow
+      // would otherwise be claimed by BOTH the home and overlay panels — each
+      // mints its own session id and sends, producing a duplicate conversation.
+      // shouldHandleChatPrefillForWindow pins an untargeted autoSend to home.
+      if (!shouldHandleChatPrefillForWindow({ targetWindow, autoSend }, getCurrentWindow().label)) return;
 
       if (autoSend && prompt) {
         // Deduplicate: skip if another listener instance is already handling this
@@ -3749,7 +3831,7 @@ export function StandaloneChat({
             autoSendBypassRef.current = true;
             await new Promise(r => setTimeout(r, 200));
             if (sendMessageRef.current) {
-              await sendMessageRef.current(fullMessage);
+              await sendMessageRef.current(fullMessage, displayLabel);
               setInput("");
               if (inputRef.current) inputRef.current.style.height = "auto";
             }
@@ -5224,7 +5306,7 @@ export function StandaloneChat({
             // processing the followUp turn.
           }
 
-          const text = (() => {
+          const rawText = (() => {
             const c = data.message?.content;
             if (typeof c === "string") return c;
             if (Array.isArray(c)) {
@@ -5235,6 +5317,7 @@ export function StandaloneChat({
             }
             return "";
           })();
+          const text = extractConversationHistorySyncUserText(rawText) ?? rawText;
           const eventImages = imageDataUrlsFromPiContent(data.message?.content);
           const pendingOptimisticSteer = optimisticSteerRef.current;
           const isPendingOptimisticSteerEcho = Boolean(
@@ -5243,17 +5326,6 @@ export function StandaloneChat({
           );
           const shouldConsumePendingOptimisticSteer = isPendingOptimisticSteerEcho;
           const preMatchedTurnIntent = findTurnIntentForUserStart(piSessionIdRef.current, text, pendingNextPiUserDisplayRef.current);
-
-          // Skip the chat panel's own injected `<conversation_history>...`
-          // sync prompt (see promptMessage construction at the piPrompt call).
-          // Pi echoes it back as a message_start (user) event; we've already
-          // stored the real user-typed message locally via sendPiMessage, so
-          // adding this would create a phantom user bubble whose first 50
-          // chars look like `<conversation_history>\nassistant: [tool: ...`
-          // and corrupt the chat title on next save.
-          if (text.startsWith("<conversation_history>")) {
-            return;
-          }
 
           if (!piMessageIdRef.current || isPendingOptimisticSteerEcho || preMatchedTurnIntent?.kind === "steer") {
             const sidForStartedUser = piSessionIdRef.current;
@@ -5424,7 +5496,7 @@ export function StandaloneChat({
               }
             }
 
-            // Surface credits_exhausted / rate limit errors from agent_end
+            // Surface credits_exhausted / rate limit / connection errors from agent_end
             if (agentEndError && !content) {
               const errStr = agentEndError;
               const quotaErrorType = classifyQuotaError(errStr);
@@ -5434,9 +5506,11 @@ export function StandaloneChat({
                     } catch {}
                                   content = buildDailyLimitMessage(errStr);
               } else if (quotaErrorType === "rate") {
-                  content = buildRateLimitMessage(errStr);
+                content = buildRateLimitMessage(errStr);
+              } else if (errStr.includes("model_not_allowed")) {
+                content = "This model requires an upgrade.";
               } else {
-                content = `Error: ${errStr}`;
+                content = errStr;
               }
             }
 
@@ -5543,6 +5617,7 @@ export function StandaloneChat({
             piThinkingStartRef.current = null;
             followUpFiredRef.current = false;
             forceQueueModeRef.current = false;
+            piRateLimitRetries.current = 0;
             setIsLoading(false);
             setIsStreaming(false);
             emitSessionActivity({ status: "idle" });
@@ -5567,6 +5642,46 @@ export function StandaloneChat({
                 commands.piPrompt(piSessionIdRef.current, lastUserMsg.content, null, null).catch(() => {});
               }
             }
+            return;
+          }
+          // Rate-limit (429) auto-retry — honor the gateway's reset_in hint and
+          // re-send the same prompt. The cloud LLM gateway caps free/logged-in
+          // tiers at a few dozen requests/minute; a single agentic run can trip
+          // it, after which a short wait clears the budget. Without this the turn
+          // dies silently (e.g. pipe creation stalls mid-skill).
+          if (
+            classifyQuotaError(errorStr) === "rate" &&
+            piRateLimitRetries.current < PI_MAX_RATE_LIMIT_RETRIES &&
+            piSessionIdRef.current &&
+            lastUserMessageRef.current
+          ) {
+            piRateLimitRetries.current += 1;
+            const attempt = piRateLimitRetries.current;
+            const waitSecs = parseRateLimitWaitSeconds(errorStr);
+            const retrySession = piSessionIdRef.current;
+            const retryPrompt = lastUserMessageRef.current;
+            console.warn(`[Pi] rate limited, auto-retry ${attempt}/${PI_MAX_RATE_LIMIT_RETRIES} in ${waitSecs}s:`, errorStr);
+            // Reset the in-flight buffers so the retried turn renders cleanly into
+            // the same bubble instead of appending onto any pre-429 partial output.
+            piStreamingTextRef.current = "";
+            piContentBlocksRef.current = [];
+            const retryTurnId = piMessageIdRef.current;
+            if (retryTurnId) {
+              setMessages((prev) =>
+                prev.map((m) => m.id === retryTurnId
+                  ? { ...m, content: `Rate limited — retrying in ${waitSecs}s… (attempt ${attempt}/${PI_MAX_RATE_LIMIT_RETRIES})`, contentBlocks: [] }
+                  : m)
+              );
+            }
+            setTimeout(() => {
+              // Guard the delayed re-send: bail if the user unmounted, switched
+              // sessions, or started a new turn during the wait, so we never
+              // inject a stale prompt into the wrong place.
+              if (!mountedRef.current) return;
+              if (piSessionIdRef.current !== retrySession) return;
+              if (piMessageIdRef.current && piMessageIdRef.current !== retryTurnId) return;
+              commands.piPrompt(retrySession, retryPrompt, null, null).catch(() => {});
+            }, waitSecs * 1000);
             return;
           }
           if (piMessageIdRef.current) {
@@ -6265,11 +6380,49 @@ export function StandaloneChat({
     if (inputRef.current) inputRef.current.style.height = "auto";
     if (hadPastedImages) setPastedImages([]);
 
+    // Issue #3636: same contract as sendPiMessage's send path — every
+    // turn carries the recent conversation history so the model has
+    // context even if Pi's internal session lost it (compaction,
+    // crash + auto-restart, kill that the termination handler missed).
+    // The queue path was previously a silent gap: when an earlier send
+    // was still in-flight, follow-ups routed here got the bare user
+    // message, and any Pi state divergence in between manifested as
+    // "chat suddenly forgot what we were talking about."
+    let queuedPrompt = userMessage;
+    if (messages.length > 0) {
+      const historyLines = messages
+        .slice(-40)
+        .map((m) => {
+          let text = m.content || "";
+          if (m.contentBlocks?.length) {
+            const blockTexts = m.contentBlocks
+              .map((b: any) => {
+                if (b.type === "text" && b.text) return b.text;
+                if (b.type === "tool" && b.toolCall) {
+                  const tc = b.toolCall;
+                  let s = `[tool: ${tc.toolName}](${JSON.stringify(tc.args)})`;
+                  if (tc.result) s += ` → ${tc.result.slice(0, 500)}`;
+                  return s;
+                }
+                return "";
+              })
+              .filter(Boolean)
+              .join("\n");
+            if (blockTexts && !text) text = blockTexts;
+            else if (blockTexts) text += "\n" + blockTexts;
+          }
+          return `${m.role}: ${text}`;
+        })
+        .join("\n");
+      queuedPrompt = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
+    }
+
     try {
       const result = await commands.piQueuePrompt(
         piSessionIdRef.current,
-        userMessage,
+        queuedPrompt,
         piImages.length > 0 ? piImages : null,
+        queuedPreviewForText(userMessage),
       );
       const queuedTurnIntentId = `queued-${result.status === "ok" ? result.data : Date.now()}`;
       if (result.status !== "ok") {
@@ -6426,6 +6579,7 @@ export function StandaloneChat({
     // Clear follow-ups for new message
     setFollowUpSuggestions([]);
     followUpFiredRef.current = false;
+    piRateLimitRetries.current = 0;
     if (followUpAbortRef.current) {
       followUpAbortRef.current.abort();
       followUpAbortRef.current = null;
@@ -6463,7 +6617,7 @@ export function StandaloneChat({
       if (!storeState.sessions[sidNow]) {
         storeState.actions.upsert({
           id: sidNow,
-          title: "new chat",
+          title: "untitled",
           preview: "",
           status: "streaming",
           messageCount: 0,
@@ -6474,6 +6628,10 @@ export function StandaloneChat({
         });
       }
       storeState.actions.appendMessage(sidNow, newUserMessage as any);
+      const currentTitle = useChatStore.getState().sessions[sidNow]?.title;
+      if (displayLabel && isPlaceholderConversationTitle(currentTitle)) {
+        storeState.actions.patch(sidNow, { title: displayLabel });
+      }
       storeState.actions.appendMessage(sidNow, {
         id: assistantMessageId,
         role: "assistant",
@@ -6560,9 +6718,42 @@ export function StandaloneChat({
         { id: assistantMessageId, role: "assistant", content: "Processing...", timestamp: Date.now(), model: activePreset?.model, provider: activePreset?.provider },
       ]);
 
-      // If Pi's session is out of sync (restart, conversation load), inject history
+      // Always re-inject the recent conversation history into every prompt
+      // when the chat has prior turns (issue #3636).
+      //
+      // The previous contract gated injection on `piSessionSyncedRef.current`
+      // — a local boolean that tracked "we believe Pi has the conversation
+      // in its own in-memory session." The ref was reset on explicit Pi
+      // restarts (piStart paths), but Pi can also lose state silently —
+      // pi-agent runs context compaction by default (default settings:
+      // reserveTokens 16384, keepRecentTokens 20000), pi can crash and
+      // be auto-restarted before our termination handler observes the
+      // exit, and a queued / steer follow-up can race with a fresh
+      // sendPiMessage in ways the ref can't track. When the ref says
+      // "synced" but Pi has actually dropped everything, the next turn
+      // is sent as a bare user message — the model sees no prior context
+      // and answers as if the conversation just started. That's the
+      // user-visible symptom in issue #3636: "chat suddenly loses prior
+      // conversation context, but if I explicitly ask it to read the
+      // previous conversation, it can."
+      //
+      // The frontend's `messages` array is the durable source of truth
+      // (it's what gets persisted to disk on every save). Sending the
+      // last ~40 turns every time costs a small amount of tokens against
+      // the model's context window, but eliminates the entire class of
+      // "pi state silently diverged from messages" bugs. Pi appends the
+      // prompt verbatim to its own session; in the steady-state path the
+      // model sees a small amount of duplication between Pi's accumulated
+      // state and the injected block, which it handles fine. In the
+      // failure path (Pi just restarted, compacted, or never had this
+      // turn at all), the injected block IS the conversation and the
+      // model has what it needs.
+      //
+      // `piSessionSyncedRef` is kept around because other code paths
+      // (preset change, reauth, the conversation-load handler) still
+      // toggle it for diagnostics, but it no longer gates injection.
       let promptMessage = userMessage;
-      if (!piSessionSyncedRef.current && messages.length > 0) {
+      if (messages.length > 0) {
         const historyLines = messages
           .slice(-40)
           .map(m => {
@@ -6586,10 +6777,8 @@ export function StandaloneChat({
           })
           .join("\n");
         promptMessage = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
-        piSessionSyncedRef.current = true;
-      } else {
-        piSessionSyncedRef.current = true;
       }
+      piSessionSyncedRef.current = true;
 
       // Send prompt — abort/new_session now await completion, so no retry needed
       let result = await commands.piPrompt(
@@ -6645,7 +6834,7 @@ export function StandaloneChat({
         } else if (rawError.includes("Broken pipe") || rawError.includes("not running") || rawError.includes("has died") || rawError.includes("Pi not initialized")) {
           const provider = activePreset?.provider;
           errorMsg = provider === "native-ollama"
-            ? "Ollama is not running. Start it with: `ollama serve`"
+            ? "Ollama isn't running. Start it with: `ollama serve`"
             : "AI agent crashed — restarting automatically...";
           retryPrompt = userMessage;
         } else if (rawError.includes("not found")) {
@@ -7207,6 +7396,7 @@ export function StandaloneChat({
 
     setFollowUpSuggestions([]);
     followUpFiredRef.current = false;
+    piRateLimitRetries.current = 0;
     if (followUpAbortRef.current) {
       followUpAbortRef.current.abort();
       followUpAbortRef.current = null;
@@ -8185,6 +8375,12 @@ export function StandaloneChat({
               const canEditMessage = message.role === "user" && !isSteerUserMessage && !isLoading;
               const canShowMessageActions = !item.showActionsWhenExpandedBy ||
                 expandedSteerWorkIds.has(item.showActionsWhenExpandedBy);
+              const isActiveStreamingAssistantMessage =
+                message.role === "assistant" &&
+                (isLoading || isStreaming) &&
+                message.id === activeSourceFooterMessageId;
+              const shouldShowMessageActionBar =
+                canShowMessageActions && !isActiveStreamingAssistantMessage;
               const nextAssistant = visibleMessages
                 .slice(messageIndex + 1)
                 .find((candidate) => candidate.role === "assistant");
@@ -8342,7 +8538,7 @@ export function StandaloneChat({
                 )}
               </div>
               )}
-              {!hideSupersededSteerBody && canShowMessageActions ? (
+              {!hideSupersededSteerBody && shouldShowMessageActionBar ? (
                 <>
                 {/* Action buttons - appear on hover, outside the message box */}
                 {editingMessageId !== message.id && (

@@ -286,9 +286,9 @@ Focus on professional interactions. End with: "**Follow up with:** [person or th
     featured: false,
     prompt: `Export a video of my screen activity from the last 5 minutes.
 
-Use the POST /frames/export endpoint with the time range and fps=1.0. Then show me the exported video file path as an inline code block so I can watch it.
+Use the POST /export endpoint (\`{"start": "5m ago", "end": "now"}\`) — it renders a real-time clip with synced audio whose duration matches the time range. Then show me the returned output_path as an inline code block so I can watch it.
 
-If the export is large, suggest a lower fps or shorter time range.`,
+Long ranges can take a few minutes; if needed, suggest a shorter time range.`,
   },
   {
     name: "meeting-summary",

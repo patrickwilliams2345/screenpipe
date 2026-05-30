@@ -337,6 +337,81 @@ pub fn trigger_channel() -> (TriggerSender, TriggerReceiver) {
     (tx, rx)
 }
 
+/// Edge-triggered bookkeeping for the high-FPS override.
+///
+/// The override interval lives in [`crate::high_fps_controller::HighFpsController`]
+/// (atomic, runtime-mutable). Each tick the loop hands this struct the
+/// controller's current `effective_interval_ms()` and the live
+/// `min_capture_interval_ms` value, and gets back either `Some(new_ms)` to
+/// install or `None` (no change needed). The struct's job is to keep the
+/// pre-override baseline so the eventual restore writes the right value
+/// even if a power-profile update arrived mid-override or the user changed
+/// the meeting interval on the fly.
+#[derive(Debug)]
+pub(crate) struct HighFpsBookkeeping {
+    active_ms: Option<u64>,
+    baseline_ms: u64,
+}
+
+impl HighFpsBookkeeping {
+    pub(crate) fn new(initial_baseline_ms: u64) -> Self {
+        Self {
+            active_ms: None,
+            baseline_ms: initial_baseline_ms,
+        }
+    }
+
+    /// Apply external baseline changes (e.g. power-profile updates) while
+    /// the override may or may not be active. Returns the value the caller
+    /// should install on the live config: the active override value if one
+    /// is in force, the new baseline otherwise.
+    pub(crate) fn on_baseline_change(&mut self, new_baseline_ms: u64) -> u64 {
+        self.baseline_ms = new_baseline_ms;
+        self.active_ms.unwrap_or(new_baseline_ms)
+    }
+
+    /// React to the controller's latest effective state. Returns
+    /// `Some(new_ms)` on a transition or an interval change while active;
+    /// `None` when nothing needs to change.
+    pub(crate) fn on_controller_state(
+        &mut self,
+        controller_ms: Option<u64>,
+        current_live_ms: u64,
+    ) -> Option<u64> {
+        match (self.active_ms, controller_ms) {
+            (None, None) => None,
+            (None, Some(new_ms)) => {
+                // false → true: stash the current live value as the
+                // restore target (defense-in-depth — even if the baseline
+                // tracker drifted, the live config is authoritative).
+                self.baseline_ms = current_live_ms;
+                self.active_ms = Some(new_ms);
+                Some(new_ms)
+            }
+            (Some(_), None) => {
+                // true → false: restore the tracked baseline.
+                self.active_ms = None;
+                Some(self.baseline_ms)
+            }
+            (Some(prev_ms), Some(new_ms)) => {
+                if prev_ms == new_ms {
+                    None
+                } else {
+                    // Override stayed active but the interval changed
+                    // underneath us — install the new value, keep baseline.
+                    self.active_ms = Some(new_ms);
+                    Some(new_ms)
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_active(&self) -> bool {
+        self.active_ms.is_some()
+    }
+}
+
 /// True iff this tick should release the OS-level capture stream.
 ///
 /// Edge-triggered: fires exactly once on the non-paused → paused transition.
@@ -377,6 +452,10 @@ pub async fn event_driven_capture_loop(
     power_profile_rx: Option<watch::Receiver<PowerProfile>>,
     focus_controller: Arc<crate::focus_aware_controller::FocusAwareController>,
     linker_tx: Option<crate::frame_linker_actor::LinkerSender>,
+    // Runtime control surface for the high-FPS override (manual + auto modes).
+    // The loop polls `effective_interval_ms()` each tick; `None` here means
+    // the override is fully disabled (no auto, no manual, no detector).
+    high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
 ) -> Result<()> {
     info!(
         "event-driven capture started for monitor {} (device: {})",
@@ -390,6 +469,11 @@ pub async fn event_driven_capture_loop(
 
     let mut state = EventDrivenCapture::new(config);
     let mut power_profile_rx = power_profile_rx;
+    // High-FPS override: takes ownership of `min_capture_interval_ms` while
+    // active (manual toggle or auto-detected meeting). The reducer forwards
+    // power-profile baseline updates so the post-override restore writes the
+    // current baseline, not the value live when the override started.
+    let mut high_fps = HighFpsBookkeeping::new(state.config.min_capture_interval_ms);
     // Polling the ActivityFeed too aggressively burns CPU when idle. External UI
     // triggers arrive via `broadcast::Receiver::recv()` (awaitable), so we only
     // need a modest tick to detect typing-pause / idle timers.
@@ -431,6 +515,13 @@ pub async fn event_driven_capture_loop(
     // then suppress until success. Prevents monitor disconnect from flooding
     // Sentry with 100k+ identical events.
     let mut consecutive_capture_errors: u32 = 0;
+    // Whether an HD (high-FPS) session is currently active. Refreshed each
+    // tick from the controller snapshot below. When true, content dedup is
+    // bypassed (see `dedup_applies`) so dense replay captures every change at
+    // the HD interval even when the accessibility-tree hash is unchanged —
+    // the video / slide-flip / demo-replay case the AX-text dedup otherwise
+    // suppresses. Stays false when no controller is wired.
+    let mut hd_active = false;
 
     let capture_params = CaptureParams {
         db: &db,
@@ -466,6 +557,7 @@ pub async fn event_driven_capture_loop(
             None, // first capture — no elements ref
             &mut walk_budget,
             false, // screenshot enabled on startup
+            false, // hd not active at startup (Manual is dedup-exempt anyway)
         )
         .await
         {
@@ -736,7 +828,11 @@ pub async fn event_driven_capture_loop(
                     "applying power profile {:?} to monitor {}",
                     profile.name, monitor_id
                 );
-                state.config.min_capture_interval_ms = profile.min_capture_interval_ms;
+                // While the high-FPS override is active it owns
+                // `min_capture_interval_ms`; route the new baseline through
+                // the bookkeeper so the post-override cadence is still correct.
+                state.config.min_capture_interval_ms =
+                    high_fps.on_baseline_change(profile.min_capture_interval_ms);
                 state.config.idle_capture_interval_ms = profile.idle_capture_interval_ms;
                 // Power profile can only LOWER quality from the user's baseline,
                 // never raise it — picking "max" in settings shouldn't be silently
@@ -755,6 +851,31 @@ pub async fn event_driven_capture_loop(
                         profile.name, monitor_id
                     );
                 }
+            }
+        }
+
+        // High-FPS override: bumps capture rate while the controller reports
+        // effective (manual toggle on, or auto mode on + meeting detected).
+        // ONE snapshot per tick: reading effective + interval_ms together
+        // guarantees the log line and the installed value can't disagree
+        // because the controller flipped between two separate atomic loads.
+        if let Some(controller) = high_fps_controller.as_ref() {
+            let snap = controller.snapshot();
+            // Source of truth for dedup-bypass this tick. Read from the same
+            // snapshot as the interval install so the two can't disagree.
+            hd_active = snap.active;
+            if let Some(new_ms) = high_fps.on_controller_state(
+                snap.effective_interval_ms(),
+                state.config.min_capture_interval_ms,
+            ) {
+                info!(
+                    "high-fps: monitor {} {} min_capture_interval_ms {} -> {} ms",
+                    monitor_id,
+                    if snap.active { "dropping" } else { "restoring" },
+                    state.config.min_capture_interval_ms,
+                    new_ms,
+                );
+                state.config.min_capture_interval_ms = new_ms;
             }
         }
 
@@ -1009,6 +1130,7 @@ pub async fn event_driven_capture_loop(
                         elements_ref,
                         &mut walk_budget,
                         screenshot_disabled,
+                        hd_active,
                     ),
                 )
                 .await;
@@ -1246,19 +1368,20 @@ async fn push_to_hot_cache(
     let hot = HotFrame {
         frame_id: result.frame_id,
         timestamp: result.captured_at,
-        device_name: device_name.to_string(),
-        app_name: result.app_name.clone().unwrap_or_default(),
-        window_name: result.window_name.clone().unwrap_or_default(),
+        device_name: device_name.into(),
+        app_name: result.app_name.as_deref().unwrap_or("").into(),
+        window_name: result.window_name.as_deref().unwrap_or("").into(),
         ocr_text_preview: result
             .accessibility_text
             .as_deref()
             .unwrap_or("")
             .chars()
             .take(200)
-            .collect(),
-        snapshot_path: result.snapshot_path.clone(),
-        browser_url: result.browser_url.clone(),
-        capture_trigger: trigger.as_str().to_string(),
+            .collect::<String>()
+            .into(),
+        snapshot_path: result.snapshot_path.as_str().into(),
+        browser_url: result.browser_url.as_deref().map(Arc::from),
+        capture_trigger: trigger.as_str().into(),
         offset_index: 0,
         fps: 0.033,
         machine_id: None,
@@ -1387,12 +1510,34 @@ fn terminal_ocr_throttled(app_name: &str) -> bool {
     }
 }
 
+/// Decide whether content dedup applies to this capture attempt.
+///
+/// Dedup skips a capture when the accessibility-tree hash matches the previous
+/// frame. It is suppressed in three cases:
+/// - `hd_active`: an HD (high-FPS) session is running. HD exists to produce
+///   dense replay (video, slide flips, demos), and that content frequently
+///   moves pixels while leaving the AX-tree text unchanged — exactly what the
+///   hash dedup would otherwise drop. While HD is on we capture every change
+///   at the HD interval and let the visual-change trigger + `min_capture_
+///   interval_ms` debounce be the only rate limiters.
+/// - `Idle`/`Manual` triggers: fallback captures that must always write so the
+///   timeline is never completely empty.
+/// - the 30s time-floor has elapsed: forces a write even if the hash matches.
+fn dedup_applies(trigger: &CaptureTrigger, hd_active: bool, since_last_db_write: Duration) -> bool {
+    !hd_active
+        && !matches!(trigger, CaptureTrigger::Idle | CaptureTrigger::Manual)
+        && since_last_db_write < Duration::from_secs(30)
+}
+
 /// Perform a single event-driven capture.
 ///
 /// When `previous_content_hash` is `Some` and matches the current accessibility
 /// tree hash, the capture is skipped (content dedup). The returned
 /// `CaptureOutput.result` will be `None` in that case — the caller should still
 /// update the frame comparer with the image but skip DB/metrics work.
+///
+/// `hd_active` bypasses content dedup entirely for this capture — see
+/// [`dedup_applies`].
 async fn do_capture(
     params: &CaptureParams<'_>,
     trigger: &CaptureTrigger,
@@ -1401,6 +1546,7 @@ async fn do_capture(
     elements_ref_frame_id: Option<i64>,
     walk_budget: &mut screenpipe_a11y::budget::AppWalkBudget,
     screenshot_disabled: bool,
+    hd_active: bool,
 ) -> Result<CaptureOutput> {
     let captured_at = Utc::now();
 
@@ -1575,11 +1721,9 @@ async fn do_capture(
     }
 
     // Content dedup: skip capture if accessibility text hasn't changed.
-    // Never dedup Idle/Manual triggers — these are fallback captures that must
-    // always write so the timeline is never completely empty.
-    // Also force a write every 30s even if hash matches (time-based floor).
-    let dedup_eligible = !matches!(trigger, CaptureTrigger::Idle | CaptureTrigger::Manual)
-        && last_db_write.elapsed() < Duration::from_secs(30);
+    // Never dedup Idle/Manual triggers, bypass entirely during HD sessions, and
+    // force a write every 30s even if the hash matches — see `dedup_applies`.
+    let dedup_eligible = dedup_applies(trigger, hd_active, last_db_write.elapsed());
     if dedup_eligible {
         if let Some(ref snap) = tree_snapshot {
             if !snap.text_content.is_empty() {
@@ -1862,6 +2006,29 @@ mod tests {
     }
 
     #[test]
+    fn test_dedup_applies() {
+        let recent = Duration::from_secs(5);
+        let stale = Duration::from_secs(31);
+
+        // Baseline: a change-driven trigger within the 30s floor → dedup applies.
+        assert!(dedup_applies(&CaptureTrigger::VisualChange, false, recent));
+        assert!(dedup_applies(&CaptureTrigger::Click, false, recent));
+
+        // HD active → dedup is bypassed even for an otherwise-eligible trigger.
+        // This is the fix: video/demo replay moves pixels but not AX text, so
+        // the hash would dedup it away without this bypass.
+        assert!(!dedup_applies(&CaptureTrigger::VisualChange, true, recent));
+        assert!(!dedup_applies(&CaptureTrigger::Click, true, recent));
+
+        // Idle/Manual are always dedup-exempt (timeline floor), HD or not.
+        assert!(!dedup_applies(&CaptureTrigger::Idle, false, recent));
+        assert!(!dedup_applies(&CaptureTrigger::Manual, false, recent));
+
+        // 30s time-floor: once it elapses, write through regardless.
+        assert!(!dedup_applies(&CaptureTrigger::VisualChange, false, stale));
+    }
+
+    #[test]
     fn test_debounce() {
         let config = EventDrivenCaptureConfig {
             min_capture_interval_ms: 200,
@@ -2133,5 +2300,89 @@ mod tests {
             !should_release_on_pause_entry(false, false),
             "active steady-state: must NOT release"
         );
+    }
+
+    #[test]
+    fn high_fps_no_change_returns_none() {
+        let mut o = HighFpsBookkeeping::new(500);
+        // No state transition — caller must do nothing.
+        assert_eq!(o.on_controller_state(None, 500), None);
+        assert!(!o.is_active());
+    }
+
+    #[test]
+    fn high_fps_enter_then_exit_restores_baseline() {
+        let mut o = HighFpsBookkeeping::new(500);
+        // None -> Some: drop to meeting interval.
+        assert_eq!(o.on_controller_state(Some(100), 500), Some(100));
+        assert!(o.is_active());
+        // Some -> None: restore the baseline that was live when we entered.
+        assert_eq!(o.on_controller_state(None, 100), Some(500));
+        assert!(!o.is_active());
+    }
+
+    #[test]
+    fn high_fps_baseline_change_during_override_persists_on_exit() {
+        // Regression guard: a power-profile update during the override must
+        // not be dropped — exiting must restore the NEW baseline.
+        let mut o = HighFpsBookkeeping::new(500);
+        assert_eq!(o.on_controller_state(Some(100), 500), Some(100));
+        // Power profile shifts baseline to 1000 (saver mode) mid-override.
+        // While active, the live config stays at the override value.
+        assert_eq!(o.on_baseline_change(1000), 100);
+        // Exit — must restore the updated baseline, not 500.
+        assert_eq!(o.on_controller_state(None, 100), Some(1000));
+    }
+
+    #[test]
+    fn high_fps_baseline_change_when_idle_passes_through() {
+        let mut o = HighFpsBookkeeping::new(500);
+        // Idle: baseline changes flow straight to the live value.
+        assert_eq!(o.on_baseline_change(800), 800);
+        assert!(!o.is_active());
+        // Entering override still uses the latest live ms as restore target.
+        assert_eq!(o.on_controller_state(Some(100), 800), Some(100));
+        assert_eq!(o.on_controller_state(None, 100), Some(800));
+    }
+
+    #[test]
+    fn high_fps_redundant_calls_are_noops() {
+        let mut o = HighFpsBookkeeping::new(500);
+        assert_eq!(o.on_controller_state(Some(100), 500), Some(100));
+        // Same active interval — no transition, no write.
+        assert_eq!(o.on_controller_state(Some(100), 100), None);
+        assert_eq!(o.on_controller_state(Some(100), 100), None);
+        assert_eq!(o.on_controller_state(None, 100), Some(500));
+        // Same idle state — no transition, no write.
+        assert_eq!(o.on_controller_state(None, 500), None);
+    }
+
+    #[test]
+    fn high_fps_runtime_interval_change_while_active() {
+        // User toggles 10 fps → 30 fps via the tray slider mid-override.
+        // The bookkeeper must install the new value but keep the original
+        // baseline so the eventual exit still restores correctly.
+        let mut o = HighFpsBookkeeping::new(500);
+        assert_eq!(o.on_controller_state(Some(100), 500), Some(100));
+        assert_eq!(o.on_controller_state(Some(33), 100), Some(33));
+        // Idle: baseline still 500.
+        assert_eq!(o.on_controller_state(None, 33), Some(500));
+    }
+
+    #[test]
+    fn high_fps_power_profile_then_interval_change_then_exit() {
+        // The hardest interleaving: enter override, power profile shifts
+        // baseline mid-override, then user changes the override interval,
+        // then exit. Restore target must be the *latest* baseline (1000),
+        // not the original (500) or the runtime interval (33).
+        let mut o = HighFpsBookkeeping::new(500);
+        // Enter override.
+        assert_eq!(o.on_controller_state(Some(100), 500), Some(100));
+        // Power profile drops baseline to 1000 (saver) — live config stays at 100.
+        assert_eq!(o.on_baseline_change(1000), 100);
+        // User cranks override to 30 fps via tray slider.
+        assert_eq!(o.on_controller_state(Some(33), 100), Some(33));
+        // Exit override — restore the saver baseline.
+        assert_eq!(o.on_controller_state(None, 33), Some(1000));
     }
 }

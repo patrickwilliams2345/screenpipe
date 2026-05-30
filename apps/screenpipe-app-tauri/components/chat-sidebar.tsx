@@ -418,7 +418,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       const fresh = crypto.randomUUID();
       actions.upsert({
         id: fresh,
-        title: "new chat",
+        title: "untitled",
         preview: "",
         status: "idle",
         messageCount: 0,
@@ -474,7 +474,7 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
       const fresh = crypto.randomUUID();
       actions.upsert({
         id: fresh,
-        title: "new chat",
+        title: "untitled",
         preview: "",
         status: "idle",
         messageCount: 0,
@@ -509,9 +509,10 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
 
   const handleRenameConfirmed = async (id: string, nextTitleRaw: string) => {
     const nextTitle = nextTitleRaw.trim() || "untitled";
-    actions.patch(id, { title: nextTitle });
+    actions.patch(id, { title: nextTitle, titleSource: "user" });
     try {
-      await updateConversationFlags(id, { title: nextTitle });
+      await updateConversationFlags(id, { title: nextTitle, titleSource: "user" });
+      await emit("chat-renamed", { id, title: nextTitle });
     } catch {
       // best-effort persistence — UI already updated
     }
@@ -1379,6 +1380,9 @@ function Section({
         className={cn(
           // Light header row — avoid the "boxed section" look.
           "group/section shrink-0 px-2.5 py-1 flex items-center gap-1 rounded-sm text-left",
+          // Suppress the default macOS blue focus ring — it bleeds into the
+          // adjacent animated grid during collapse and leaves a cyan stripe.
+          "focus:outline-none",
           tone === "subtle" ? "hover:bg-muted/10" : "hover:bg-muted/15"
         )}
         aria-expanded={!collapsed}
@@ -1434,7 +1438,10 @@ function Section({
       </button>
       <div
         className={cn(
-          "grid transition-[grid-template-rows] duration-200 ease-in-out",
+          // overflow-hidden here ensures paint stays within the animated
+          // boundary and prevents the focus-ring bleed that caused the
+          // left-edge cyan stripe artifact during collapse/expand.
+          "grid overflow-hidden transition-[grid-template-rows] duration-200 ease-in-out",
           collapsed ? "grid-rows-[0fr]" : "grid-rows-[1fr]"
         )}
       >
@@ -1547,13 +1554,13 @@ export function SidebarChatRow({
                 : "text-muted-foreground"
           )}
         >
-          {(isConversationHistorySyncPrompt(session.title) ? undefined : session.title) || "untitled"}
+          {session.streamingTitle || (isConversationHistorySyncPrompt(session.title) ? undefined : session.title) || "untitled"}
         </span>
         <span className="ml-1 h-4 w-10 shrink-0 relative flex items-center justify-end">
           <span
             className={cn(
               "absolute inset-y-0 right-0 flex items-center justify-end transition-opacity duration-150",
-              canSwapAgeForMenu && "group-hover:opacity-0",
+              canShowActions && "group-hover:opacity-0",
               menuOpen && "opacity-0"
             )}
           >

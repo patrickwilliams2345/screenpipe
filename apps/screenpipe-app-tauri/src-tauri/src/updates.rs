@@ -251,6 +251,7 @@ pub async fn await_restart_gate(timeout: Duration, label: &str) -> RestartGate {
 /// `relaunch`. Returns one of `"proceed"`, `"errored"`, or `"pending"`
 /// — frontend toasts on the latter two.
 #[tauri::command]
+#[specta::specta]
 pub async fn await_safe_restart(timeout_secs: Option<u64>) -> String {
     let cap = Duration::from_secs(timeout_secs.unwrap_or(BANNER_GATE_TIMEOUT_SECS));
     await_restart_gate(cap, "banner-triggered restart")
@@ -740,7 +741,10 @@ impl UpdatesManager {
                 // race. In the common case boot is already ready and this returns
                 // immediately. See `await_restart_gate` for the full rationale.
                 let label = format!("auto-update v{}", update.version);
-                if !await_restart_gate(AUTO_UPDATE_GATE_TIMEOUT, &label).await.proceed() {
+                if !await_restart_gate(AUTO_UPDATE_GATE_TIMEOUT, &label)
+                    .await
+                    .proceed()
+                {
                     return Result::Ok(true);
                 }
 

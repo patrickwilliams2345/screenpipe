@@ -26,6 +26,11 @@ let _orderedEntriesCache: ConversationEntry[] | null = null;
 export const CHAT_HISTORY_INITIAL_LIMIT = 50;
 export const CHAT_SEARCH_RESULT_LIMIT = 50;
 
+/** Placeholder the chat panel writes for an assistant turn that hasn't started
+ *  streaming yet (see standalone-chat.tsx send path). Centralized here so the
+ *  dedup's "completed reply" check can't silently drift from the writer. */
+export const CHAT_PROCESSING_PLACEHOLDER = "Processing...";
+
 export function __resetChatStorageCachesForTests(): void {
   _chatsDir = null;
   clearConversationEntryCache();
@@ -170,6 +175,8 @@ export interface ConversationMeta {
   kind: ConversationKind;
   /** Pipe metadata for `pipe-*` kinds. Undefined for plain chats. */
   pipeContext?: PipeContext;
+  /** Title source priority: user > ai > fallback. */
+  titleSource?: "user" | "ai" | "fallback";
 }
 
 interface ConversationEntry {
@@ -278,6 +285,7 @@ export function conversationMetaFromJson(conv: any): ConversationMeta | null {
     lastUserMessageAt,
     kind: conv.kind ?? "chat",
     pipeContext: conv.pipeContext,
+    titleSource: conv.titleSource,
   };
 }
 
@@ -301,6 +309,119 @@ function normalizeLimit(limit: number | undefined): number | undefined {
   return Math.max(0, Math.floor(limit));
 }
 
+// ---------------------------------------------------------------------------
+// Duplicate-conversation collapsing
+//
+// A cross-window save race — the home window and the floating chat overlay
+// each run their own chat-store + panel + Pi session id — can persist the
+// SAME conversation under two different ids, producing two sidebar rows for
+// one chat. The two copies are near-identical: same first user message,
+// near-identical per-turn timestamps, but independently minted message ids
+// (each window generated its own). One copy usually wins the AI-generated
+// title; the other is left at a fallback title (and sometimes a stale
+// "Processing…" tail when its window never observed the final tokens).
+//
+// Until the write-side race is closed, collapse these at read time so the
+// user sees a single row. We key on the normalized first user message and
+// only merge chats created within a short window of each other, so two
+// genuinely distinct chats that happen to share an opener — and templated
+// pipe runs, which legitimately repeat the same first message every run —
+// are never merged.
+// ---------------------------------------------------------------------------
+
+/** Chats sharing a first user message and created within this window of each
+ *  other are treated as the same conversation persisted twice. */
+export const CONVERSATION_DEDUP_WINDOW_MS = 30 * 60 * 1000;
+
+export interface ConversationDedupCandidate {
+  meta: ConversationMeta;
+  /** Normalized first user message. `null` exempts the row from dedup
+   *  (pipe runs, or chats with no user message yet). */
+  key: string | null;
+  /** True when at least one assistant message carries real content (not just
+   *  the transient "Processing…" placeholder). Lets us keep the finished copy
+   *  over a half-written ghost regardless of the ghost's (sometimes spurious)
+   *  titleSource. */
+  hasCompletedReply: boolean;
+}
+
+/** Dedup key for a conversation: its first user message, normalized. Returns
+ *  null for non-chat (pipe) conversations — repeated pipe runs share a
+ *  templated first message and must never be collapsed — and for chats with
+ *  no user message. */
+export function conversationDedupKey(conv: any): string | null {
+  const kind: ConversationKind = conv?.kind ?? "chat";
+  if (kind !== "chat") return null;
+  const messages = Array.isArray(conv?.messages) ? conv.messages : [];
+  const firstUser = messages.find((m: any) => m?.role === "user");
+  const raw = typeof firstUser?.content === "string" ? firstUser.content : "";
+  const cleaned = raw.trim().toLowerCase().replace(/\s+/g, " ");
+  return cleaned ? cleaned.slice(0, 200) : null;
+}
+
+function conversationHasCompletedReply(conv: any): boolean {
+  const messages = Array.isArray(conv?.messages) ? conv.messages : [];
+  return messages.some((m: any) => {
+    if (m?.role !== "assistant") return false;
+    const content = typeof m.content === "string" ? m.content.trim() : "";
+    if (content && content !== CHAT_PROCESSING_PLACEHOLDER) return true;
+    return Array.isArray(m.contentBlocks) && m.contentBlocks.length > 0;
+  });
+}
+
+function dedupCandidateIsBetter(
+  a: ConversationDedupCandidate,
+  b: ConversationDedupCandidate,
+): boolean {
+  if (a.hasCompletedReply !== b.hasCompletedReply) return a.hasCompletedReply;
+  if (a.meta.messageCount !== b.meta.messageCount) {
+    return a.meta.messageCount > b.meta.messageCount;
+  }
+  return a.meta.updatedAt > b.meta.updatedAt;
+}
+
+/** Collapse conversations that are the same chat saved under two ids. Keeps
+ *  the more "complete" copy and preserves the position of the first-seen one.
+ *  Pure (no I/O) so it is unit-testable in isolation. */
+export function dedupeConversationMetas(
+  candidates: ConversationDedupCandidate[],
+): ConversationMeta[] {
+  const kept: ConversationDedupCandidate[] = [];
+  const indicesByKey = new Map<string, number[]>();
+
+  for (const candidate of candidates) {
+    if (!candidate.key) {
+      kept.push(candidate);
+      continue;
+    }
+    const indices = indicesByKey.get(candidate.key);
+    let mergeIndex = -1;
+    if (indices) {
+      for (const index of indices) {
+        const a = candidate.meta.createdAt;
+        const b = kept[index].meta.createdAt;
+        // Only merge when both timestamps are real and close together.
+        if (a && b && Math.abs(a - b) <= CONVERSATION_DEDUP_WINDOW_MS) {
+          mergeIndex = index;
+          break;
+        }
+      }
+    }
+    if (mergeIndex >= 0) {
+      if (dedupCandidateIsBetter(candidate, kept[mergeIndex])) {
+        kept[mergeIndex] = candidate;
+      }
+      continue;
+    }
+    kept.push(candidate);
+    const bucket = indicesByKey.get(candidate.key);
+    if (bucket) bucket.push(kept.length - 1);
+    else indicesByKey.set(candidate.key, [kept.length - 1]);
+  }
+
+  return kept.map((candidate) => candidate.meta);
+}
+
 export async function listConversations(
   options: ConversationListOptions = {}
 ): Promise<ConversationMeta[]> {
@@ -314,7 +435,7 @@ export async function listConversations(
     limit == null && offset === 0
       ? await listConversationEntries(dir)
       : await orderedConversationEntries(dir);
-  const metas: ConversationMeta[] = [];
+  const candidates: ConversationDedupCandidate[] = [];
   let skipped = 0;
 
   for (const entry of orderedEntries) {
@@ -327,13 +448,19 @@ export async function listConversations(
         skipped += 1;
         continue;
       }
-      metas.push(meta);
-      if (limit != null && metas.length >= limit) break;
+      candidates.push({
+        meta,
+        key: conversationDedupKey(conv),
+        hasCompletedReply: conversationHasCompletedReply(conv),
+      });
+      if (limit != null && candidates.length >= limit) break;
     } catch {
       // skip corrupt files
     }
   }
 
+  // Collapse same-chat duplicates (cross-window save race) before sorting.
+  const metas = dedupeConversationMetas(candidates);
   // Sort by updatedAt descending (most recent first)
   metas.sort((a, b) => b.updatedAt - a.updatedAt);
   return metas;
@@ -361,7 +488,7 @@ export async function searchConversations(
   const offset = Math.max(0, Math.floor(options.offset ?? 0));
   if (limit === 0) return [];
   const entries = await orderedConversationEntries(dir);
-  const metas: ConversationMeta[] = [];
+  const candidates: ConversationDedupCandidate[] = [];
   let skipped = 0;
 
   for (const entry of entries) {
@@ -377,13 +504,19 @@ export async function searchConversations(
         skipped += 1;
         continue;
       }
-      metas.push(meta);
-      if (limit != null && metas.length >= limit) break;
+      candidates.push({
+        meta,
+        key: conversationDedupKey(conv),
+        hasCompletedReply: conversationHasCompletedReply(conv),
+      });
+      if (limit != null && candidates.length >= limit) break;
     } catch {
       // skip corrupt files
     }
   }
 
+  // Collapse same-chat duplicates (cross-window save race) before sorting.
+  const metas = dedupeConversationMetas(candidates);
   metas.sort((a, b) => b.updatedAt - a.updatedAt);
   return metas;
 }
@@ -399,7 +532,7 @@ export async function searchConversations(
  */
 export async function updateConversationFlags(
   id: string,
-  patch: Partial<Pick<ChatConversation, "pinned" | "hidden" | "title" | "browserState">>
+  patch: Partial<Pick<ChatConversation, "pinned" | "hidden" | "title" | "titleSource" | "browserState">>
 ): Promise<void> {
   const conv = await loadConversationFile(id);
   if (!conv) return;

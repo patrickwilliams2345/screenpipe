@@ -64,6 +64,7 @@ import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { PipesSection } from "@/components/settings/pipes-section";
 import { ChatPrefillData } from "@/lib/chat-utils";
+import { useFeedbackStore } from "@/lib/stores/feedback-store";
 // --- Types ---
 
 interface StorePipe {
@@ -180,6 +181,16 @@ function navigateHomeAndPrefill(data: ChatPrefillData): void {
   const url = new URL(window.location.href);
   url.searchParams.set("section", "home");
   window.location.href = url.toString();
+}
+
+function buildForkPipeDisplayLabel(pipeTitle: string): string {
+  const title = pipeTitle.trim();
+  return title ? `Fork pipe: ${title}` : "Fork pipe";
+}
+
+function buildPublishPipeDisplayLabel(pipeName: string): string {
+  const name = pipeName.trim();
+  return name ? `Publish pipe: ${name}` : "Publish pipe";
 }
 
 
@@ -312,6 +323,7 @@ export function PipeStoreView() {
 function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const { settings } = useSettings();
   const { toast } = useToast();
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
   const token = settings.user?.token;
 
   // Browse state
@@ -553,7 +565,18 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
     } catch (err: any) {
       toast({
         title: "failed to install pipe",
-        description: err.message,
+        description: (
+          <span>
+            {err.message}{" "}
+            <button
+              type="button"
+              className="underline underline-offset-2 text-inherit opacity-80 hover:opacity-100"
+              onClick={() => openFeedback(`Pipe install failed (${slug}): ${err.message}`)}
+            >
+              report issue
+            </button>
+          </span>
+        ),
         variant: "destructive",
       });
     } finally {
@@ -1096,6 +1119,7 @@ ${pipeSource}
 
 IMPORTANT: first read the screenpipe skill file to understand how pipes work, then ask the user how they want to customize/improve this pipe for their specific needs. do NOT auto-send or auto-create — have a conversation first to understand what they want to change.`,
                     prompt: `i want to fork the "${pipe.title}" pipe and adapt it to my needs. here is the original pipe.md:\n\n${pipeSource}`,
+                    displayLabel: buildForkPipeDisplayLabel(pipe.title),
                     autoSend: true,
                   });
                 }}
@@ -1498,6 +1522,7 @@ STEP 5: PUBLISH (only after user says yes)
 - include Authorization header with Bearer token from settings (read settings first to get user.token)
 - tell the user the result`,
       prompt: `help me publish my pipe "${pipeName}" to the store. make it generic and ready for anyone to use.`,
+      displayLabel: buildPublishPipeDisplayLabel(pipeName),
       autoSend: true,
     });
   };

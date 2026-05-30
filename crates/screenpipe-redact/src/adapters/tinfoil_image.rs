@@ -88,6 +88,12 @@ pub struct TinfoilImageConfig {
     /// Score floor sent to the server. Below this, the server drops
     /// detections before returning.
     pub threshold: f32,
+    /// Canonical [`crate::SpanLabel`] snake_case names the enclave
+    /// should return regions for (e.g. `["secret", "email"]`). The
+    /// detector finds every class but only the requested ones come
+    /// back. Empty = enclave default. Populated from the
+    /// `piiRedactionLabels` setting.
+    pub labels: Vec<String>,
 }
 
 /// See sibling `tinfoil::CachedClient` for the rationale on holding
@@ -105,6 +111,9 @@ pub struct TinfoilImageRedactor {
     bearer: Option<HeaderValue>,
     timeout: Duration,
     threshold: f32,
+    /// Server-side label allow-list forwarded on every request; empty =
+    /// enclave default.
+    labels: Vec<String>,
     client: RwLock<Option<CachedClient>>,
     has_auth: bool,
 }
@@ -173,6 +182,7 @@ impl TinfoilImageRedactor {
             bearer,
             timeout: cfg.timeout.unwrap_or(DEFAULT_TIMEOUT),
             threshold,
+            labels: cfg.labels,
             client: RwLock::new(None),
             has_auth,
         }
@@ -235,6 +245,11 @@ impl TinfoilImageRedactor {
 struct DetectRequest<'a> {
     image_b64: &'a str,
     threshold: f32,
+    /// Server-side label allow-list. Older enclave builds ignore this
+    /// field (pydantic drops unknown keys); newer builds only return
+    /// regions for these classes. Sent only when non-empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    labels: &'a Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +291,7 @@ impl ImageRedactor for TinfoilImageRedactor {
             .json(&DetectRequest {
                 image_b64: &image_b64,
                 threshold: self.threshold,
+                labels: &self.labels,
             });
         if let Some(b) = &self.bearer {
             req = req.header(AUTHORIZATION, b.clone());
@@ -358,6 +374,7 @@ mod tests {
             api_key: None,
             timeout: None,
             threshold: 0.0,
+            labels: vec![],
         }
     }
 

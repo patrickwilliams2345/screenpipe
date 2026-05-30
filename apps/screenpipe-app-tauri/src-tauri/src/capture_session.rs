@@ -82,7 +82,8 @@ impl CaptureSession {
             let vision_manager = Arc::new(
                 VisionManager::new(vision_config, db_clone, tokio::runtime::Handle::current())
                     .with_hot_frame_cache(server.hot_frame_cache.clone())
-                    .with_power_profile(server.power_manager.subscribe()),
+                    .with_power_profile(server.power_manager.subscribe())
+                    .with_high_fps_controller(server.high_fps_controller.clone()),
             );
 
             capture_trigger_tx = Some(vision_manager.trigger_sender());
@@ -326,11 +327,8 @@ async fn reconfigure_audio_manager(
     let audio_devices = if config.disable_audio {
         Vec::new()
     } else {
-        resolve_audio_devices_for_capture(
-            &config.audio_devices,
-            config.use_system_default_audio,
-        )
-        .await
+        resolve_audio_devices_for_capture(&config.audio_devices, config.use_system_default_audio)
+            .await
     };
 
     let mut audio_manager_builder = config

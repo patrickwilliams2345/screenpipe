@@ -116,12 +116,24 @@ pub struct TinfoilConfig {
     pub api_key: Option<String>,
     /// Per-request HTTP timeout. Default: 60s.
     pub timeout: Option<Duration>,
+    /// Canonical [`crate::SpanLabel`] snake_case names the enclave
+    /// should redact (e.g. `["secret", "email", "person"]`). The
+    /// enclave detects every class but only rewrites these. Empty =
+    /// let the enclave use its own default (back-compat). The desktop
+    /// app populates this from the `piiRedactionLabels` setting.
+    pub labels: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct FilterRequest<'a> {
     text: &'a str,
     include_spans: bool,
+    /// Server-side allow-list. Older enclave builds ignore this field
+    /// (pydantic drops unknown keys); newer builds filter to exactly
+    /// these classes. Sent only when non-empty so an unconfigured
+    /// caller falls back to the enclave's own default policy.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    labels: &'a Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -150,6 +162,10 @@ pub struct TinfoilRedactor {
     /// the OpenAI chat path), so we keep the header logic local.
     bearer: Option<HeaderValue>,
     timeout: Duration,
+    /// Server-side redaction allow-list (canonical snake_case label
+    /// names). Forwarded on every `/filter` request; empty = enclave
+    /// default.
+    labels: Vec<String>,
     /// Cached attested client. RwLock so reads (the hot path) don't
     /// serialize, write lock only on (re-)attest. Lazy: the first
     /// `http()` call pays the ~1-2 s attestation handshake.
@@ -206,6 +222,7 @@ impl TinfoilRedactor {
             repo,
             bearer,
             timeout: cfg.timeout.unwrap_or(DEFAULT_TIMEOUT),
+            labels: cfg.labels,
             client: RwLock::new(None),
             has_auth,
         }
@@ -357,6 +374,7 @@ impl TinfoilRedactor {
             .json(&FilterRequest {
                 text,
                 include_spans: false,
+                labels: &self.labels,
             });
         if let Some(b) = &self.bearer {
             req = req.header(AUTHORIZATION, b.clone());
@@ -407,6 +425,7 @@ mod tests {
             repo: Some("test/never".into()),
             api_key: None,
             timeout: None,
+            labels: vec![],
         }
     }
 
@@ -447,6 +466,7 @@ mod tests {
             repo: Some("test/never".into()),
             api_key: Some("test-token-abc".into()),
             timeout: None,
+            labels: vec![],
         });
         assert!(
             r.has_auth(),
@@ -465,6 +485,7 @@ mod tests {
             repo: Some("test/never".into()),
             api_key: None,
             timeout: None,
+            labels: vec![],
         });
         assert!(!r.has_auth(), "no api key should mean no auth header");
     }

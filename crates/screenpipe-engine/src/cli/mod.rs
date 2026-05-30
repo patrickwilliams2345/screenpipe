@@ -8,6 +8,7 @@ pub mod backup;
 mod browser;
 pub mod connection;
 pub mod db;
+pub mod export;
 pub mod install;
 pub mod login;
 pub mod mcp;
@@ -285,6 +286,51 @@ pub enum Command {
         #[arg(long, value_hint = ValueHint::DirPath)]
         data_dir: Option<String>,
     },
+
+    /// Export a recording to a single MP4 (screen frames + synced audio).
+    /// Pass `--meeting-id` to export a meeting (start/end resolved for you),
+    /// or `--start`/`--end` for an arbitrary time range. Reads
+    /// `~/.screenpipe/db.sqlite` directly — no daemon required.
+    #[command(alias = "export-meeting")]
+    Export(ExportArgs),
+}
+
+// =============================================================================
+// Export args
+// =============================================================================
+
+/// Two entry points, one renderer: `--meeting-id` resolves a meeting's
+/// start/end from the DB; `--start`/`--end` take an explicit wall-clock range.
+/// Exactly one of the two must be supplied (they're mutually exclusive).
+#[derive(Parser, Clone)]
+pub struct ExportArgs {
+    /// Meeting id to export — resolves the meeting's start/end automatically
+    /// (see `screenpipe search` or the app's meetings list). Mutually
+    /// exclusive with `--start`/`--end`.
+    #[arg(long, alias = "id", conflicts_with_all = ["start", "end"])]
+    pub meeting_id: Option<i64>,
+
+    /// Start of the time range. Accepts ISO 8601 (`2026-01-15T10:00:00Z`) or
+    /// relative (`30m ago`, `2h ago`, `7d ago`, `now`). Pair with `--end`.
+    #[arg(long)]
+    pub start: Option<String>,
+
+    /// End of the time range. Same accepted formats as `--start`. Defaults to
+    /// now when `--start` is set.
+    #[arg(long)]
+    pub end: Option<String>,
+
+    /// Output .mp4 path. Defaults to `<data-dir>/exports/<name>_<timestamp>.mp4`.
+    #[arg(short = 'o', long, value_hint = ValueHint::FilePath)]
+    pub output: Option<String>,
+
+    /// Data directory. Default to $HOME/.screenpipe
+    #[arg(long, value_hint = ValueHint::DirPath)]
+    pub data_dir: Option<String>,
+
+    /// Open the resulting MP4 with the OS default player when done.
+    #[arg(long, default_value_t = false)]
+    pub open: bool,
 }
 
 // =============================================================================
@@ -385,6 +431,13 @@ pub struct RecordArgs {
     /// both worker types.
     #[arg(long, default_value = "local")]
     pub pii_backend: String,
+
+    /// Which PII classes the AI redaction workers rewrite when enabled.
+    /// Comma-separated canonical labels: secret, person, email, phone,
+    /// address, sensitive, url, company, repo, handle, channel, id,
+    /// date. `secret` is always included regardless. Default: secret.
+    #[arg(long, value_delimiter = ',', default_value = "secret")]
+    pub pii_redaction_labels: Vec<String>,
 
     /// Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise)
     #[arg(long, default_value_t = false)]
@@ -601,6 +654,7 @@ pub struct RecordArgSources {
     pub async_pii_redaction: bool,
     pub async_image_pii_redaction: bool,
     pub pii_backend: bool,
+    pub pii_redaction_labels: bool,
     pub filter_music: bool,
     pub disable_vision: bool,
     pub ignored_windows: bool,
@@ -645,6 +699,7 @@ impl RecordArgSources {
             async_pii_redaction: from_command_line(record, "async_pii_redaction"),
             async_image_pii_redaction: from_command_line(record, "async_image_pii_redaction"),
             pii_backend: from_command_line(record, "pii_backend"),
+            pii_redaction_labels: from_command_line(record, "pii_redaction_labels"),
             filter_music: from_command_line(record, "filter_music"),
             disable_vision: from_command_line(record, "disable_vision"),
             ignored_windows: from_command_line(record, "ignored_windows"),
@@ -681,6 +736,7 @@ impl RecordArgSources {
             || self.async_pii_redaction
             || self.async_image_pii_redaction
             || self.pii_backend
+            || self.pii_redaction_labels
             || self.filter_music
             || self.disable_vision
             || self.ignored_windows
@@ -761,6 +817,7 @@ impl RecordArgs {
             async_pii_redaction: self.async_pii_redaction,
             async_image_pii_redaction: self.async_image_pii_redaction,
             pii_backend: self.pii_backend.clone(),
+            pii_redaction_labels: self.pii_redaction_labels.clone(),
             filter_music: self.filter_music,
             audio_transcription_engine: engine_str.to_string(),
             transcription_mode: mode_str.to_string(),
@@ -1002,6 +1059,9 @@ impl RecordArgs {
         }
         if sources.pii_backend {
             settings.pii_backend = self.pii_backend.clone();
+        }
+        if sources.pii_redaction_labels {
+            settings.pii_redaction_labels = self.pii_redaction_labels.clone();
         }
         if sources.filter_music {
             settings.filter_music = self.filter_music;

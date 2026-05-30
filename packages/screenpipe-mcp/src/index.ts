@@ -12,7 +12,6 @@ import {
   ReadResourceRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { WebSocket } from "ws";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -389,15 +388,22 @@ const TOOLS: Tool[] = [
   {
     name: "export-video",
     description:
-      "Export an MP4 video of screen recordings for a time range. " +
-      "Returns the file path. Can take a few minutes for long ranges.",
+      "Export an MP4 of screen recordings for a time range, with synced microphone audio. " +
+      "Frames are placed at their real timestamps, so the clip's duration matches the " +
+      "wall-clock span you requested (not a sped-up timelapse). Returns the file path. " +
+      "Can take a few minutes for long ranges.",
     annotations: { title: "Export Video", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     inputSchema: {
       type: "object",
       properties: {
-        start_time: { type: "string", description: "ISO 8601 UTC or relative" },
-        end_time: { type: "string", description: "ISO 8601 UTC or relative" },
-        fps: { type: "number", description: "Output FPS (default 1.0). Higher = smoother but larger file.", default: 1.0 },
+        start_time: { type: "string", description: 'ISO 8601 UTC or relative (e.g. "5m ago", "now")' },
+        end_time: { type: "string", description: 'ISO 8601 UTC or relative (e.g. "5m ago", "now")' },
+        output_path: {
+          type: "string",
+          description:
+            "Optional absolute path for the MP4 (e.g. ~/Downloads/clip.mp4). " +
+            "Defaults to the screenpipe data dir's exports/ folder.",
+        },
       },
       required: ["start_time", "end_time"],
     },
@@ -690,24 +696,49 @@ const TEAM_TOOLS: Tool[] = [
   {
     name: "team-records",
     description:
-      "Chronological raw dump of the org's telemetry for a time window. " +
-      "Returns oldest → newest (vs team-search which is recency-ranked). " +
-      "Use for ETL or \"walk me through X from Y to Z\" — NOT for question-answering, use team-search for that. " +
+      "Chronological dump of the org's data for a time window — both raw " +
+      "telemetry (frame/audio) and the structured outputs of the enterprise-" +
+      "worker pipes (sop/skill/trajectory/memory/workflow). " +
+      "Raw kinds return oldest → newest (vs team-search which is recency-ranked). " +
+      "Synthesized kinds return one record per device's latest run by default " +
+      "(set latest_only=false to walk run history). " +
+      "Use raw for ETL / \"walk me through X from Y to Z\". " +
+      "Use synthesized for \"what SOPs / skills / trajectories / memories did " +
+      "we extract from my team's work\" — each item carries evidence-cited " +
+      "event_ids/frame_ids that team-search can resolve back to raw records. " +
       "Auth: enterprise admin token.",
     annotations: { title: "Team Records", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
     inputSchema: {
       type: "object",
       properties: {
-        device_id: { type: "string", description: "Restrict to one device (optional)." },
-        kind: { type: "string", enum: ["frame", "audio", "all"], description: "Record kind filter. Default: all.", default: "all" },
-        since: { type: "string", description: "ISO 8601 lower bound." },
-        until: { type: "string", description: "ISO 8601 upper bound." },
-        since_hours_ago: { type: "integer", description: "Convenience: equivalent to since=now-N*h." },
-        limit: { type: "integer", description: "Max records (default 50, max 200).", default: 50 },
+        device_id: { type: "string", description: "Restrict to one device (optional). Raw kinds only." },
+        kind: {
+          type: "string",
+          enum: ["frame", "audio", "all", "sop", "skill", "trajectory", "memory", "workflow"],
+          description:
+            "What to return. Raw: frame|audio|all (telemetry). " +
+            "Synthesized: sop|skill|trajectory|memory|workflow (pipe outputs). " +
+            "Default: all.",
+          default: "all",
+        },
+        since: { type: "string", description: "ISO 8601 lower bound. Raw kinds only." },
+        until: { type: "string", description: "ISO 8601 upper bound. Raw kinds only." },
+        since_hours_ago: { type: "integer", description: "Convenience: equivalent to since=now-N*h. Raw kinds only." },
+        limit: { type: "integer", description: "Max records (default 50, max 200). Raw kinds only.", default: 50 },
+        latest_only: {
+          type: "boolean",
+          description:
+            "Synthesized kinds only: if true (default), collapse to the newest " +
+            "run per device. Set false to walk run history.",
+          default: true,
+        },
       },
     },
   },
 ];
+
+// Pipe-output kinds map to /workflows/generated, raw kinds map to /records.
+const SYNTHESIZED_KINDS = new Set(["sop", "skill", "trajectory", "memory", "workflow"]);
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Team tools only surface when an enterprise token was discovered at boot.
@@ -1308,7 +1339,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "export-video": {
         const startTime = normalizeTime(args.start_time as string);
         const endTime = normalizeTime(args.end_time as string);
-        const fps = (args.fps as number) || 1.0;
 
         if (!startTime || !endTime) {
           return {
@@ -1316,127 +1346,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Get frame IDs for the time range
-        const searchParams = new URLSearchParams({
-          content_type: "ocr",
-          start_time: startTime,
-          end_time: endTime,
-          limit: "10000",
-        });
-
-        const searchResponse = await callAPI(`/search?${searchParams.toString()}`);
-        const searchData = await searchResponse.json();
-        const results = searchData.data || [];
-
-        if (results.length === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `No screen recordings found between ${startTime} and ${endTime}.`,
-              },
-            ],
-          };
-        }
-
-        const frameIds: number[] = [];
-        const seenIds = new Set<number>();
-        for (const result of results) {
-          if (result.type === "OCR" && result.content?.frame_id) {
-            const frameId = result.content.frame_id;
-            if (!seenIds.has(frameId)) {
-              seenIds.add(frameId);
-              frameIds.push(frameId);
-            }
+        // A real-time MP4 with synced microphone audio, rendered server-side by the
+        // engine export core (the `screenpipe export` CLI's HTTP twin). MCP runs on the
+        // same host as the backend, so the returned path is a local file. Frames sit at
+        // their real timestamps, so the clip duration matches the wall-clock span.
+        try {
+          const body: Record<string, unknown> = { start: startTime, end: endTime };
+          if (typeof args.output_path === "string" && args.output_path.trim()) {
+            body.output_path = args.output_path;
           }
-        }
-
-        if (frameIds.length === 0) {
-          return {
-            content: [{ type: "text", text: "No valid frame IDs found (audio-only?)." }],
+          const response = await callAPI("/export", {
+            method: "POST",
+            body: JSON.stringify(body),
+          });
+          const data = (await response.json()) as {
+            output_path: string;
+            frame_count: number;
+            audio_chunk_count: number;
+            duration_secs: number;
+            file_size_bytes: number;
           };
-        }
-
-        frameIds.sort((a, b) => a - b);
-
-        const wsUrl = `ws://localhost:${port}/frames/export?fps=${fps}`;
-
-        const exportResult = await new Promise<{
-          success: boolean;
-          filePath?: string;
-          error?: string;
-          frameCount?: number;
-        }>((resolve) => {
-          const ws = new WebSocket(wsUrl);
-          let resolved = false;
-
-          const timeout = setTimeout(() => {
-            if (!resolved) {
-              resolved = true;
-              ws.close();
-              resolve({ success: false, error: "Export timed out after 5 minutes" });
-            }
-          }, 5 * 60 * 1000);
-
-          ws.on("open", () => {
-            ws.send(JSON.stringify({ frame_ids: frameIds }));
-          });
-
-          ws.on("error", (error) => {
-            if (!resolved) {
-              resolved = true;
-              clearTimeout(timeout);
-              resolve({ success: false, error: `WebSocket error: ${error.message}` });
-            }
-          });
-
-          ws.on("close", () => {
-            if (!resolved) {
-              resolved = true;
-              clearTimeout(timeout);
-              resolve({ success: false, error: "Connection closed unexpectedly" });
-            }
-          });
-
-          ws.on("message", (data) => {
-            try {
-              const message = JSON.parse(data.toString());
-              if (message.status === "completed" && message.video_data) {
-                const tempDir = os.tmpdir();
-                const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-                const filename = `screenpipe_export_${timestamp}.mp4`;
-                const filePath = path.join(tempDir, filename);
-                fs.writeFileSync(filePath, Buffer.from(message.video_data));
-                resolved = true;
-                clearTimeout(timeout);
-                ws.close();
-                resolve({ success: true, filePath, frameCount: frameIds.length });
-              } else if (message.status === "error") {
-                resolved = true;
-                clearTimeout(timeout);
-                ws.close();
-                resolve({ success: false, error: message.error || "Export failed" });
-              }
-            } catch {
-              // Ignore parse errors for progress messages
-            }
-          });
-        });
-
-        if (exportResult.success && exportResult.filePath) {
+          const sizeMb = data.file_size_bytes
+            ? (data.file_size_bytes / (1024 * 1024)).toFixed(1)
+            : null;
           return {
             content: [
               {
                 type: "text",
                 text:
-                  `Video exported: ${exportResult.filePath}\n` +
-                  `Frames: ${exportResult.frameCount} | ${startTime} → ${endTime} | ${fps} fps`,
+                  `Video exported (with audio): ${data.output_path}\n` +
+                  `${data.frame_count ?? 0} frames | ${data.audio_chunk_count ?? 0} audio chunks` +
+                  (sizeMb ? ` | ${sizeMb} MB` : "") +
+                  (data.duration_secs ? ` | ${data.duration_secs}s` : "") +
+                  ` | ${startTime} → ${endTime}`,
               },
             ],
           };
-        } else {
+        } catch (err) {
           return {
-            content: [{ type: "text", text: `Export failed: ${exportResult.error}` }],
+            content: [
+              {
+                type: "text",
+                text: `Export failed: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
           };
         }
       }
@@ -1695,7 +1648,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
         const response = await callAPI(`/meetings/${meetingId}`, {
-          method: "PATCH",
+          method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
@@ -1820,10 +1773,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ],
           };
         }
-        // Map MCP tool name → /api/enterprise/v1 path
+        // Map MCP tool name → /api/enterprise/v1 path. team-records also
+        // routes synthesized pipe outputs (kind=sop|skill|...) to the
+        // workflows endpoint so callers see one tool surface for "give me
+        // the org's data."
+        const kindArg = typeof args.kind === "string" ? args.kind : "";
         const subpath =
           name === "team-search" ? "/search"
           : name === "team-devices" ? "/devices"
+          : name === "team-records" && SYNTHESIZED_KINDS.has(kindArg) ? "/workflows/generated"
           : "/records";
         // Forward every primitive arg as a query param. The server validates;
         // unknown params are ignored, so we don't need to gatekeep here.

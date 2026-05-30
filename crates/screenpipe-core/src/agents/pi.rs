@@ -20,6 +20,51 @@ const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.75.4";
 const PI_NAMESPACE_DIR: &str = "@earendil-works";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 
+/// Bounded retries for provider rate limiting (HTTP 429) in streaming runs.
+const MAX_RATE_LIMIT_RETRIES: usize = 3;
+/// Fallback wait when the 429 payload carries no `reset_in` hint.
+const RATE_LIMIT_DEFAULT_WAIT_SECS: u64 = 10;
+/// Cap so an oversized `reset_in` can't stall a pipe run indefinitely.
+const RATE_LIMIT_MAX_WAIT_SECS: u64 = 60;
+
+/// Parse the rate-limit retry hint (in seconds) from a pi error payload.
+///
+/// The cloud gateway returns a 429 body containing `"reset_in":<secs>` plus a
+/// human-readable "Please wait N seconds". We prefer the structured `reset_in`
+/// field and fall back to the prose. Returns `None` when no hint is present.
+fn parse_rate_limit_reset_secs(text: &str) -> Option<u64> {
+    // Prefer the structured "reset_in" field.
+    if let Some(idx) = text.find("\"reset_in\"") {
+        let rest = &text[idx + "\"reset_in\"".len()..];
+        let rest = rest.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(secs) = digits.parse::<u64>() {
+            return Some(secs);
+        }
+    }
+    // Fall back to the human-readable "wait N seconds".
+    let lower = text.to_lowercase();
+    if let Some(idx) = lower.find("wait ") {
+        let rest = &lower[idx + "wait ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(secs) = digits.parse::<u64>() {
+            return Some(secs);
+        }
+    }
+    None
+}
+
+/// Whether a pi failure was caused by provider rate limiting (HTTP 429).
+fn is_rate_limit_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("requests per minute")
+        || lower.contains("too many requests")
+        || lower.contains("\"reset_in\"")
+}
+
 /// Fetch the model catalog from the Cloudflare Worker gateway and convert
 /// it into the format Pi's `models.json` expects.
 ///
@@ -1268,7 +1313,7 @@ impl AgentExecutor for PiExecutor {
             resolved_provider, resolved_model
         );
 
-        let output = self
+        let mut output = self
             .spawn_pi_streaming(
                 &pi_path,
                 prompt,
@@ -1300,7 +1345,7 @@ impl AgentExecutor for PiExecutor {
                 provider_url,
             )
             .await?;
-            return self
+            output = self
                 .spawn_pi_streaming(
                     &pi_path,
                     prompt,
@@ -1309,11 +1354,58 @@ impl AgentExecutor for PiExecutor {
                     &resolved_provider,
                     provider_api_key,
                     None,
-                    line_tx,
+                    line_tx.clone(),
                     continue_session,
                     pipe_system_prompt,
                 )
-                .await;
+                .await?;
+        }
+
+        // Retry on provider rate limiting (HTTP 429). The cloud gateway caps
+        // requests per minute; concurrent scheduler pressure or a single busy
+        // run can trip it. pi exits 0 but surfaces the 429 as an assistant
+        // error, so `output.success` is false with the payload (including
+        // "reset_in") in stderr. Honor that hint, wait, and re-run instead of
+        // failing the whole pipe — which previously left automations silently
+        // doing nothing. (Runs that legitimately exceed the per-minute budget
+        // also need scheduler pacing, but a wait-and-retry still beats a hard
+        // stop.)
+        let mut rate_limit_retries = 0usize;
+        while !output.success
+            && rate_limit_retries < MAX_RATE_LIMIT_RETRIES
+            && is_rate_limit_error(&output.stderr)
+        {
+            rate_limit_retries += 1;
+            let wait_secs = parse_rate_limit_reset_secs(&output.stderr)
+                .unwrap_or(RATE_LIMIT_DEFAULT_WAIT_SECS)
+                .clamp(1, RATE_LIMIT_MAX_WAIT_SECS);
+            warn!(
+                "pi rate limited (attempt {}/{}), waiting {}s before retry (stderr: {})",
+                rate_limit_retries,
+                MAX_RATE_LIMIT_RETRIES,
+                wait_secs,
+                output.stderr.trim()
+            );
+            // Surface the wait to any UI/log consumer draining line_tx.
+            let _ = line_tx.send(format!(
+                r#"{{"type":"status","kind":"rate_limit_retry","wait_secs":{},"attempt":{},"max_attempts":{}}}"#,
+                wait_secs, rate_limit_retries, MAX_RATE_LIMIT_RETRIES
+            ));
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+            output = self
+                .spawn_pi_streaming(
+                    &pi_path,
+                    prompt,
+                    &resolved_model,
+                    working_dir,
+                    &resolved_provider,
+                    provider_api_key,
+                    None,
+                    line_tx.clone(),
+                    continue_session,
+                    pipe_system_prompt,
+                )
+                .await?;
         }
 
         Ok(output)
@@ -1476,39 +1568,60 @@ fn seed_pi_package_json(install_dir: &Path) {
         }
     });
     if pkg_path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(&pkg_path) {
-            if let Ok(mut pkg) = serde_json::from_str::<serde_json::Value>(&contents) {
-                let mut changed = false;
-                if let Some(obj) = pkg.as_object_mut() {
-                    if obj.get("overrides") != Some(&expected_overrides) {
-                        obj.insert("overrides".to_string(), expected_overrides.clone());
-                        changed = true;
-                    }
-                    if let Some(deps_obj) =
-                        obj.get_mut("dependencies").and_then(|d| d.as_object_mut())
-                    {
-                        let legacy: Vec<String> = deps_obj
-                            .keys()
-                            .filter(|k| k.starts_with("@mariozechner/"))
-                            .cloned()
-                            .collect();
-                        for k in &legacy {
-                            deps_obj.remove(k);
-                            changed = true;
-                        }
-                    }
+        let read_result = std::fs::read_to_string(&pkg_path);
+        let parse_result = read_result
+            .as_ref()
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
+        // Detect corruption: a partial bun-install write can leave NUL bytes
+        // in package.json (SCREENPIPE-APP-AR — bun then errors at SyntaxError).
+        // Read failures and parse failures land here too. Wipe and re-seed
+        // rather than silently exiting and letting the next `bun install`
+        // re-fail on the same garbled file.
+        let corrupted = parse_result.is_none()
+            || read_result
+                .as_ref()
+                .map(|c| c.contains('\0'))
+                .unwrap_or(true);
+        if corrupted {
+            warn!(
+                "pi-agent package.json at {} is unreadable or corrupted — re-seeding",
+                pkg_path.display()
+            );
+            let _ = std::fs::remove_file(&pkg_path);
+            let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+            let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
+            // Fall through to the fresh-seed path below.
+        } else if let Some(mut pkg) = parse_result {
+            let mut changed = false;
+            if let Some(obj) = pkg.as_object_mut() {
+                if obj.get("overrides") != Some(&expected_overrides) {
+                    obj.insert("overrides".to_string(), expected_overrides.clone());
+                    changed = true;
                 }
-                if changed {
-                    if let Ok(new_contents) = serde_json::to_string_pretty(&pkg) {
-                        let _ = std::fs::write(&pkg_path, new_contents);
-                        let _ = std::fs::remove_file(install_dir.join("bun.lock"));
-                        let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
-                        info!("Patched pi-agent package.json (overrides + legacy dep cleanup)");
+                if let Some(deps_obj) = obj.get_mut("dependencies").and_then(|d| d.as_object_mut())
+                {
+                    let legacy: Vec<String> = deps_obj
+                        .keys()
+                        .filter(|k| k.starts_with("@mariozechner/"))
+                        .cloned()
+                        .collect();
+                    for k in &legacy {
+                        deps_obj.remove(k);
+                        changed = true;
                     }
                 }
             }
+            if changed {
+                if let Ok(new_contents) = serde_json::to_string_pretty(&pkg) {
+                    let _ = std::fs::write(&pkg_path, new_contents);
+                    let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+                    let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
+                    info!("Patched pi-agent package.json (overrides + legacy dep cleanup)");
+                }
+            }
+            return;
         }
-        return;
     }
     let pkg_json = json!({
         "overrides": {
@@ -2146,6 +2259,38 @@ mod tests {
         assert_eq!(lines[1], "OK");
     }
 
+    #[test]
+    fn test_parse_rate_limit_reset_secs() {
+        // Real gateway 429 payload: prefer the structured "reset_in" field.
+        let payload = r#"{"error":"You've exceeded 25 requests per minute. Please wait 12 seconds before retrying.","tier":"logged_in","reset_in":12}"#;
+        assert_eq!(parse_rate_limit_reset_secs(payload), Some(12));
+
+        // As surfaced through pi (prefixed "LLM error:") with whitespace
+        // around the colon.
+        let wrapped = r#"LLM error: {"reset_in" : 9, "tier":"logged_in"}"#;
+        assert_eq!(parse_rate_limit_reset_secs(wrapped), Some(9));
+
+        // No structured field — fall back to the prose hint.
+        assert_eq!(
+            parse_rate_limit_reset_secs("rate limited, please wait 8 seconds"),
+            Some(8)
+        );
+
+        // Unrelated error carries no hint.
+        assert_eq!(parse_rate_limit_reset_secs("model not found"), None);
+    }
+
+    #[test]
+    fn test_is_rate_limit_error() {
+        assert!(is_rate_limit_error("HTTP 429 Too Many Requests"));
+        assert!(is_rate_limit_error(
+            "You've exceeded 25 requests per minute"
+        ));
+        assert!(is_rate_limit_error(r#"{"reset_in":12}"#));
+        assert!(!is_rate_limit_error("model not found"));
+        assert!(!is_rate_limit_error("credits_exhausted"));
+    }
+
     #[tokio::test]
     async fn test_ensure_pi_config_adds_ollama_provider() {
         // Call ensure_pi_config with ollama provider info
@@ -2235,5 +2380,43 @@ mod tests {
         exec_b.set_user_token(None);
         assert_eq!(exec_a.current_user_token(), None);
         assert_eq!(exec_b.current_user_token(), None);
+    }
+
+    /// Regression guard for SCREENPIPE-APP-AR: a corrupted package.json
+    /// (NUL bytes from a partial bun-install write) used to silently exit
+    /// `seed_pi_package_json` and leave bun looping on the same broken file.
+    #[test]
+    fn seed_pi_package_json_recovers_from_nul_byte_corruption() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pkg_path = dir.path().join("package.json");
+        let lock_path = dir.path().join("bun.lock");
+
+        // Simulate the observed corruption: garbled package name + NUL padding
+        // (matches the actual bytes from `Pi background install failed`).
+        std::fs::write(
+            &pkg_path,
+            b"{\n  \"dependencies\": {\n    \"@mariozech\0\0\0\0\0\0\0\0\0\0\0\0",
+        )
+        .expect("write corrupt pkg");
+        std::fs::write(&lock_path, b"stale-lock").expect("write stale lock");
+
+        seed_pi_package_json(dir.path());
+
+        let contents = std::fs::read_to_string(&pkg_path).expect("re-seeded pkg readable");
+        assert!(
+            !contents.contains('\0'),
+            "re-seeded package.json must not contain NUL bytes; got: {:?}",
+            contents
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&contents).expect("re-seeded pkg must parse");
+        assert!(
+            parsed.get("overrides").is_some(),
+            "re-seeded pkg must include the lru-cache overrides"
+        );
+        assert!(
+            !lock_path.exists(),
+            "stale bun.lock must be cleared so bun re-resolves from the fresh manifest"
+        );
     }
 }

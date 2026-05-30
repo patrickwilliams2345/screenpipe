@@ -2,7 +2,7 @@
 
 [package]
 name = "screenpipe-app"
-version = "2.4.287"
+version = "2.4.298"
 description = "24/7 memory for your desktop. 100% local."
 authors = ["you"]
 license = ""
@@ -15,6 +15,7 @@ rust-version = "1.92"
 
 [build-dependencies]
 tauri-build = { version = "=2.5.4", features = [] }
+tauri-helper = { git = "https://github.com/divanshu-go/tauri-helper", rev = "17f463d" }
 # Used by build.rs on Windows MSVC targets (incl. cross-compiles from
 # Linux/macOS CI runners) to compile c/bswap_shim.c — provides
 # __builtin_bswap{16,32,64} as real functions to satisfy the aws-lc-sys
@@ -23,6 +24,7 @@ tauri-build = { version = "=2.5.4", features = [] }
 cc = "1"
 
 [dependencies]
+tauri-helper = { git = "https://github.com/divanshu-go/tauri-helper", rev = "17f463d" }
 tauri = { version = "=2.10.1", features = [
   "protocol-asset",
   "macos-private-api",
@@ -50,6 +52,7 @@ tauri-plugin-http = "=2.5.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
+plist = "1"
 arc-swap = "1"
 
 tower-http = { version = "0.4.0", features = ["cors", "trace"] }
@@ -291,6 +294,7 @@ jemalloc = ["tikv-jemallocator"]
 # enterprise-build feature is on).
 tempfile = "3"
 wiremock = "0.6"
+serial_test = "3"
 
 
 [package.metadata.cargo-machete]

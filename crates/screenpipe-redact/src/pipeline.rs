@@ -106,12 +106,25 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// Pipeline with regex only. Most useful for tests and as the
-    /// "off" state when the user disables AI redaction.
+    /// "off" state when the user disables AI redaction. Uses the
+    /// default (secrets-only) policy.
     pub fn regex_only() -> Self {
+        Self::regex_only_with_policy(TextRedactionPolicy::default())
+    }
+
+    /// Regex-only pipeline with an explicit policy. Used as the local
+    /// fallback when neither AI adapter loads but the user still
+    /// selected classes the deterministic regex pass can catch
+    /// (emails, phones, cards, connection strings, …) — without this
+    /// those would silently stop being redacted.
+    pub fn regex_only_with_policy(policy: TextRedactionPolicy) -> Self {
         Self {
             regex: RegexRedactor::new(),
             ai: None,
-            cfg: PipelineConfig::default(),
+            cfg: PipelineConfig {
+                policy,
+                ..Default::default()
+            },
             cache: RedactionCache::with_defaults(),
         }
     }
@@ -176,16 +189,29 @@ impl Redactor for Pipeline {
                 let ai = self.ai.as_ref().expect("checked above");
                 match ai.redact(&current.redacted).await {
                     Ok(ai_out) => {
-                        // Filter AI output to the same policy + re-render
-                        // its `redacted` from its `input` (= the
-                        // regex-redacted text). Now the AI's redacted
-                        // string carries only allowed-class
-                        // placeholders, alongside the regex pass's
-                        // already-allowed placeholders.
-                        let ai_filtered = apply_policy(ai_out, &self.cfg.policy);
+                        let redacted = if ai_out.spans.is_empty() {
+                            // Span-less adapter (the Tinfoil enclave
+                            // returns redacted text only, no spans). It
+                            // already applied the label policy we sent
+                            // it server-side, so trust its output
+                            // verbatim. Running apply_policy here would
+                            // be wrong — it rebuilds `redacted` from
+                            // spans, of which there are none, and would
+                            // therefore throw the enclave's redaction
+                            // away and hand back the text we sent.
+                            ai_out.redacted
+                        } else {
+                            // Span-aware adapter (regex / local ONNX):
+                            // filter to the allow-list client-side + re-
+                            // render from `input` (= the regex-redacted
+                            // text). Now the AI's redacted string carries
+                            // only allowed-class placeholders, alongside
+                            // the regex pass's already-allowed ones.
+                            apply_policy(ai_out, &self.cfg.policy).redacted
+                        };
                         current = RedactionOutput {
                             input: current.input,
-                            redacted: ai_filtered.redacted,
+                            redacted,
                             spans: current.spans,
                         };
                     }
@@ -295,6 +321,24 @@ mod tests {
         // AI must have been invoked for an input that has no obvious
         // regex match but is long enough to clear `ai_min_chars`.
         assert_eq!(ai.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn span_less_ai_output_is_trusted() {
+        // A span-less adapter (like the Tinfoil enclave, which returns
+        // redacted text and no spans) must have its output used
+        // verbatim — it applied the policy server-side. UppercaseAi
+        // stands in for it: its `redacted` is the uppercased input with
+        // an empty span list. Regression guard for the bug where
+        // apply_policy rebuilt from the (empty) spans and silently
+        // discarded the enclave's redaction.
+        let ai = Arc::new(UppercaseAi::new());
+        let p = Pipeline::regex_then_ai(ai, PipelineConfig::default());
+        let out = p
+            .redact("hello world this is a long enough sentence")
+            .await
+            .unwrap();
+        assert_eq!(out.redacted, "HELLO WORLD THIS IS A LONG ENOUGH SENTENCE");
     }
 
     #[tokio::test]

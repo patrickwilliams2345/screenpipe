@@ -44,9 +44,14 @@ vi.mock("@tauri-apps/plugin-fs", () => ({
 
 import {
   CHAT_HISTORY_INITIAL_LIMIT,
+  CONVERSATION_DEDUP_WINDOW_MS,
   __resetChatStorageCachesForTests,
+  conversationDedupKey,
+  dedupeConversationMetas,
   listConversations,
   searchConversations,
+  type ConversationDedupCandidate,
+  type ConversationMeta,
 } from "../chat-storage";
 
 const CHATS_DIR = "/Users/test/.screenpipe/chats";
@@ -59,20 +64,34 @@ function putConversation(
     title?: string;
     hidden?: boolean;
     kind?: "chat" | "pipe-watch" | "pipe-run";
+    createdAt?: number;
+    titleSource?: "fallback" | "ai" | "user";
+    /** When set, append an assistant message with this content. */
+    assistantContent?: string;
   }
 ) {
+  const messages: Array<Record<string, unknown>> = [
+    {
+      id: `${id}-m1`,
+      role: "user",
+      content: opts.content ?? id,
+      timestamp: opts.updatedAt,
+    },
+  ];
+  if (opts.assistantContent !== undefined) {
+    messages.push({
+      id: `${id}-m2`,
+      role: "assistant",
+      content: opts.assistantContent,
+      timestamp: opts.updatedAt,
+    });
+  }
   const conv = {
     id,
     title: opts.title ?? id,
-    messages: [
-      {
-        id: `${id}-m1`,
-        role: "user",
-        content: opts.content ?? id,
-        timestamp: opts.updatedAt,
-      },
-    ],
-    createdAt: opts.updatedAt,
+    titleSource: opts.titleSource,
+    messages,
+    createdAt: opts.createdAt ?? opts.updatedAt,
     updatedAt: opts.updatedAt,
     hidden: opts.hidden,
     kind: opts.kind,
@@ -159,5 +178,200 @@ describe("chat-storage bounded history", () => {
     });
 
     expect(rows.map((row) => row.id)).toEqual(["visible-old"]);
+  });
+});
+
+function meta(
+  id: string,
+  over: Partial<ConversationMeta> = {}
+): ConversationMeta {
+  return {
+    id,
+    title: id,
+    createdAt: 1000,
+    updatedAt: 1000,
+    messageCount: 2,
+    pinned: false,
+    hidden: false,
+    kind: "chat",
+    ...over,
+  };
+}
+
+function candidate(
+  id: string,
+  key: string | null,
+  hasCompletedReply: boolean,
+  over: Partial<ConversationMeta> = {}
+): ConversationDedupCandidate {
+  return { meta: meta(id, over), key, hasCompletedReply };
+}
+
+describe("dedupeConversationMetas", () => {
+  it("collapses two copies of the same chat, keeping the one with a real reply", () => {
+    const out = dedupeConversationMetas([
+      candidate("ghost", "export last 5 min of video", false, { createdAt: 1000 }),
+      candidate("real", "export last 5 min of video", true, { createdAt: 1200 }),
+    ]);
+    // One row survives, and it is the canonical (completed-reply) copy even
+    // though the ghost was seen first.
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("real");
+  });
+
+  it("keeps the higher message count when both copies have a reply", () => {
+    const out = dedupeConversationMetas([
+      candidate("short", "hi there", true, { createdAt: 1000, messageCount: 4 }),
+      candidate("long", "hi there", true, { createdAt: 1100, messageCount: 10 }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("long");
+  });
+
+  it("breaks ties on updatedAt when reply state and message count match", () => {
+    const out = dedupeConversationMetas([
+      candidate("older", "same opener", true, { createdAt: 1000, updatedAt: 1000 }),
+      candidate("newer", "same opener", true, { createdAt: 1100, updatedAt: 5000 }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe("newer");
+  });
+
+  it("does NOT merge chats with the same opener created far apart", () => {
+    const out = dedupeConversationMetas([
+      candidate("a", "search this meeting", true, { createdAt: 1000 }),
+      candidate("b", "search this meeting", true, {
+        createdAt: 1000 + CONVERSATION_DEDUP_WINDOW_MS + 1,
+      }),
+    ]);
+    expect(out.map((m) => m.id)).toEqual(["a", "b"]);
+  });
+
+  it("never merges rows with a null key (pipe runs, empty chats)", () => {
+    const out = dedupeConversationMetas([
+      candidate("pipe-1", null, true, { createdAt: 1000 }),
+      candidate("pipe-2", null, true, { createdAt: 1001 }),
+    ]);
+    expect(out.map((m) => m.id)).toEqual(["pipe-1", "pipe-2"]);
+  });
+
+  it("does not merge when either createdAt is missing", () => {
+    const out = dedupeConversationMetas([
+      candidate("legacy-a", "opener", true, { createdAt: 0 }),
+      candidate("legacy-b", "opener", true, { createdAt: 0 }),
+    ]);
+    expect(out.map((m) => m.id)).toEqual(["legacy-a", "legacy-b"]);
+  });
+
+  it("leaves distinct conversations untouched", () => {
+    const out = dedupeConversationMetas([
+      candidate("a", "first", true, { createdAt: 1000 }),
+      candidate("b", "second", true, { createdAt: 1100 }),
+      candidate("c", "third", true, { createdAt: 1200 }),
+    ]);
+    expect(out.map((m) => m.id)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("conversationDedupKey", () => {
+  it("normalizes whitespace and case of the first user message", () => {
+    expect(
+      conversationDedupKey({
+        kind: "chat",
+        messages: [{ role: "user", content: "  Export  Last 5 Min\nOf Video " }],
+      })
+    ).toBe("export last 5 min of video");
+  });
+
+  it("returns null for pipe conversations (repeated runs share a prompt)", () => {
+    expect(
+      conversationDedupKey({
+        kind: "pipe-run",
+        messages: [{ role: "user", content: "time range: ... daily report" }],
+      })
+    ).toBeNull();
+  });
+
+  it("returns null when there is no user message", () => {
+    expect(
+      conversationDedupKey({ kind: "chat", messages: [{ role: "assistant", content: "hi" }] })
+    ).toBeNull();
+  });
+});
+
+describe("listConversations duplicate collapsing", () => {
+  beforeEach(() => {
+    fsMock.files.clear();
+    fsMock.reads.length = 0;
+    fsMock.stats.length = 0;
+    __resetChatStorageCachesForTests();
+  });
+
+  it("collapses a duplicated chat into the copy that has a real reply", async () => {
+    // The AI-titled survivor (real reply) created first…
+    putConversation("real", {
+      updatedAt: 1_700_000_100_000,
+      createdAt: 1_700_000_000_000,
+      content: "Can you export the last five minutes of my data?",
+      title: "Export Last 5 Minutes of Data",
+      titleSource: "ai",
+      assistantContent: "I've exported the last five minutes of your screen activity.",
+    });
+    // …and the ghost twin, same opener, created seconds later, stuck on the
+    // placeholder (and carrying a spurious user-rank title — must NOT win).
+    putConversation("ghost", {
+      updatedAt: 1_700_000_050_000,
+      createdAt: 1_700_000_002_000,
+      content: "Can you export the last five minutes of my data?",
+      title: "Can you export the last five minutes of my data?",
+      titleSource: "user",
+      assistantContent: "Processing...",
+    });
+
+    const rows = await listConversations({ limit: CHAT_HISTORY_INITIAL_LIMIT });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe("real");
+    expect(rows[0].title).toBe("Export Last 5 Minutes of Data");
+  });
+
+  it("does not collapse distinct pipe runs that share a templated prompt", async () => {
+    putConversation("pipe_imessage-sync_1", {
+      updatedAt: 1_700_000_100_000,
+      createdAt: 1_700_000_100_000,
+      content: "time range: ... summarize messages",
+      kind: "pipe-run",
+      assistantContent: "done",
+    });
+    putConversation("pipe_imessage-sync_2", {
+      updatedAt: 1_700_000_200_000,
+      createdAt: 1_700_000_200_000,
+      content: "time range: ... summarize messages",
+      kind: "pipe-run",
+      assistantContent: "done",
+    });
+
+    const rows = await listConversations({ limit: CHAT_HISTORY_INITIAL_LIMIT });
+    expect(rows.map((r) => r.id).sort()).toEqual([
+      "pipe_imessage-sync_1",
+      "pipe_imessage-sync_2",
+    ]);
+  });
+
+  it("keeps same-opener chats that are far apart in time", async () => {
+    putConversation("morning", {
+      updatedAt: 1_700_000_000_000,
+      createdAt: 1_700_000_000_000,
+      content: "search screenpipe for what happened during this meeting",
+      assistantContent: "here is what I found",
+    });
+    putConversation("evening", {
+      updatedAt: 1_700_006_400_000,
+      createdAt: 1_700_006_400_000, // ~1.7h later, well past the dedup window
+      content: "search screenpipe for what happened during this meeting",
+      assistantContent: "here is what I found",
+    });
+
+    const rows = await listConversations({ limit: CHAT_HISTORY_INITIAL_LIMIT });
+    expect(rows.map((r) => r.id).sort()).toEqual(["evening", "morning"]);
   });
 });

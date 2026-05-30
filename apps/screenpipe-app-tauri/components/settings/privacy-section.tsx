@@ -462,6 +462,43 @@ export function PrivacySection() {
     handleSettingsChange({ piiBackend: next } as any, true);
   };
 
+  // Which PII classes the AI workers actually remove. Secret is the
+  // always-on baseline (the backend forces it in too — see
+  // screenpipe_redact::parse_allow_list); the rest are opt-in. Stored
+  // as canonical snake_case SpanLabel names in `piiRedactionLabels`.
+  // The model detects every class, but only the selected ones get
+  // redacted — everything else stays as searchable timeline value.
+  const PII_FIELD_OPTIONS: {
+    value: string;
+    label: string;
+    desc: string;
+    always?: boolean;
+  }[] = [
+    { value: "secret", label: "Secrets", desc: "passwords, API keys, tokens", always: true },
+    { value: "person", label: "Names", desc: "people's names" },
+    { value: "email", label: "Emails", desc: "email addresses" },
+    { value: "phone", label: "Phone numbers", desc: "phone numbers" },
+    { value: "address", label: "Addresses", desc: "postal addresses" },
+    { value: "sensitive", label: "Sensitive info", desc: "health, financial, identity context" },
+  ];
+
+  const piiRedactionLabels = useMemo<string[]>(() => {
+    const raw = (settings.piiRedactionLabels as string[] | undefined) ?? ["secret"];
+    // Secret is always implied, regardless of what's persisted.
+    return raw.includes("secret") ? raw : ["secret", ...raw];
+  }, [settings.piiRedactionLabels]);
+
+  const handlePiiLabelToggle = (value: string, checked: boolean) => {
+    if (value === "secret") return; // always-on baseline; can't be unchecked
+    const next = new Set(piiRedactionLabels);
+    if (checked) next.add(value);
+    else next.delete(value);
+    next.add("secret"); // never drop the baseline
+    // Persist in the canonical option order so diffs stay stable.
+    const ordered = PII_FIELD_OPTIONS.map((o) => o.value).filter((v) => next.has(v));
+    handleSettingsChange({ piiRedactionLabels: ordered } as Partial<Settings>, true);
+  };
+
   const handleIncognitoToggle = (checked: boolean) => {
     handleSettingsChange({ ignoreIncognitoWindows: checked }, true);
   };
@@ -1070,6 +1107,50 @@ export function PrivacySection() {
                     </span>
                   </span>
                 </label>
+
+                <p className="text-xs font-medium text-foreground pt-2">
+                  Fields to redact
+                </p>
+                {PII_FIELD_OPTIONS.map((opt) => {
+                  const checked =
+                    opt.always || piiRedactionLabels.includes(opt.value);
+                  return (
+                    <label
+                      key={opt.value}
+                      className={cn(
+                        "flex items-start gap-2 text-xs",
+                        opt.always ? "cursor-default" : "cursor-pointer",
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        className="mt-0.5"
+                        checked={checked}
+                        disabled={opt.always}
+                        onChange={(e) =>
+                          handlePiiLabelToggle(opt.value, e.target.checked)
+                        }
+                      />
+                      <span>
+                        <span className="font-medium text-foreground">
+                          {opt.label}
+                        </span>
+                        {opt.always && (
+                          <span className="text-muted-foreground">
+                            {" "}(always on)
+                          </span>
+                        )}
+                        <span className="text-muted-foreground">
+                          {" "}— {opt.desc}
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })}
+                <p className="text-[11px] text-muted-foreground pt-0.5">
+                  Unselected types stay visible so your timeline remains
+                  searchable. Secrets are always removed.
+                </p>
               </div>
             )}
           </CardContent>

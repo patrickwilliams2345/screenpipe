@@ -198,6 +198,30 @@ pub struct RecordingSettings {
     #[serde(rename = "minCaptureIntervalMs", default)]
     pub min_capture_interval_ms: Option<u64>,
 
+    /// Default behavior when a meeting is detected.
+    /// `"ask"` (default) surfaces a "+ HD" action on the existing meeting
+    /// notification; `"always"` auto-starts a meeting-bound HD session
+    /// every time; `"never"` is opt-out — only the manual tray timer
+    /// can start a session.
+    ///
+    /// Runtime-mutable via `POST /capture/hd/settings`; this field
+    /// just seeds the controller on startup.
+    #[serde(
+        rename = "hdRecordingDefault",
+        default = "default_hd_recording_default"
+    )]
+    pub hd_recording_default: String,
+
+    /// Capture debounce (ms) installed while an HD session is active.
+    /// Default 100 ms ≈ 10 fps — smooth enough for human replay without
+    /// exploding disk usage. Clamped to >= 33 ms (30 fps ceiling) by the
+    /// controller.
+    #[serde(
+        rename = "hdRecordingIntervalMs",
+        default = "default_hd_recording_interval_ms"
+    )]
+    pub hd_recording_interval_ms: u64,
+
     /// Override `EventDrivenCaptureConfig::capture_on_keystroke`.
     /// None = engine default (false). When true, non-printable key events
     /// (Arrow / Enter / Tab / Esc, modifier combos like Ctrl+S) fire a paired
@@ -337,6 +361,22 @@ pub struct RecordingSettings {
     /// Tinfoil operator. Tracked separately; structured for swap-in.
     #[serde(rename = "piiBackend", default = "default_pii_backend")]
     pub pii_backend: String,
+
+    /// Which PII classes the AI redaction workers actually rewrite
+    /// when `asyncPiiRedaction` / `asyncImagePiiRedaction` are on.
+    /// Canonical snake_case `SpanLabel` names (e.g.
+    /// `["secret", "email", "person"]`). The models detect every
+    /// class but only these are removed — the rest is *value* (a
+    /// searchable timeline). Defaults to `["secret"]`, the safety
+    /// baseline; `secret` is always treated as included regardless of
+    /// what's stored (see screenpipe-redact `parse_allow_list`). The
+    /// Settings UI surfaces a curated subset (Names, Emails, Phones,
+    /// Addresses, Sensitive) as opt-in checkboxes.
+    #[serde(
+        rename = "piiRedactionLabels",
+        default = "default_pii_redaction_labels"
+    )]
+    pub pii_redaction_labels: Vec<String>,
 
     // ── Cloud / Auth ───────────────────────────────────────────────────
     /// Screenpipe cloud user ID. Empty string means not logged in.
@@ -497,6 +537,8 @@ impl Default for RecordingSettings {
             visual_check_interval_ms: None,
             visual_change_threshold: None,
             min_capture_interval_ms: None,
+            hd_recording_default: default_hd_recording_default(),
+            hd_recording_interval_ms: default_hd_recording_interval_ms(),
             capture_on_keystroke: None,
             capture_on_clipboard: None,
             capture_scroll: None,
@@ -515,6 +557,7 @@ impl Default for RecordingSettings {
             async_pii_redaction: false,
             async_image_pii_redaction: false,
             pii_backend: default_pii_backend(),
+            pii_redaction_labels: default_pii_redaction_labels(),
             user_id: String::new(),
             user_name: None,
             openai_compatible_endpoint: None,
@@ -567,6 +610,20 @@ fn default_pause_extraction_on_input_ms() -> u64 {
 
 fn default_pii_backend() -> String {
     "local".to_string()
+}
+
+/// Default redaction allow-list: secrets only. The safety baseline —
+/// credentials are the one class where a miss is genuinely dangerous.
+fn default_pii_redaction_labels() -> Vec<String> {
+    vec!["secret".to_string()]
+}
+
+fn default_hd_recording_default() -> String {
+    "ask".to_string()
+}
+
+fn default_hd_recording_interval_ms() -> u64 {
+    100
 }
 
 #[cfg(test)]

@@ -35,6 +35,12 @@ pub struct ServerCore {
     pub power_manager: Arc<PowerManagerHandle>,
     pub pipe_manager: Arc<tokio::sync::Mutex<screenpipe_core::pipes::PipeManager>>,
     pub manual_meeting: Arc<tokio::sync::RwLock<Option<i64>>>,
+    /// Shared HD-recording controller. Lives on ServerCore (not the per-
+    /// capture `Server`, which is recreated on every recording restart) so
+    /// the tray menu and `/capture/hd` routes keep working across capture
+    /// toggles. Handed to both the HTTP server and the VisionManager so HTTP
+    /// toggles and the capture loop see the same session state.
+    pub high_fps_controller: Arc<screenpipe_engine::high_fps_controller::HighFpsController>,
     pub data_dir: PathBuf,
     pub data_path: PathBuf,
     pub port: u16,
@@ -249,10 +255,10 @@ impl ServerCore {
                         .push_audio(screenpipe_engine::hot_frame_cache::HotAudio {
                             audio_chunk_id: info.audio_chunk_id,
                             timestamp: ts,
-                            transcription: info.transcription,
-                            device_name: info.device_name,
+                            transcription: info.transcription.into(),
+                            device_name: info.device_name.into(),
                             is_input: info.is_input,
-                            audio_file_path: info.audio_file_path,
+                            audio_file_path: info.audio_file_path.into(),
                             duration_secs: info.duration_secs,
                             start_time: info.start_time,
                             end_time: info.end_time,
@@ -397,11 +403,7 @@ impl ServerCore {
                     let memory_sync = Arc::new(
                         screenpipe_engine::external_memory_sync::ExternalMemorySyncScheduler::new(),
                     );
-                    memory_sync.start(
-                        db.clone(),
-                        Some(store_arc.clone()),
-                        local_data_dir.clone(),
-                    );
+                    memory_sync.start(db.clone(), Some(store_arc.clone()), local_data_dir.clone());
                     server.external_memory_sync = Some(memory_sync);
 
                     server.secret_store = Some(store_arc);
@@ -474,7 +476,92 @@ impl ServerCore {
             warn!("failed to start pipe scheduler: {}", e);
         }
         let shared_pipe_manager = Arc::new(tokio::sync::Mutex::new(pipe_manager));
-        let server = server.with_pipe_manager(shared_pipe_manager.clone());
+
+        // --- HD-recording controller ---
+        // One Arc shared between the HTTP server (so the tray menu,
+        // /capture/hd routes, and pipes can toggle HD without an engine
+        // restart) and the VisionManager in CaptureSession (so the capture
+        // loop raises FPS on the next tick). The standalone engine bin wires
+        // this the same way; #3661 only wired the CLI, so in the app
+        // /capture/hd returned 503 "controller unavailable (vision disabled)"
+        // and the tray "Record HD for N minutes" menu silently no-opped.
+        //
+        // detector = None: the meeting detector lives on the AudioManager and
+        // is (re)created per capture session, while this controller is
+        // server-scoped. Meeting binding is driven by the meeting_started /
+        // meeting_ended events below rather than a held detector handle;
+        // explicit timer sessions (the tray "Record HD for N minutes") need
+        // no detector at all.
+        let high_fps_controller = Arc::new(
+            screenpipe_engine::high_fps_controller::HighFpsController::new(
+                None,
+                config.hd_recording_default,
+                config.hd_recording_interval_ms,
+            ),
+        );
+
+        // meeting_ended → auto-stop a meeting-bound session when the call
+        // ends. Without this the only safety net is the 4-hour hard cap.
+        {
+            let controller = high_fps_controller.clone();
+            tokio::spawn(async move {
+                use futures::StreamExt;
+                let mut sub =
+                    screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
+                while let Some(event) = sub.next().await {
+                    let meeting_id = event
+                        .data
+                        .get("meeting_id")
+                        .and_then(|v| v.as_i64())
+                        .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                    if let Some(id) = meeting_id {
+                        controller.handle_meeting_ended(id);
+                    }
+                }
+            });
+        }
+
+        // meeting_started → (1) upgrade any prewarm-pending session to a
+        // meeting binding, and (2) auto-start a meeting-bound session when the
+        // user picked "always". Ask mode is handled by the desktop shell,
+        // which adds a "+ HD" action to the meeting notification.
+        {
+            let controller = high_fps_controller.clone();
+            tokio::spawn(async move {
+                use futures::StreamExt;
+                let mut sub =
+                    screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+                while let Some(event) = sub.next().await {
+                    let meeting_id = event
+                        .data
+                        .get("meeting_id")
+                        .and_then(|v| v.as_i64())
+                        .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                    let Some(id) = meeting_id else { continue };
+
+                    controller.try_upgrade_pending_to_meeting(id);
+
+                    let snap = controller.snapshot();
+                    if !matches!(
+                        snap.default_mode,
+                        screenpipe_engine::high_fps_controller::DefaultMode::Always
+                    ) {
+                        continue;
+                    }
+                    let already_bound = matches!(
+                        snap.kind,
+                        Some(screenpipe_engine::high_fps_controller::SessionKind::Meeting { .. })
+                    );
+                    if !already_bound {
+                        controller.start_meeting_session(id);
+                    }
+                }
+            });
+        }
+
+        let server = server
+            .with_pipe_manager(shared_pipe_manager.clone())
+            .with_high_fps_controller(high_fps_controller.clone());
 
         // Install pi agent in background
         tokio::spawn(async move {
@@ -525,16 +612,21 @@ impl ServerCore {
         let backend = config.pii_backend.as_str();
         let use_tinfoil = matches!(backend, "tinfoil" | "cloud" | "enclave");
 
+        // User-selected redaction classes (the `piiRedactionLabels`
+        // setting, default ["secret"]). Local adapters return spans and
+        // we filter client-side via the text/image policies built from
+        // this list; the tinfoil adapters forward the raw list so the
+        // enclave filters server-side. `secret` is always included
+        // regardless (see screenpipe_redact::parse_allow_list).
+        let pii_labels = config.pii_redaction_labels.clone();
+
         // Cloud Clerk JWT — same token used for the cloud transcription
         // bearer (see line 96). Tinfoil's enclave is on the screenpipe
         // cloud auth boundary, so the user's signed-in token is what
         // authenticates redactor requests. Without this the worker logs
         // "no api key — requests will be un-authenticated" on every
         // restart even when the user is signed in.
-        let tinfoil_api_key = config
-            .user_id
-            .clone()
-            .filter(|s| !s.is_empty());
+        let tinfoil_api_key = config.user_id.clone().filter(|s| !s.is_empty());
 
         // One shutdown signal, shared across both worker spawn paths and
         // stored on Self for `shutdown()` to fire on app quit.
@@ -547,6 +639,7 @@ impl ServerCore {
             use screenpipe_redact::pipeline::{Pipeline, PipelineConfig};
             use screenpipe_redact::worker::{Worker, WorkerConfig, ALL_TARGET_TABLES};
             use screenpipe_redact::Redactor;
+            use screenpipe_redact::TextRedactionPolicy;
 
             // Backend selection for the text "AI" step:
             //   - "local"   → on-device candle OPF v3 (opf-rs). First
@@ -569,9 +662,16 @@ impl ServerCore {
                 );
                 let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::new(TinfoilConfig {
                     api_key: tinfoil_api_key.clone(),
+                    labels: pii_labels.clone(),
                     ..Default::default()
                 }));
-                let pipeline = Pipeline::regex_then_ai(ai, PipelineConfig::default());
+                let pipeline = Pipeline::regex_then_ai(
+                    ai,
+                    PipelineConfig {
+                        policy: TextRedactionPolicy::from_labels(&pii_labels),
+                        ..Default::default()
+                    },
+                );
                 let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
                 let cfg = WorkerConfig {
                     tables: ALL_TARGET_TABLES.to_vec(),
@@ -586,7 +686,9 @@ impl ServerCore {
                 // task once the model is ready.
                 let pool = db.pool.clone();
                 let shutdown = redact_shutdown.clone();
+                let labels = pii_labels.clone();
                 tokio::spawn(async move {
+                    let policy = TextRedactionPolicy::from_labels(&labels);
                     // Prefer v45 phase 3 ONNX (~278 MB INT8, HIPAA 90.2%,
                     // sub-10 ms p50, gets CoreML on macOS / DirectML on
                     // Windows / CPU on Linux via the redact-onnx-* CI
@@ -597,8 +699,7 @@ impl ServerCore {
                         "fetching v45 phase 3 ONNX text redactor (~278 MB INT8 on first run, \
                          cached at ~/.screenpipe/models/v45_phase3_onnx/)"
                     );
-                    let onnx_result =
-                        OnnxRedactor::load_or_download(OnnxConfig::default()).await;
+                    let onnx_result = OnnxRedactor::load_or_download(OnnxConfig::default()).await;
                     let pipeline = match onnx_result {
                         Ok(adapter) => {
                             info!(
@@ -606,7 +707,13 @@ impl ServerCore {
                                  v45_phase3_onnx)"
                             );
                             let ai: Arc<dyn Redactor> = Arc::new(adapter);
-                            Pipeline::regex_then_ai(ai, PipelineConfig::default())
+                            Pipeline::regex_then_ai(
+                                ai,
+                                PipelineConfig {
+                                    policy: policy.clone(),
+                                    ..Default::default()
+                                },
+                            )
                         }
                         Err(onnx_err) => {
                             warn!(
@@ -620,7 +727,13 @@ impl ServerCore {
                                          (backend=local, opf-rs fallback)"
                                     );
                                     let ai: Arc<dyn Redactor> = Arc::new(adapter);
-                                    Pipeline::regex_then_ai(ai, PipelineConfig::default())
+                                    Pipeline::regex_then_ai(
+                                        ai,
+                                        PipelineConfig {
+                                            policy: policy.clone(),
+                                            ..Default::default()
+                                        },
+                                    )
                                 }
                                 Err(e) => {
                                     warn!(
@@ -629,7 +742,7 @@ impl ServerCore {
                                          to 'tinfoil' in Settings → Privacy → AI PII removal \
                                          to use the cloud enclave instead."
                                     );
-                                    Pipeline::regex_only()
+                                    Pipeline::regex_only_with_policy(policy.clone())
                                 }
                             }
                         }
@@ -650,6 +763,7 @@ impl ServerCore {
                 TinfoilImageConfig, TinfoilImageRedactor,
             };
             use screenpipe_redact::image::worker::{ImageWorker, ImageWorkerConfig};
+            use screenpipe_redact::ImageRedactionPolicy;
             use screenpipe_redact::ImageRedactor;
 
             let pool = db.pool.clone();
@@ -658,26 +772,40 @@ impl ServerCore {
                     has_api_key = tinfoil_api_key.is_some(),
                     "starting async image-PII worker (backend=tinfoil)"
                 );
-                let detector =
-                    Arc::new(TinfoilImageRedactor::new(TinfoilImageConfig {
-                        api_key: tinfoil_api_key.clone(),
+                let detector = Arc::new(TinfoilImageRedactor::new(TinfoilImageConfig {
+                    api_key: tinfoil_api_key.clone(),
+                    labels: pii_labels.clone(),
+                    ..Default::default()
+                })) as Arc<dyn ImageRedactor>;
+                let _ = ImageWorker::new(
+                    pool,
+                    detector,
+                    ImageWorkerConfig {
+                        policy: ImageRedactionPolicy::from_labels(&pii_labels),
                         ..Default::default()
-                    })) as Arc<dyn ImageRedactor>;
-                let _ = ImageWorker::new(pool, detector, ImageWorkerConfig::default())
-                    .spawn_with_shutdown(redact_shutdown.clone());
+                    },
+                )
+                .spawn_with_shutdown(redact_shutdown.clone());
             } else {
                 // Local mode: rfdetr_v8 ONNX. First-run downloads
                 // ~108 MB from huggingface.co/screenpipe/pii-image-redactor
                 // and verifies SHA-256 before landing in ~/.screenpipe/models/.
                 let shutdown = redact_shutdown.clone();
+                let labels = pii_labels.clone();
                 tokio::spawn(async move {
                     match RfdetrRedactor::load_or_download(RfdetrConfig::default()).await {
                         Ok(detector) => {
                             info!("starting async image-PII worker (backend=local)");
                             let detector_arc = Arc::new(detector) as Arc<dyn ImageRedactor>;
-                            let _ =
-                                ImageWorker::new(pool, detector_arc, ImageWorkerConfig::default())
-                                    .spawn_with_shutdown(shutdown);
+                            let _ = ImageWorker::new(
+                                pool,
+                                detector_arc,
+                                ImageWorkerConfig {
+                                    policy: ImageRedactionPolicy::from_labels(&labels),
+                                    ..Default::default()
+                                },
+                            )
+                            .spawn_with_shutdown(shutdown);
                         }
                         Err(e) => {
                             warn!(
@@ -699,6 +827,7 @@ impl ServerCore {
             power_manager,
             pipe_manager: shared_pipe_manager,
             manual_meeting,
+            high_fps_controller,
             data_dir: local_data_dir,
             data_path,
             port: config.port,

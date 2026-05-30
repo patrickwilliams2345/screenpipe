@@ -40,10 +40,10 @@ use crate::{
             vision_metrics_handler,
         },
         meetings::{
-            bulk_delete_meetings_handler, delete_meeting_handler, get_meeting_handler,
-            get_meeting_transcript_handler, list_meetings_handler, meeting_status_handler,
-            merge_meetings_handler, split_meeting_handler, start_meeting_handler,
-            stop_meeting_handler, update_meeting_handler,
+            bulk_delete_meetings_handler, delete_meeting_handler, export_handler,
+            get_meeting_handler, get_meeting_transcript_handler, list_meetings_handler,
+            meeting_status_handler, merge_meetings_handler, split_meeting_handler,
+            start_meeting_handler, stop_meeting_handler, update_meeting_handler,
         },
         memories::{
             create_memory_handler, delete_memory_handler, get_memory_handler,
@@ -57,7 +57,7 @@ use crate::{
             mark_as_hallucination_handler, merge_speakers_handler, reassign_speaker_handler,
             search_speakers_handler, undo_speaker_reassign_handler, update_speaker_handler,
         },
-        streaming::{handle_video_export_post, handle_video_export_ws, stream_frames_handler},
+        streaming::stream_frames_handler,
         websocket::{
             ws_events_handler, ws_health_handler, ws_meeting_status_handler, ws_metrics_handler,
         },
@@ -199,6 +199,12 @@ pub struct AppState {
     pub cloud_token: Arc<ArcSwap<Option<String>>>,
     /// Unified credential store for OAuth tokens, API keys, etc.
     pub secret_store: Option<Arc<screenpipe_secrets::SecretStore>>,
+    /// Runtime control for the high-FPS screen-capture override. Shared
+    /// with each per-monitor capture loop so HTTP toggles propagate
+    /// without a restart. `None` only when the engine was started in a
+    /// configuration that doesn't run vision capture (e.g. headless
+    /// `--disable-vision`).
+    pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
 }
 
 pub struct SCServer {
@@ -246,6 +252,9 @@ pub struct SCServer {
     /// same reasons as `oauth_refresher` — keeps the JoinHandle alive
     /// and exposes `.snapshot()` for health reporting later.
     pub external_memory_sync: Option<Arc<crate::external_memory_sync::ExternalMemorySyncScheduler>>,
+    /// Shared high-FPS controller. Set before `start()` so AppState and
+    /// the per-monitor capture loops point at the same instance.
+    pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
 }
 
 impl SCServer {
@@ -285,7 +294,18 @@ impl SCServer {
             secret_store: None,
             oauth_refresher: None,
             external_memory_sync: None,
+            high_fps_controller: None,
         }
+    }
+
+    /// Wire the shared high-FPS controller. Pass the same instance to the
+    /// `VisionManager` so the HTTP routes and capture loops point at it.
+    pub fn with_high_fps_controller(
+        mut self,
+        controller: Arc<crate::high_fps_controller::HighFpsController>,
+    ) -> Self {
+        self.high_fps_controller = Some(controller);
+        self
     }
 
     /// Set the cloud JWT used to authenticate proxied chat-completion calls
@@ -553,6 +573,7 @@ impl SCServer {
             api_auth_key: self.api_auth_key.clone(),
             cloud_token: self.cloud_token.clone(),
             secret_store: self.secret_store.clone(),
+            high_fps_controller: self.high_fps_controller.clone(),
         });
 
         // Populate the registry so /connections/browsers shows both kinds
@@ -617,6 +638,9 @@ impl SCServer {
             .get("/meetings", list_meetings_handler)
             .get("/meetings/status", meeting_status_handler)
             .post("/meetings/merge", merge_meetings_handler)
+            // General export: meeting_id XOR start/end → MP4 (frames + synced audio).
+            // HTTP twin of the `screenpipe export` CLI; used by the MCP export-video tool.
+            .post("/export", export_handler)
             .post("/meetings/bulk-delete", bulk_delete_meetings_handler)
             .post("/meetings/start", start_meeting_handler)
             .post("/meetings/stop", stop_meeting_handler)
@@ -692,6 +716,30 @@ impl SCServer {
             // Vision/audio pipeline metrics (not in OpenAPI spec — external types)
             .route("/vision/metrics", get(vision_metrics_handler))
             .route("/audio/metrics", get(audio_metrics_handler))
+            // HD recording — bound sessions (meeting / timer / prewarm-pending),
+            // no indefinite mode. Every session has a natural end condition.
+            // GET    /capture/hd            → current snapshot
+            // POST   /capture/hd/start      → { boundTo: "meeting"|"timer"|"prewarm_pending", meetingId?, durationSecs? }
+            // POST   /capture/hd/stop       → clear active session
+            // POST   /capture/hd/extend     → { additionalSecs } push expires_at back
+            // POST   /capture/hd/settings   → { defaultMode?, intervalMs? }
+            .route("/capture/hd", get(crate::routes::capture::get_hd))
+            .route(
+                "/capture/hd/start",
+                axum::routing::post(crate::routes::capture::start_hd),
+            )
+            .route(
+                "/capture/hd/stop",
+                axum::routing::post(crate::routes::capture::stop_hd),
+            )
+            .route(
+                "/capture/hd/extend",
+                axum::routing::post(crate::routes::capture::extend_hd),
+            )
+            .route(
+                "/capture/hd/settings",
+                axum::routing::post(crate::routes::capture::update_hd_settings),
+            )
             // Retranscribe/transcribe (not in OpenAPI spec — opaque Response / multipart)
             .route(
                 "/audio/reconciliation/backlog",
@@ -931,10 +979,6 @@ impl SCServer {
                     }
                 }),
             )
-            .route(
-                "/frames/export",
-                get(handle_video_export_ws).post(handle_video_export_post),
-            )
             .with_state(app_state.clone())
             .layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
@@ -980,7 +1024,8 @@ impl SCServer {
                             // Allow specific endpoints without auth:
                             // - /health: device monitor, tray status, startup polling
                             //   (called before frontend loads API key via IPC)
-                            // - /connections/oauth/callback: browser redirect from
+                            // - /connections/oauth/callback and
+                            //   /mcp-servers/:id/oauth/callback: browser redirect from
                             //   OAuth providers (no bearer token in redirect)
                             // - /pipes/store/*: onboarding can fire pipe install before
                             //   the frontend's IPC key-fetch completes on cold start /
@@ -992,6 +1037,8 @@ impl SCServer {
                                 || path == "/ws/health"
                                 || path == "/audio/device/status"
                                 || path == "/connections/oauth/callback"
+                                || (path.starts_with("/mcp-servers/")
+                                    && path.ends_with("/oauth/callback"))
                                 || path == "/connections/browser/pair/start"
                                 || path == "/connections/browser/pair/status"
                                 || path.starts_with("/frames/")
