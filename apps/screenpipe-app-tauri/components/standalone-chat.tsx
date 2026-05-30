@@ -67,6 +67,7 @@ import {
   isConversationHistorySyncPrompt,
   type ChatLoadConversationPayload,
   shouldHandleChatLoadConversationForWindow,
+  shouldHandleChatPrefillForWindow,
 } from "@/lib/chat-utils";
 import { sanitizeToolCallXml } from "@/lib/utils/sanitize-tool-call-xml";
 import { useAutoSuggestions, type Suggestion } from "@/lib/hooks/use-auto-suggestions";
@@ -3686,8 +3687,15 @@ export function StandaloneChat({
       sessionStorage.removeItem("pendingChatPrefill");
       try {
         const data = JSON.parse(pending);
+        // Stamp targetWindow so an autoSend prefill is claimed by THIS window
+        // only. sessionStorage is per-window, so the window that stored the
+        // pending prefill (and navigated here) is the correct target. Without
+        // this, pipe-store / pipes-section store the prefill with no target,
+        // and the untargeted re-emit fires in BOTH windows → duplicate chat.
+        // An explicit targetWindow in `data` still wins (spread comes last).
+        const prefillData = { targetWindow: getCurrentWindow().label, ...data };
         // Small delay to let the chat fully initialize without showing setup flashes.
-        setTimeout(() => emit("chat-prefill", data), 120);
+        setTimeout(() => emit("chat-prefill", prefillData), 120);
       } catch {
         setIsPreparingPrefill(false);
       }
@@ -3775,8 +3783,11 @@ export function StandaloneChat({
     const unlisten = listen<{ context: string; prompt?: string; displayLabel?: string; frameId?: number; autoSend?: boolean; source?: string; targetWindow?: string }>("chat-prefill", (event) => {
       const { context, prompt, displayLabel, frameId, autoSend, source, targetWindow } = event.payload;
 
-      // Only process if this window is the intended target (or no target for backwards compat)
-      if (targetWindow && getCurrentWindow().label !== targetWindow) return;
+      // Route to exactly one window. An autoSend prefill with no targetWindow
+      // would otherwise be claimed by BOTH the home and overlay panels — each
+      // mints its own session id and sends, producing a duplicate conversation.
+      // shouldHandleChatPrefillForWindow pins an untargeted autoSend to home.
+      if (!shouldHandleChatPrefillForWindow({ targetWindow, autoSend }, getCurrentWindow().label)) return;
 
       if (autoSend && prompt) {
         // Deduplicate: skip if another listener instance is already handling this

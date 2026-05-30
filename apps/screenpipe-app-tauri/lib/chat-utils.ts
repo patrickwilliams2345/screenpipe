@@ -106,6 +106,33 @@ export function shouldActivateHomeSectionForChatLoadConversation(
   return shouldHandleChatLoadConversationForWindow(payload, "home");
 }
 
+/**
+ * Decide whether THIS window should act on a `chat-prefill` event.
+ *
+ * Both the home window and the chat overlay run a live chat panel. An
+ * `autoSend` prefill with no explicit `targetWindow` would be claimed by
+ * BOTH — each mints its own session id and calls `sendMessage`, producing
+ * two conversations for one intent. That is the root of the duplicate-chat
+ * bug for action/pipe-originated prompts.
+ *
+ * So an untargeted autoSend is pinned to the home window (the only surface
+ * that emits untargeted autoSends — the overlay path always sets a target),
+ * guaranteeing exactly one window sends. Non-autoSend prefills merely
+ * populate the input box, where double-handling is harmless, so they stay
+ * permissive.
+ */
+export function shouldHandleChatPrefillForWindow(
+  payload:
+    | { targetWindow?: string | null; autoSend?: boolean }
+    | null
+    | undefined,
+  windowLabel: string,
+): boolean {
+  if (!payload) return false;
+  const target = payload.targetWindow ?? (payload.autoSend ? "home" : null);
+  return !target || target === windowLabel;
+}
+
 const CHAT_READY_TIMEOUT_MS = 2500;
 const CHAT_READY_MAX_ATTEMPTS = 3;
 const PENDING_CHAT_PREFILL_KEY = "pendingChatPrefill";

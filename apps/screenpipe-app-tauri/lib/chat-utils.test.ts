@@ -36,6 +36,7 @@ import {
   readSearchOpenedFromChatSurface,
   shouldActivateHomeSectionForChatLoadConversation,
   shouldHandleChatLoadConversationForWindow,
+  shouldHandleChatPrefillForWindow,
 } from "./chat-utils";
 import { useChatStore } from "./stores/chat-store";
 
@@ -131,5 +132,34 @@ describe("chat-utils", () => {
     clearSearchOpenedFromChatSurface();
 
     expect(readSearchOpenedFromChatSurface()).toBeNull();
+  });
+});
+
+describe("shouldHandleChatPrefillForWindow", () => {
+  it("routes a targeted prefill to only its target window", () => {
+    expect(shouldHandleChatPrefillForWindow({ targetWindow: "chat", autoSend: true }, "chat")).toBe(true);
+    expect(shouldHandleChatPrefillForWindow({ targetWindow: "chat", autoSend: true }, "home")).toBe(false);
+    expect(shouldHandleChatPrefillForWindow({ targetWindow: "home", autoSend: true }, "home")).toBe(true);
+    expect(shouldHandleChatPrefillForWindow({ targetWindow: "home", autoSend: true }, "chat")).toBe(false);
+  });
+
+  it("pins an UNtargeted autoSend prefill to the home window only (the dup fix)", () => {
+    // Without this, both the home and overlay panels would auto-send and each
+    // create its own conversation — the duplicate-chat bug.
+    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "home")).toBe(true);
+    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "chat")).toBe(false);
+    // A stray third window never claims it either.
+    expect(shouldHandleChatPrefillForWindow({ autoSend: true }, "main")).toBe(false);
+  });
+
+  it("leaves untargeted NON-autoSend prefills permissive (input fill is harmless)", () => {
+    expect(shouldHandleChatPrefillForWindow({ autoSend: false }, "home")).toBe(true);
+    expect(shouldHandleChatPrefillForWindow({ autoSend: false }, "chat")).toBe(true);
+    expect(shouldHandleChatPrefillForWindow({}, "chat")).toBe(true);
+  });
+
+  it("returns false for a missing payload", () => {
+    expect(shouldHandleChatPrefillForWindow(null, "home")).toBe(false);
+    expect(shouldHandleChatPrefillForWindow(undefined, "chat")).toBe(false);
   });
 });

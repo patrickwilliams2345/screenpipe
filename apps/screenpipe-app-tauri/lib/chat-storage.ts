@@ -26,6 +26,11 @@ let _orderedEntriesCache: ConversationEntry[] | null = null;
 export const CHAT_HISTORY_INITIAL_LIMIT = 50;
 export const CHAT_SEARCH_RESULT_LIMIT = 50;
 
+/** Placeholder the chat panel writes for an assistant turn that hasn't started
+ *  streaming yet (see standalone-chat.tsx send path). Centralized here so the
+ *  dedup's "completed reply" check can't silently drift from the writer. */
+export const CHAT_PROCESSING_PLACEHOLDER = "Processing...";
+
 export function __resetChatStorageCachesForTests(): void {
   _chatsDir = null;
   clearConversationEntryCache();
@@ -359,7 +364,7 @@ function conversationHasCompletedReply(conv: any): boolean {
   return messages.some((m: any) => {
     if (m?.role !== "assistant") return false;
     const content = typeof m.content === "string" ? m.content.trim() : "";
-    if (content && content !== "Processing...") return true;
+    if (content && content !== CHAT_PROCESSING_PLACEHOLDER) return true;
     return Array.isArray(m.contentBlocks) && m.contentBlocks.length > 0;
   });
 }
