@@ -19,6 +19,7 @@
 //! to ~5ms amortized over the entire batch.
 
 use chrono::{DateTime, Utc};
+use sqlx::migrate::MigrateDatabase;
 use sqlx::{Pool, Sqlite};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -489,14 +490,20 @@ async fn execute_batch(
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
                     // "unable to open database file" (SQLITE_CANTOPEN) on acquire
-                    // means the data dir vanished mid-run (deleted folder, etc.) —
-                    // the top runtime DB error (SCREENPIPE-CLI-HA). Recreate the
-                    // dir and retry instead of erroring every queued write.
+                    // means the data dir/file vanished mid-run (deleted folder,
+                    // etc.) — the top runtime DB error (SCREENPIPE-CLI-HA).
+                    // Recreate the dir AND the db file, then retry, instead of
+                    // erroring every queued write. Recreating the dir alone is
+                    // not enough: the pool opens with create_if_missing=false, so
+                    // a fresh acquire against the now-missing file would
+                    // CANTOPEN again. The recreated db is empty (schema is
+                    // restored by migrations on the next startup); this just
+                    // clears CANTOPEN so the pool can reconnect.
                     if is_cantopen_error(&e) && attempt < max_retries {
-                        let recreated = ensure_db_parent_dir(db_path, false);
+                        let recovered = ensure_db_openable(db_path).await;
                         warn!(
-                            "write_queue: acquire CANTOPEN (attempt {}/{}), dir_recreated={}, retrying",
-                            attempt, max_retries, recreated
+                            "write_queue: acquire CANTOPEN (attempt {}/{}), db_recovered={}, retrying",
+                            attempt, max_retries, recovered
                         );
                         last_error = Some(e);
                         tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
@@ -1587,6 +1594,47 @@ pub(crate) fn ensure_db_parent_dir(database_path: &str, create_tree: bool) -> bo
     }
 }
 
+/// Make the database openable again after the data dir/file vanished mid-run
+/// (the SQLITE_CANTOPEN runtime recovery). Recreates the parent dir
+/// (mountpoint-safe, via [`ensure_db_parent_dir`]) AND an empty db file —
+/// recreating the dir alone is not enough because the write pool opens with
+/// `create_if_missing = false`, so a fresh `acquire()` against a missing file
+/// would CANTOPEN again.
+///
+/// The recreated db is **empty**: the schema is restored by migrations on the
+/// next startup. This only clears CANTOPEN so the pool can reconnect instead of
+/// erroring every queued write; it does not recover the lost rows.
+///
+/// Returns true if the db file exists (is openable) afterward. In-memory DBs are
+/// always openable. Stays mountpoint-safe: if `ensure_db_parent_dir` declined to
+/// recreate the dir (e.g. unmounted volume), the file is not created either.
+async fn ensure_db_openable(db_path: &str) -> bool {
+    if db_path.contains(":memory:") {
+        return true;
+    }
+    ensure_db_parent_dir(db_path, false);
+    // Only recreate the file if the parent dir actually exists now —
+    // ensure_db_parent_dir is mountpoint-safe and may have intentionally
+    // skipped recreation (don't shadow an unmounted volume with a stray file).
+    match std::path::Path::new(db_path).parent() {
+        Some(p) if !p.as_os_str().is_empty() && !p.exists() => return false,
+        _ => {}
+    }
+    let connection_string = format!("sqlite:{}", db_path);
+    // create_database opens with create_if_missing(true) then closes; it is a
+    // no-op (does not truncate) if the file already exists.
+    match sqlx::Sqlite::create_database(&connection_string).await {
+        Ok(_) => {
+            warn!("db: recreated empty database file {}", db_path);
+            true
+        }
+        Err(e) => {
+            warn!("db: failed to recreate database file {}: {}", db_path, e);
+            false
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1612,6 +1660,58 @@ mod tests {
         assert!(!base.exists());
         // in-memory is always skipped
         assert!(!ensure_db_parent_dir("sqlite::memory:", true));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regression for SCREENPIPE-CLI-HA: after the data dir/file vanishes
+    /// mid-run, the runtime recovery must make a *fresh* connection openable
+    /// again. Recreating the parent dir alone is NOT enough — the write pool
+    /// opens with create_if_missing=false, so the file must be recreated too.
+    #[tokio::test]
+    async fn ensure_db_openable_recreates_file_and_clears_cantopen() {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use sqlx::{ConnectOptions, Connection};
+
+        let base = std::env::temp_dir().join(format!("sp_wq_cantopen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("db.sqlite");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let conn_str = format!("sqlite:{}", db_path_str);
+
+        // prod-like options (mirror db.rs): NO create_if_missing => default false
+        let opts: SqliteConnectOptions = conn_str.parse().unwrap();
+
+        // file exists -> opens fine
+        sqlx::Sqlite::create_database(&conn_str).await.unwrap();
+        opts.clone().connect().await.unwrap().close().await.unwrap();
+
+        // data dir vanishes mid-run
+        std::fs::remove_dir_all(&dir).unwrap();
+        // precondition: a fresh open now CANTOPENs (the bug)
+        assert!(opts.clone().connect().await.is_err());
+
+        // recovery: must recreate dir AND file so a fresh open succeeds
+        assert!(ensure_db_openable(&db_path_str).await);
+        assert!(db_path.exists(), "recovery must recreate the db file");
+        opts.clone()
+            .connect()
+            .await
+            .expect("fresh connection must open after recovery")
+            .close()
+            .await
+            .unwrap();
+
+        // mountpoint-safe: whole tree gone (unmounted volume) => no file created
+        std::fs::remove_dir_all(&base).unwrap();
+        let on_volume = base.join("vol/db.sqlite");
+        assert!(!ensure_db_openable(&on_volume.to_string_lossy()).await);
+        assert!(!base.exists(), "must not shadow an unmounted volume");
+
+        // in-memory is always openable
+        assert!(ensure_db_openable("sqlite::memory:").await);
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
