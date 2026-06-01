@@ -286,25 +286,11 @@ impl DatabaseManager {
             ));
         }
 
-        // Ensure the parent directory exists before opening the file. A missing
-        // data dir (fresh install, a relocated/unmounted volume, or a path under
-        // a not-yet-created subfolder) makes SQLite fail with "unable to open
-        // database file" (SQLITE_CANTOPEN, code 14) at create_database / connect
-        // — the single highest-volume DB error in production. Skip in-memory
-        // databases (":memory:"), which have no filesystem path.
-        if !database_path.contains(":memory:") {
-            if let Some(parent) = std::path::Path::new(database_path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        warn!(
-                            "failed to create db parent dir {}: {} — open may still fail with SQLITE_CANTOPEN",
-                            parent.display(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
+        // Ensure the data dir exists before opening the file — a missing parent
+        // dir makes SQLite fail with "unable to open database file"
+        // (SQLITE_CANTOPEN, code 14) at create_database/connect. Shared with the
+        // write_queue's runtime recovery (see ensure_db_parent_dir).
+        crate::write_queue::ensure_db_parent_dir(database_path, true);
 
         // Create the database if it doesn't exist
         if !sqlx::Sqlite::database_exists(&connection_string).await? {
@@ -367,8 +353,11 @@ impl DatabaseManager {
             .await?;
 
         let write_semaphore = Arc::new(Semaphore::new(1));
-        let write_queue =
-            crate::write_queue::spawn_write_drain(write_pool.clone(), Arc::clone(&write_semaphore));
+        let write_queue = crate::write_queue::spawn_write_drain(
+            write_pool.clone(),
+            Arc::clone(&write_semaphore),
+            Arc::from(database_path),
+        );
         let db_manager = DatabaseManager {
             pool: read_pool,
             write_pool,

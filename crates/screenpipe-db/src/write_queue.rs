@@ -383,10 +383,11 @@ impl WriteQueue {
 pub(crate) fn spawn_write_drain(
     write_pool: Pool<Sqlite>,
     write_semaphore: Arc<Semaphore>,
+    db_path: Arc<str>,
 ) -> WriteQueue {
     let (tx, rx) = mpsc::channel::<PendingWrite>(CHANNEL_CAPACITY);
 
-    tokio::spawn(drain_loop(rx, write_pool, write_semaphore));
+    tokio::spawn(drain_loop(rx, write_pool, write_semaphore, db_path));
 
     WriteQueue { tx }
 }
@@ -395,6 +396,7 @@ async fn drain_loop(
     mut rx: mpsc::Receiver<PendingWrite>,
     write_pool: Pool<Sqlite>,
     write_semaphore: Arc<Semaphore>,
+    db_path: Arc<str>,
 ) {
     let mut batch: Vec<PendingWrite> = Vec::with_capacity(MAX_BATCH_SIZE);
 
@@ -433,7 +435,7 @@ async fn drain_loop(
         }
 
         debug!("write_queue: draining batch of {} writes", batch.len());
-        execute_batch(&write_pool, &write_semaphore, &mut batch).await;
+        execute_batch(&write_pool, &write_semaphore, &mut batch, &db_path).await;
         batch.clear();
     }
 
@@ -445,7 +447,7 @@ async fn drain_loop(
             "write_queue: shutdown — flushing {} remaining writes",
             tail_batch.len()
         );
-        execute_batch(&write_pool, &write_semaphore, &mut tail_batch).await;
+        execute_batch(&write_pool, &write_semaphore, &mut tail_batch, &db_path).await;
         tail_batch.clear();
     }
     debug!("write_queue: drain loop exited");
@@ -455,6 +457,7 @@ async fn execute_batch(
     write_pool: &Pool<Sqlite>,
     write_semaphore: &Arc<Semaphore>,
     batch: &mut Vec<PendingWrite>,
+    db_path: &str,
 ) {
     // Acquire write semaphore once for the entire batch
     let _permit: OwnedSemaphorePermit = match tokio::time::timeout(
@@ -485,6 +488,20 @@ async fn execute_batch(
             match tokio::time::timeout(Duration::from_secs(5), write_pool.acquire()).await {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
+                    // "unable to open database file" (SQLITE_CANTOPEN) on acquire
+                    // means the data dir vanished mid-run (deleted folder, etc.) —
+                    // the top runtime DB error (SCREENPIPE-CLI-HA). Recreate the
+                    // dir and retry instead of erroring every queued write.
+                    if is_cantopen_error(&e) && attempt < max_retries {
+                        let recreated = ensure_db_parent_dir(db_path, false);
+                        warn!(
+                            "write_queue: acquire CANTOPEN (attempt {}/{}), dir_recreated={}, retrying",
+                            attempt, max_retries, recreated
+                        );
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
                     send_error_to_all(batch, e);
                     return;
                 }
@@ -1511,12 +1528,92 @@ fn is_busy_error(e: &sqlx::Error) -> bool {
     }
 }
 
+/// SQLITE_CANTOPEN — "unable to open database file". At runtime this means the
+/// data dir/file vanished out from under an open pool (deleted folder, etc.).
+fn is_cantopen_error(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(db_err) => db_err
+            .message()
+            .to_lowercase()
+            .contains("unable to open database file"),
+        _ => false,
+    }
+}
+
+/// Ensure the database file's parent directory exists.
+///
+/// Fixes "unable to open database file" (SQLITE_CANTOPEN): a missing parent dir
+/// fails every open. Called at startup (`create_tree = true`, builds the whole
+/// path for fresh installs) and from the write_queue's runtime recovery
+/// (`create_tree = false`). Skips in-memory DBs. Returns true if it created the
+/// directory.
+///
+/// Runtime recovery is mountpoint-safe: when the whole tree is gone (the
+/// grandparent is also missing — the signature of an unmounted volume) it does
+/// nothing, so we never shadow a mountpoint with a stray local dir when the
+/// volume returns. It only heals the recoverable case: a single deleted dir
+/// whose parent still exists.
+pub(crate) fn ensure_db_parent_dir(database_path: &str, create_tree: bool) -> bool {
+    if database_path.contains(":memory:") {
+        return false;
+    }
+    let parent = match std::path::Path::new(database_path).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return false,
+    };
+    if parent.exists() {
+        return false;
+    }
+    if !create_tree {
+        if let Some(gp) = parent.parent() {
+            if !gp.as_os_str().is_empty() && !gp.exists() {
+                warn!(
+                    "db: parent tree of {} is gone (likely unmounted volume); not recreating",
+                    parent.display()
+                );
+                return false;
+            }
+        }
+    }
+    match std::fs::create_dir_all(parent) {
+        Ok(_) => {
+            warn!("db: created missing parent dir {}", parent.display());
+            true
+        }
+        Err(e) => {
+            warn!("db: failed to create parent dir {}: {}", parent.display(), e);
+            false
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn ensure_db_parent_dir_creates_and_is_mountpoint_safe() {
+        let base = std::env::temp_dir().join(format!("sp_wq_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = base.join("a/b/db.sqlite");
+        // create_tree builds the whole missing path (fresh install)
+        assert!(ensure_db_parent_dir(&db.to_string_lossy(), true));
+        assert!(db.parent().unwrap().exists());
+        // runtime recovery heals a single deleted dir whose parent still exists
+        std::fs::remove_dir_all(base.join("a/b")).unwrap();
+        assert!(ensure_db_parent_dir(&db.to_string_lossy(), false));
+        // mountpoint-safe: whole tree gone + runtime mode => no-op (don't shadow)
+        std::fs::remove_dir_all(&base).unwrap();
+        let deep = base.join("gone/db.sqlite");
+        assert!(!ensure_db_parent_dir(&deep.to_string_lossy(), false));
+        assert!(!base.exists());
+        // in-memory is always skipped
+        assert!(!ensure_db_parent_dir("sqlite::memory:", true));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     async fn setup_test_db() -> (Pool<Sqlite>, Arc<Semaphore>) {
         let pool = SqlitePoolOptions::new()
@@ -1622,7 +1719,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_write() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunk {
@@ -1648,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_coalescing() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         // Submit many writes concurrently — they should be batched
         let mut handles = Vec::new();
@@ -1682,7 +1779,7 @@ mod tests {
     #[tokio::test]
     async fn test_ordering_chunk_before_transcription() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         // Insert chunk first
         let chunk_result = queue
@@ -1731,7 +1828,7 @@ mod tests {
     #[tokio::test]
     async fn test_combined_chunk_and_transcription() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
@@ -1784,7 +1881,7 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_transcription_skipped() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
@@ -1820,7 +1917,7 @@ mod tests {
     #[tokio::test]
     async fn test_video_chunk_insert() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertVideoChunkWithFps {
@@ -1846,7 +1943,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_frame_insert() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertSnapshotFrameWithOcr {
@@ -1888,7 +1985,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_mixed_writes() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let mut handles = Vec::new();
 
@@ -1939,7 +2036,7 @@ mod tests {
         let queue = WriteQueue { tx };
 
         let pool_clone = pool.clone();
-        let handle = tokio::spawn(drain_loop(rx, pool_clone, sem));
+        let handle = tokio::spawn(drain_loop(rx, pool_clone, sem, std::sync::Arc::from("sqlite::memory:")));
 
         // Submit a write
         let result = queue
@@ -1972,7 +2069,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_transcription_skipped() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
