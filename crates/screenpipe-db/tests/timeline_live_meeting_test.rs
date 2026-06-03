@@ -459,4 +459,64 @@ mod timeline_live_meeting_tests {
             "falls back to the free-text Deepgram label when unresolved"
         );
     }
+
+    /// The mirror must attach a segment to a chunk of the SAME device, even when a
+    /// different-device chunk is nearer in time — otherwise a mic (input) segment
+    /// would inherit a remote speaker from a System Audio (output) chunk. Device is
+    /// matched via the filename, the only place a chunk records it.
+    #[tokio::test]
+    async fn test_mirror_associates_segment_to_same_device_chunk() {
+        let db = setup_test_db().await;
+        let base = Utc::now();
+
+        // OUTPUT chunk exactly at `base` (nearest), INPUT chunk 2s away.
+        let out_chunk = db
+            .insert_audio_chunk("System Audio (output)_t.mp4", Some(base))
+            .await
+            .unwrap();
+        let in_chunk = db
+            .insert_audio_chunk(
+                "Built-in Mic (input)_t.mp4",
+                Some(base + Duration::seconds(2)),
+            )
+            .await
+            .unwrap();
+
+        // An INPUT (mic) segment at `base` — naively it would grab the nearer OUTPUT chunk.
+        let meeting_id = db
+            .insert_meeting("zoom.us", "ui_scan", None, None)
+            .await
+            .unwrap();
+        db.insert_meeting_transcript_segment(
+            meeting_id,
+            "screenpipe-cloud",
+            None,
+            "deepgram:0:0",
+            "Built-in Mic",
+            "input",
+            Some("speaker 1"),
+            "my own words",
+            base,
+        )
+        .await
+        .unwrap();
+
+        let n = db
+            .mirror_live_meeting_to_audio_transcriptions(meeting_id, 15.0)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+
+        let chunk_id: i64 = sqlx::query_scalar(
+            "SELECT audio_chunk_id FROM audio_transcriptions WHERE transcription = 'my own words'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            chunk_id, in_chunk,
+            "input segment must map to the input-device chunk, not the nearer output chunk"
+        );
+        assert_ne!(chunk_id, out_chunk);
+    }
 }

@@ -9051,9 +9051,12 @@ LIMIT ? OFFSET ?
         let max_ts = segs.iter().map(|s| s.captured_at).max().unwrap() + window;
 
         // Candidate chunks across the meeting window, fetched ONCE (a 40-min meeting
-        // is ~80 chunks), then matched in memory — avoids a per-segment query.
+        // is ~80 chunks), then matched in memory — avoids a per-segment query. We
+        // pull file_path because chunk audio is single-device and the device is
+        // encoded in the filename ("<name> (input|output)_<ts>.mp4"), which is the
+        // only place a chunk records its device.
         let chunk_rows = sqlx::query(
-            "SELECT id, timestamp FROM audio_chunks \
+            "SELECT id, timestamp, file_path FROM audio_chunks \
              WHERE timestamp IS NOT NULL \
                AND julianday(timestamp) >= julianday(?1) \
                AND julianday(timestamp) <= julianday(?2)",
@@ -9063,12 +9066,13 @@ LIMIT ? OFFSET ?
         .fetch_all(&self.pool)
         .await?;
 
-        let chunks: Vec<(i64, i64)> = chunk_rows
+        let chunks: Vec<(i64, i64, String)> = chunk_rows
             .iter()
             .filter_map(|r| {
                 let id: i64 = r.try_get("id").ok()?;
                 let ts: DateTime<Utc> = r.try_get("timestamp").ok()?;
-                Some((id, ts.timestamp_millis()))
+                let file_path: String = r.try_get("file_path").unwrap_or_default();
+                Some((id, ts.timestamp_millis(), file_path))
             })
             .collect();
         if chunks.is_empty() {
@@ -9080,13 +9084,32 @@ LIMIT ? OFFSET ?
         let mut inserted: u64 = 0;
         for s in &segs {
             let seg_ms = s.captured_at.timestamp_millis();
-            let Some(&(chunk_id, chunk_ms)) = chunks.iter().min_by_key(|c| (c.1 - seg_ms).abs())
-            else {
+            // Match the SAME physical device's chunk so an input (mic) segment can't
+            // inherit a remote speaker from a System Audio (output) chunk, and vice
+            // versa. The device string is sanitized the same way the recorder names
+            // files (only '/' and '\\' replaced). Fall back to nearest-any within the
+            // window if no same-device chunk exists (legacy/odd naming) — never worse
+            // than before.
+            let device_key = format!(
+                "{} ({})",
+                s.device_name,
+                if s.is_input { "input" } else { "output" }
+            )
+            .replace(['/', '\\'], "_");
+            let pick = chunks
+                .iter()
+                .filter(|c| (c.1 - seg_ms).abs() <= window_ms && c.2.contains(device_key.as_str()))
+                .min_by_key(|c| (c.1 - seg_ms).abs())
+                .or_else(|| {
+                    chunks
+                        .iter()
+                        .filter(|c| (c.1 - seg_ms).abs() <= window_ms)
+                        .min_by_key(|c| (c.1 - seg_ms).abs())
+                });
+            let Some(chunk) = pick else {
                 continue;
             };
-            if (chunk_ms - seg_ms).abs() > window_ms {
-                continue;
-            }
+            let chunk_id = chunk.0;
             let text_length = s.transcript.len() as i64;
             let res = sqlx::query(
                 "INSERT OR IGNORE INTO audio_transcriptions \
@@ -9132,7 +9155,7 @@ LIMIT ? OFFSET ?
         let window_days = coverage_window_secs / 86_400.0;
 
         let segs = sqlx::query(
-            "SELECT id, captured_at FROM meeting_transcript_segments \
+            "SELECT id, captured_at, device_type FROM meeting_transcript_segments \
              WHERE speaker_id IS NULL AND julianday(captured_at) >= julianday(?1) \
              ORDER BY captured_at DESC LIMIT ?2",
         )
@@ -9149,16 +9172,22 @@ LIMIT ? OFFSET ?
         for seg in &segs {
             let seg_id: i64 = seg.get("id");
             let captured_at: DateTime<Utc> = seg.get("captured_at");
-            // The global speaker_id of the nearest already-identified audio row
-            // (the mirrored live row shares this exact timestamp, so it wins).
+            let is_input: bool =
+                seg.try_get::<String, _>("device_type").unwrap_or_default() == "input";
+            // The global speaker_id of the nearest already-identified audio row OF
+            // THE SAME DEVICE (input vs output), so a mic segment can't pick up a
+            // remote speaker. The mirrored live row shares this exact timestamp +
+            // device, so it wins.
             let speaker_id: Option<i64> = sqlx::query_scalar(
                 "SELECT at.speaker_id FROM audio_transcriptions at \
                  WHERE at.speaker_id IS NOT NULL \
+                   AND COALESCE(at.is_input_device, 1) = ?3 \
                    AND ABS(julianday(at.timestamp) - julianday(?1)) <= ?2 \
                  ORDER BY ABS(julianday(at.timestamp) - julianday(?1)) ASC LIMIT 1",
             )
             .bind(captured_at)
             .bind(window_days)
+            .bind(is_input)
             .fetch_optional(&mut **tx.conn())
             .await?;
             if let Some(sid) = speaker_id {
