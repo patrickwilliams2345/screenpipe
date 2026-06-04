@@ -4,7 +4,7 @@
 
 use crate::activity_feed::{ActivityFeed, ActivityKind};
 use crate::config::UiCaptureConfig;
-use crate::events::{ElementContext, EventData, Modifiers, UiEvent};
+use crate::events::{ElementBounds, ElementContext, EventData, Modifiers, UiEvent};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use chrono::Utc;
@@ -1274,6 +1274,7 @@ fn get_element_at_position(x: f64, y: f64, config: &UiCaptureConfig) -> Option<E
             "Unknown".to_string()
         }
     })?;
+    let bounds = get_element_bounds(&elem);
 
     // Try multiple attributes to get the element name/label
     // Different elements use different attributes for their label
@@ -1300,7 +1301,7 @@ fn get_element_at_position(x: f64, y: f64, config: &UiCaptureConfig) -> Option<E
             value: None,
             description: None,
             automation_id: None,
-            bounds: None,
+            bounds,
         });
     }
 
@@ -1325,7 +1326,33 @@ fn get_element_at_position(x: f64, y: f64, config: &UiCaptureConfig) -> Option<E
         }),
         description: description.map(|s| truncate(&s, 200)),
         automation_id: None,
-        bounds: None,
+        bounds,
+    })
+}
+
+fn get_element_bounds(elem: &ax::UiElement) -> Option<ElementBounds> {
+    let pos = elem.attr_value(ax::attr::pos()).ok().and_then(|v| {
+        if v.get_type_id() == ax::Value::type_id() {
+            let ax_val: &ax::Value = unsafe { std::mem::transmute(&*v) };
+            ax_val.cg_point().map(|p| (p.x, p.y))
+        } else {
+            None
+        }
+    })?;
+    let size = elem.attr_value(ax::attr::size()).ok().and_then(|v| {
+        if v.get_type_id() == ax::Value::type_id() {
+            let ax_val: &ax::Value = unsafe { std::mem::transmute(&*v) };
+            ax_val.cg_size().map(|s| (s.width, s.height))
+        } else {
+            None
+        }
+    })?;
+
+    Some(ElementBounds {
+        x: pos.0,
+        y: pos.1,
+        width: size.0,
+        height: size.1,
     })
 }
 
@@ -1376,6 +1403,7 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
             "Unknown".to_string()
         }
     })?;
+    let bounds = get_element_bounds(elem);
 
     // Get element name/label
     let name = get_string_attr(elem, ax::attr::title())
@@ -1390,7 +1418,7 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
             value: None,
             description: None,
             automation_id: None,
-            bounds: None,
+            bounds,
         });
     }
 
@@ -1419,7 +1447,7 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
         }),
         description: None,
         automation_id: None,
-        bounds: None,
+        bounds,
     })
 }
 

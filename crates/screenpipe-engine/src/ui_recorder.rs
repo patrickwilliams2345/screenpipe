@@ -857,6 +857,10 @@ struct TriggerGates {
     capture_on_clipboard: bool,
 }
 
+fn event_target_point(db_event: &InsertUiEvent) -> Option<(i32, i32)> {
+    Some((db_event.x?, db_event.y?))
+}
+
 /// Decide which `CaptureTrigger` (if any) this event should fire
 /// immediately. Pure helper extracted so it's trivially testable.
 ///
@@ -880,22 +884,33 @@ fn capture_trigger_kind(
     let app_lower = app.to_lowercase();
     let title_lower = title.to_lowercase();
     let is_ignored = window_pattern::matches_any(ignored_patterns, &app_lower, &title_lower);
+    let target = event_target_point(db_event);
     match &db_event.event_type {
         screenpipe_db::UiEventType::AppSwitch => {
             if is_ignored {
                 None
             } else {
-                Some(CaptureTrigger::AppSwitch { app_name: app })
+                Some(CaptureTrigger::AppSwitch {
+                    app_name: app,
+                    target,
+                })
             }
         }
         screenpipe_db::UiEventType::WindowFocus => {
             if is_ignored {
                 None
             } else {
-                Some(CaptureTrigger::WindowFocus { window_name: title })
+                Some(CaptureTrigger::WindowFocus {
+                    window_name: title,
+                    target,
+                })
             }
         }
-        screenpipe_db::UiEventType::Click => Some(CaptureTrigger::Click),
+        screenpipe_db::UiEventType::Click => Some(
+            target
+                .map(|(x, y)| CaptureTrigger::Click { x, y })
+                .unwrap_or(CaptureTrigger::Manual),
+        ),
         // Clipboard operations can be trigger-only when DB persistence is
         // disabled. The capture-loop gate is still separate: when
         // `capture_on_clipboard` is off we skip the trigger entirely.
@@ -1147,6 +1162,24 @@ mod capture_trigger_kind_tests {
     fn clipboard_event_suppressed_when_clipboard_gate_off() {
         let result = capture_trigger_kind(&evt(UiEventType::Clipboard), &[], gates(false, false));
         assert!(result.is_none(), "Clipboard with gate off must not trigger");
+    }
+
+    #[test]
+    fn click_event_carries_target_coordinates() {
+        let mut e = evt(UiEventType::Click);
+        e.x = Some(123);
+        e.y = Some(456);
+        let result = capture_trigger_kind(&e, &[], gates(false, false));
+        assert!(matches!(
+            result,
+            Some(CaptureTrigger::Click { x: 123, y: 456 })
+        ));
+    }
+
+    #[test]
+    fn click_event_without_coordinates_still_captures() {
+        let result = capture_trigger_kind(&evt(UiEventType::Click), &[], gates(false, false));
+        assert!(matches!(result, Some(CaptureTrigger::Manual)));
     }
 
     #[test]

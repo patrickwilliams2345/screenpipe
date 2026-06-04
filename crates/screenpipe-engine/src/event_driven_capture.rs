@@ -19,7 +19,7 @@ use screenpipe_core::window_pattern::{self, WindowPattern};
 use screenpipe_db::DatabaseManager;
 use screenpipe_screen::capture_screenshot_by_window::{get_excluded_sck_window_ids, WindowFilters};
 use screenpipe_screen::frame_comparison::{FrameComparer, FrameComparisonConfig};
-use screenpipe_screen::monitor::SafeMonitor;
+use screenpipe_screen::monitor::{list_monitors, SafeMonitor};
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
 use screenpipe_screen::utils::capture_monitor_image;
 use std::collections::HashMap;
@@ -49,11 +49,17 @@ pub struct CaptureParams<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CaptureTrigger {
     /// User switched to a different application
-    AppSwitch { app_name: String },
+    AppSwitch {
+        app_name: String,
+        target: Option<(i32, i32)>,
+    },
     /// Window focus changed within the same app
-    WindowFocus { window_name: String },
+    WindowFocus {
+        window_name: String,
+        target: Option<(i32, i32)>,
+    },
     /// Mouse click detected
-    Click,
+    Click { x: i32, y: i32 },
     /// User stopped typing (pause after keyboard activity)
     TypingPause,
     /// User stopped scrolling
@@ -194,7 +200,7 @@ impl CaptureTrigger {
         match self {
             CaptureTrigger::AppSwitch { .. } => "app_switch",
             CaptureTrigger::WindowFocus { .. } => "window_focus",
-            CaptureTrigger::Click => "click",
+            CaptureTrigger::Click { .. } => "click",
             CaptureTrigger::TypingPause => "typing_pause",
             CaptureTrigger::ScrollStop => "scroll_stop",
             CaptureTrigger::KeyPress => "key_press",
@@ -202,6 +208,21 @@ impl CaptureTrigger {
             CaptureTrigger::VisualChange => "visual_change",
             CaptureTrigger::Idle => "idle",
             CaptureTrigger::Manual => "manual",
+        }
+    }
+
+    fn target_point(&self) -> Option<(i32, i32)> {
+        match self {
+            CaptureTrigger::AppSwitch {
+                target: Some((x, y)),
+                ..
+            }
+            | CaptureTrigger::WindowFocus {
+                target: Some((x, y)),
+                ..
+            } => Some((*x, *y)),
+            CaptureTrigger::Click { x, y } => Some((*x, *y)),
+            _ => None,
         }
     }
 }
@@ -259,15 +280,19 @@ pub struct EventDrivenCapture {
     config: EventDrivenCaptureConfig,
     /// Time of last capture
     last_capture: Instant,
+    /// Time reference for periodic idle captures.
+    last_idle_reference: Instant,
     /// Last known idle_ms from ActivityFeed
     last_idle_ms: u64,
 }
 
 impl EventDrivenCapture {
     pub fn new(config: EventDrivenCaptureConfig) -> Self {
+        let now = Instant::now();
         Self {
             config,
-            last_capture: Instant::now(),
+            last_capture: now,
+            last_idle_reference: now,
             last_idle_ms: 0,
         }
     }
@@ -279,12 +304,26 @@ impl EventDrivenCapture {
 
     /// Record that a capture just happened.
     pub fn mark_captured(&mut self) {
-        self.last_capture = Instant::now();
+        let now = Instant::now();
+        self.last_capture = now;
+        self.last_idle_reference = now;
+    }
+
+    /// Phase the next idle capture without changing the normal debounce clock.
+    pub fn phase_next_idle_capture(&mut self, delay: Duration) {
+        let idle_interval = Duration::from_millis(self.config.idle_capture_interval_ms);
+        let now = Instant::now();
+        self.last_idle_reference = if delay >= idle_interval {
+            now
+        } else {
+            now.checked_sub(idle_interval - delay).unwrap_or(now)
+        };
     }
 
     /// Check if we need an idle capture (no capture for too long).
     pub fn needs_idle_capture(&self) -> bool {
-        self.last_capture.elapsed() >= Duration::from_millis(self.config.idle_capture_interval_ms)
+        self.last_idle_reference.elapsed()
+            >= Duration::from_millis(self.config.idle_capture_interval_ms)
     }
 
     /// Poll activity state and return a trigger if a capture should happen.
@@ -419,6 +458,59 @@ pub(crate) fn should_release_on_pause_entry(was_paused: bool, is_paused: bool) -
     is_paused && !was_paused
 }
 
+type MonitorBounds = (i32, i32, i32, i32);
+
+fn monitor_bounds(monitor: &SafeMonitor) -> MonitorBounds {
+    let left = monitor.x();
+    let top = monitor.y();
+    let right = left.saturating_add(monitor.width() as i32);
+    let bottom = top.saturating_add(monitor.height() as i32);
+
+    (left, top, right, bottom)
+}
+
+fn point_in_bounds((left, top, right, bottom): MonitorBounds, x: i32, y: i32) -> bool {
+    x >= left && x < right && y >= top && y < bottom
+}
+
+fn trigger_applies_to_monitor(
+    trigger: &CaptureTrigger,
+    monitor: &SafeMonitor,
+    all_monitor_bounds: &[MonitorBounds],
+) -> bool {
+    let Some((x, y)) = trigger.target_point() else {
+        return true;
+    };
+
+    if !all_monitor_bounds
+        .iter()
+        .any(|bounds| point_in_bounds(*bounds, x, y))
+    {
+        return true;
+    }
+
+    point_in_bounds(monitor_bounds(monitor), x, y)
+}
+
+fn idle_phase_delay(
+    monitor: &SafeMonitor,
+    monitors: &[SafeMonitor],
+    idle_interval_ms: u64,
+) -> Duration {
+    let monitor_count = monitors.len().max(1);
+    let mut ordered_monitors = monitors.iter().collect::<Vec<_>>();
+    ordered_monitors.sort_by_key(|monitor| (monitor.x(), monitor.y(), monitor.id()));
+
+    let monitor_index = ordered_monitors
+        .iter()
+        .position(|candidate| candidate.id() == monitor.id())
+        .unwrap_or_else(|| (monitor.id() as usize) % monitor_count);
+    let delay_ms =
+        idle_interval_ms.saturating_mul((monitor_index + 1) as u64) / monitor_count as u64;
+
+    Duration::from_millis(delay_ms.max(1))
+}
+
 /// Main event-driven capture loop for a single monitor.
 ///
 /// This replaces `continuous_capture` for event-driven mode.
@@ -474,6 +566,22 @@ pub async fn event_driven_capture_loop(
     // need a modest tick to detect typing-pause / idle timers.
     let poll_interval = Duration::from_millis(250);
     let mut trigger_channel_closed = false;
+    let current_monitors = list_monitors().await;
+    let all_monitor_bounds = current_monitors
+        .iter()
+        .map(|monitor| monitor_bounds(monitor))
+        .collect::<Vec<_>>();
+    let idle_phase_delay = idle_phase_delay(
+        &monitor,
+        &current_monitors,
+        state.config.idle_capture_interval_ms,
+    );
+    info!(
+        "idle capture phase for monitor {}: next idle in {}ms across {} monitor(s)",
+        monitor_id,
+        idle_phase_delay.as_millis(),
+        current_monitors.len().max(1)
+    );
 
     // Adaptive accessibility throttle: tracks per-app walk cost and backs off
     // for expensive apps (e.g., Electron apps whose UIA providers block the UI thread).
@@ -597,6 +705,7 @@ pub async fn event_driven_capture_loop(
             monitor_id
         );
     }
+    state.phase_next_idle_capture(idle_phase_delay);
 
     // Cache sorted excluded SCK window IDs to avoid recreating the persistent
     // SCK stream every time a transient window (tooltip, popup, badge) appears
@@ -985,6 +1094,10 @@ pub async fn event_driven_capture_loop(
                 trigger_channel_closed = true;
             }
 
+            drained.retain(|msg| {
+                trigger_applies_to_monitor(&msg.trigger, &monitor, &all_monitor_bounds)
+            });
+
             let (reduced_trigger, reduced_corr_ids) = reduce_drained_triggers(
                 drained,
                 !state.config.capture_on_clipboard,
@@ -1065,7 +1178,7 @@ pub async fn event_driven_capture_loop(
                 // Uses AX APIs only — prevents even a single leaked frame.
                 {
                     let trigger_app = match &trigger {
-                        CaptureTrigger::AppSwitch { app_name } => Some(app_name.as_str()),
+                        CaptureTrigger::AppSwitch { app_name, .. } => Some(app_name.as_str()),
                         _ => None,
                     };
                     if crate::drm_detector::pre_capture_drm_check(pause_on_drm_content, trigger_app)
@@ -1430,6 +1543,7 @@ fn resolve_capture_metadata(
     match trigger {
         CaptureTrigger::AppSwitch {
             app_name: trigger_app_name,
+            ..
         } if !trigger_app_name.is_empty() => {
             if app_name.as_deref() != Some(trigger_app_name.as_str()) {
                 debug!(
@@ -1441,6 +1555,7 @@ fn resolve_capture_metadata(
         }
         CaptureTrigger::WindowFocus {
             window_name: trigger_window_name,
+            ..
         } if !trigger_window_name.is_empty() => {
             if window_name.as_deref() != Some(trigger_window_name.as_str()) {
                 debug!(
@@ -1593,7 +1708,7 @@ async fn do_capture(
     // we do a lightweight AX query to get the focused app. This ensures the
     // walk budget applies to ALL captures, not just app switches.
     let trigger_app = match trigger {
-        CaptureTrigger::AppSwitch { app_name } => Some(app_name.clone()),
+        CaptureTrigger::AppSwitch { app_name, .. } => Some(app_name.clone()),
         _ => {
             #[cfg(target_os = "macos")]
             {
@@ -1988,12 +2103,13 @@ mod tests {
     fn test_capture_trigger_as_str() {
         assert_eq!(
             CaptureTrigger::AppSwitch {
-                app_name: "Safari".to_string()
+                app_name: "Safari".to_string(),
+                target: None,
             }
             .as_str(),
             "app_switch"
         );
-        assert_eq!(CaptureTrigger::Click.as_str(), "click");
+        assert_eq!(CaptureTrigger::Click { x: 10, y: 20 }.as_str(), "click");
         assert_eq!(CaptureTrigger::TypingPause.as_str(), "typing_pause");
         assert_eq!(CaptureTrigger::VisualChange.as_str(), "visual_change");
         assert_eq!(CaptureTrigger::Idle.as_str(), "idle");
@@ -2007,13 +2123,21 @@ mod tests {
 
         // Baseline: a change-driven trigger within the 30s floor → dedup applies.
         assert!(dedup_applies(&CaptureTrigger::VisualChange, false, recent));
-        assert!(dedup_applies(&CaptureTrigger::Click, false, recent));
+        assert!(dedup_applies(
+            &CaptureTrigger::Click { x: 10, y: 20 },
+            false,
+            recent
+        ));
 
         // HD active → dedup is bypassed even for an otherwise-eligible trigger.
         // This is the fix: video/demo replay moves pixels but not AX text, so
         // the hash would dedup it away without this bypass.
         assert!(!dedup_applies(&CaptureTrigger::VisualChange, true, recent));
-        assert!(!dedup_applies(&CaptureTrigger::Click, true, recent));
+        assert!(!dedup_applies(
+            &CaptureTrigger::Click { x: 10, y: 20 },
+            true,
+            recent
+        ));
 
         // Idle/Manual are always dedup-exempt (timeline floor), HD or not.
         assert!(!dedup_applies(&CaptureTrigger::Idle, false, recent));
@@ -2049,7 +2173,7 @@ mod tests {
         assert!(!state.needs_idle_capture());
 
         // Simulate waiting
-        state.last_capture = Instant::now()
+        state.last_idle_reference = Instant::now()
             .checked_sub(Duration::from_millis(150))
             .unwrap_or(Instant::now());
         assert!(state.needs_idle_capture());
@@ -2063,7 +2187,7 @@ mod tests {
         };
         let mut state = EventDrivenCapture::new(config);
 
-        state.last_capture = Instant::now()
+        state.last_idle_reference = Instant::now()
             .checked_sub(Duration::from_millis(150))
             .unwrap_or(Instant::now());
         assert!(state.needs_idle_capture());
@@ -2076,16 +2200,23 @@ mod tests {
     fn test_trigger_channel() {
         let (tx, mut rx) = trigger_channel();
 
-        tx.send(CaptureTriggerMsg::new(CaptureTrigger::Click))
-            .unwrap();
+        tx.send(CaptureTriggerMsg::new(CaptureTrigger::Click {
+            x: 10,
+            y: 20,
+        }))
+        .unwrap();
         tx.send(CaptureTriggerMsg::new(CaptureTrigger::AppSwitch {
             app_name: "Code".to_string(),
+            target: None,
         }))
         .unwrap();
 
-        assert_eq!(rx.try_recv().unwrap().trigger, CaptureTrigger::Click);
+        assert!(matches!(
+            rx.try_recv().unwrap().trigger,
+            CaptureTrigger::Click { x: 10, y: 20 }
+        ));
         match rx.try_recv().unwrap().trigger {
-            CaptureTrigger::AppSwitch { app_name } => assert_eq!(app_name, "Code"),
+            CaptureTrigger::AppSwitch { app_name, .. } => assert_eq!(app_name, "Code"),
             _ => panic!("expected AppSwitch"),
         }
     }
@@ -2096,32 +2227,34 @@ mod tests {
         let mut rx2 = tx.subscribe();
 
         tx.send(CaptureTriggerMsg::with_correlation(
-            CaptureTrigger::Click,
+            CaptureTrigger::Click { x: 10, y: 20 },
             42,
         ))
         .unwrap();
 
         let m1 = rx1.try_recv().unwrap();
         let m2 = rx2.try_recv().unwrap();
-        assert_eq!(m1.trigger, CaptureTrigger::Click);
+        assert!(matches!(m1.trigger, CaptureTrigger::Click { x: 10, y: 20 }));
         assert_eq!(m1.correlation_id, Some(42));
-        assert_eq!(m2.trigger, CaptureTrigger::Click);
+        assert!(matches!(m2.trigger, CaptureTrigger::Click { x: 10, y: 20 }));
         assert_eq!(m2.correlation_id, Some(42));
     }
 
     #[test]
     fn reduce_drained_picks_last_kind_and_collects_corr_ids() {
         let drained = vec![
-            CaptureTriggerMsg::with_correlation(CaptureTrigger::Click, 1),
+            CaptureTriggerMsg::with_correlation(CaptureTrigger::Click { x: 10, y: 20 }, 1),
             CaptureTriggerMsg::with_correlation(
                 CaptureTrigger::AppSwitch {
                     app_name: "Code".into(),
+                    target: None,
                 },
                 2,
             ),
             CaptureTriggerMsg::with_correlation(
                 CaptureTrigger::WindowFocus {
                     window_name: "main".into(),
+                    target: None,
                 },
                 3,
             ),
@@ -2138,14 +2271,14 @@ mod tests {
         // The exact regression: a Clipboard tail with the gate OFF used
         // to clear valid Click corr_ids that drained alongside it.
         let drained = vec![
-            CaptureTriggerMsg::with_correlation(CaptureTrigger::Click, 10),
-            CaptureTriggerMsg::with_correlation(CaptureTrigger::Click, 11),
+            CaptureTriggerMsg::with_correlation(CaptureTrigger::Click { x: 10, y: 20 }, 10),
+            CaptureTriggerMsg::with_correlation(CaptureTrigger::Click { x: 11, y: 21 }, 11),
             CaptureTriggerMsg::with_correlation(CaptureTrigger::Clipboard, 12),
         ];
         let (trigger, corrs) =
             reduce_drained_triggers(drained, /*skip_clipboard*/ true, false);
         // Clipboard dropped from kind decision — most recent non-skipped wins.
-        assert_eq!(trigger, Some(CaptureTrigger::Click));
+        assert_eq!(trigger, Some(CaptureTrigger::Click { x: 11, y: 21 }));
         // Only the two valid Click corr ids survive.
         assert_eq!(corrs, vec![10, 11]);
     }
@@ -2154,11 +2287,11 @@ mod tests {
     fn reduce_drained_skipped_keypress_filters_in_mixed_drain() {
         let drained = vec![
             CaptureTriggerMsg::with_correlation(CaptureTrigger::KeyPress, 20),
-            CaptureTriggerMsg::with_correlation(CaptureTrigger::Click, 21),
+            CaptureTriggerMsg::with_correlation(CaptureTrigger::Click { x: 10, y: 20 }, 21),
             CaptureTriggerMsg::with_correlation(CaptureTrigger::KeyPress, 22),
         ];
         let (trigger, corrs) = reduce_drained_triggers(drained, false, /*skip_keypress*/ true);
-        assert_eq!(trigger, Some(CaptureTrigger::Click));
+        assert_eq!(trigger, Some(CaptureTrigger::Click { x: 10, y: 20 }));
         assert_eq!(corrs, vec![21]);
     }
 
@@ -2188,10 +2321,13 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_receiver_recv_async() {
         let (tx, mut rx) = trigger_channel();
-        tx.send(CaptureTriggerMsg::new(CaptureTrigger::Click))
-            .unwrap();
+        tx.send(CaptureTriggerMsg::new(CaptureTrigger::Click {
+            x: 10,
+            y: 20,
+        }))
+        .unwrap();
         let got = rx.recv().await.unwrap();
-        assert_eq!(got.trigger, CaptureTrigger::Click);
+        assert_eq!(got.trigger, CaptureTrigger::Click { x: 10, y: 20 });
     }
 
     #[test]
