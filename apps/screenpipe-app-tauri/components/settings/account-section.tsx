@@ -54,6 +54,7 @@ export function AccountSection() {
   const [isAnnual, setIsAnnual] = useState(true);
   const [pipeSyncing, setPipeSyncing] = useState(false);
   const [memoriesSyncing, setMemoriesSyncing] = useState(false);
+  const [connectionsSyncing, setConnectionsSyncing] = useState(false);
 
   useEffect(() => {
     if (!settings.user?.email) {
@@ -403,6 +404,74 @@ export function AccountSection() {
                     }}
                   >
                     <RefreshCw className={`h-3 w-3 mr-1 ${memoriesSyncing ? "animate-spin" : ""}`} />
+                    sync now
+                  </Button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Connection sync — independent toggle. Off by default and kept
+              separate from pipes/memories on purpose: this syncs connected-
+              account credentials (OAuth tokens, API keys), so enabling it is a
+              distinct, informed choice. Credentials are end-to-end encrypted in
+              the sync blob; the server never sees them in plaintext. */}
+          <div className="mt-4 pt-4 border-t border-border/50">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">connection sync across devices</p>
+                <p className="text-xs text-muted-foreground">
+                  sync connected accounts (gmail, slack, notion…) to your devices — credentials are end-to-end encrypted
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="connections-sync-toggle"
+                    checked={!!settings.connectionsSyncEnabled}
+                    onCheckedChange={async (checked) => {
+                      await updateSettings({ connectionsSyncEnabled: checked });
+                      toast({
+                        title: checked ? "connection sync enabled" : "connection sync disabled",
+                        description: checked
+                          ? "connected accounts will sync across your devices"
+                          : "connected accounts will no longer sync",
+                      });
+                    }}
+                  />
+                  <Label htmlFor="connections-sync-toggle" className="text-xs text-muted-foreground cursor-pointer sr-only">
+                    sync
+                  </Label>
+                </div>
+                {settings.connectionsSyncEnabled && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs uppercase tracking-wide"
+                    title={
+                      isServerDown
+                        ? "screenpipe server is starting up — try again in a moment"
+                        : undefined
+                    }
+                    disabled={connectionsSyncing || isServerDown}
+                    onClick={async () => {
+                      setConnectionsSyncing(true);
+                      try {
+                        await localFetch("/sync/connections/pull", { method: "POST" });
+                        await localFetch("/sync/connections/push", { method: "POST" });
+                        toast({ title: "connections synced" });
+                      } catch (e) {
+                        toast({
+                          title: "sync failed",
+                          description: syncErrorDescription(e),
+                          variant: "destructive",
+                        });
+                      } finally {
+                        setConnectionsSyncing(false);
+                      }
+                    }}
+                  >
+                    <RefreshCw className={`h-3 w-3 mr-1 ${connectionsSyncing ? "animate-spin" : ""}`} />
                     sync now
                   </Button>
                 )}

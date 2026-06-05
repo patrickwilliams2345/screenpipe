@@ -231,6 +231,11 @@ export type Settings = SettingsStore & {
 	 * Independent of pipeSyncEnabled — a user might want their memories on
 	 * every device but keep pipes device-local, or vice versa. Pro-gated. */
 	memoriesSyncEnabled?: boolean;
+	/** Sync connected-account credentials (OAuth tokens + manual API keys)
+	 * across devices. Off by default and kept separate from pipes/memories on
+	 * purpose: it syncs secrets, so enabling it is a distinct informed choice.
+	 * Credentials are end-to-end encrypted in the sync blob. Pro-gated. */
+	connectionsSyncEnabled?: boolean;
 	/** OpenAI-compatible transcription endpoint URL */
 	openaiCompatibleEndpoint?: string;
 	/** OpenAI-compatible transcription API key */
