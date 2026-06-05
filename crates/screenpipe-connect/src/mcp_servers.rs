@@ -704,7 +704,7 @@ impl McpServerStore {
         let Some(ss) = &self.secret_store else {
             return Ok(None);
         };
-        Ok(ss.get_json::<McpOAuthToken>(&oauth_token_key(id)).await?)
+        ss.get_json::<McpOAuthToken>(&oauth_token_key(id)).await
     }
 
     async fn write_oauth_token(&self, id: &str, token: McpOAuthToken) -> Result<()> {

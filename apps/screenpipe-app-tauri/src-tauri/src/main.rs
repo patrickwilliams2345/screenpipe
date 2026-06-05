@@ -1079,6 +1079,18 @@ async fn main() {
                 store.recording.disable_audio = true;
                 info!("E2E seed: audio disabled");
             }
+            if e2e_flags.iter().any(|f| f == "event-trigger-capture") {
+                store.recording.capture_on_keystroke = Some(true);
+                store.recording.capture_on_clipboard = Some(true);
+                store.recording.min_capture_interval_ms = Some(50);
+                store.recording.disable_keyboard_capture = true;
+                store.recording.disable_clipboard_capture = true;
+                info!("E2E seed: event-trigger capture enabled with keyboard/clipboard DB rows disabled");
+            }
+            if e2e_flags.iter().any(|f| f == "keyboard-db-capture") {
+                store.recording.disable_keyboard_capture = false;
+                info!("E2E seed: keyboard DB capture enabled");
+            }
             if e2e_flags.iter().any(|f| f == "cloud-audio-fallback") {
                 store.recording.disable_audio = false;
                 store.recording.disable_vision = true;
@@ -1116,12 +1128,23 @@ async fn main() {
             // Attach non-sensitive settings to all future Sentry events
             if !telemetry_disabled {
                 sentry::configure_scope(|scope| {
-                    // Set user.id to the persistent analytics UUID
-                    // This links Sentry errors to PostHog sessions and feedback reports
+                    // Set user.id to the persistent analytics UUID. Support
+                    // context env vars are attached as tags so managed
+                    // deployments can be filtered without replacing the app id.
                     scope.set_user(Some(sentry::protocol::User {
                         id: Some(store.recording.analytics_id.clone()),
                         ..Default::default()
                     }));
+                    let telemetry_context = screenpipe_engine::telemetry_context::TelemetryContext::from_env();
+                    for (key, value) in telemetry_context.pairs() {
+                        scope.set_tag(key, value);
+                    }
+                    if !telemetry_context.is_empty() {
+                        scope.set_context(
+                            "screenpipe_support",
+                            sentry::protocol::Context::Other(telemetry_context.to_json_map()),
+                        );
+                    }
                     scope.set_context("app_settings", sentry::protocol::Context::Other({
                         let mut map = std::collections::BTreeMap::new();
                         map.insert("audio_chunk_duration".into(), serde_json::json!(store.recording.audio_chunk_duration));

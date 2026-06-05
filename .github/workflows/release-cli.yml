@@ -634,6 +634,39 @@ jobs:
             cd ../../..
           done
 
+      - name: Verify platform package tarballs
+        run: |
+          for pkg in \
+            @screenpipe/cli-darwin-arm64 \
+            @screenpipe/cli-darwin-x64 \
+            @screenpipe/cli-linux-x64 \
+            @screenpipe/cli-win32-x64; do
+            ok=false
+            for attempt in $(seq 1 30); do
+              url=$(npm view "$pkg@${{ env.VERSION }}" dist.tarball 2>/dev/null || true)
+              if [[ -z "$url" ]]; then
+                echo "::warning::$pkg@${{ env.VERSION }} metadata is not visible yet (attempt $attempt/30)"
+                sleep 10
+                continue
+              fi
+
+              status=$(curl -sS -o /dev/null -w "%{http_code}" -L -I "$url" || true)
+              if [[ "$status" == "200" ]]; then
+                echo "::notice::$pkg@${{ env.VERSION }} tarball is fetchable"
+                ok=true
+                break
+              fi
+
+              echo "::warning::$pkg@${{ env.VERSION }} tarball returned HTTP $status (attempt $attempt/30)"
+              sleep 10
+            done
+
+            if [[ "$ok" != "true" ]]; then
+              echo "::error::$pkg@${{ env.VERSION }} tarball did not become fetchable"
+              exit 1
+            fi
+          done
+
       - name: Publish main package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

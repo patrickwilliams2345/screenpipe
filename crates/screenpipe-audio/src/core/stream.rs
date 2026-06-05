@@ -227,6 +227,7 @@ impl AudioStream {
 
     /// Start the standard cpal/SCK audio stream. Shared by all platforms
     /// and used as fallback when Process Tap is unavailable or fails.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
     async fn start_cpal_stream(
         device: &Arc<AudioDevice>,
@@ -840,13 +841,13 @@ where
 {
     #[cfg(target_os = "macos")]
     {
-        return build_cpal_input_stream(
+        build_cpal_input_stream(
             device,
             stream_config,
             data_callback,
             error_callback,
             macos_voice_processing_config(macos_input_vpio),
-        );
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {

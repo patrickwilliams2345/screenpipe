@@ -3177,7 +3177,7 @@ mod tests {
 
     #[test]
     fn attr_needs_identifier_only_signals() {
-        let signals = vec![
+        let signals = [
             CallSignal::AutomationId("foo"),
             CallSignal::AutomationIdContains("bar"),
             CallSignal::MenuItemId("baz"),
@@ -3195,7 +3195,7 @@ mod tests {
 
     #[test]
     fn attr_needs_title_only_signals() {
-        let signals = vec![
+        let signals = [
             CallSignal::MenuBarItem {
                 title_contains: "Meeting",
             },
@@ -3216,7 +3216,7 @@ mod tests {
 
     #[test]
     fn attr_needs_title_and_desc_signals() {
-        let signals = vec![
+        let signals = [
             CallSignal::NameContains("Leave call"),
             CallSignal::KeyboardShortcut("⌘⇧M"),
             CallSignal::RoleWithName {
@@ -3237,7 +3237,7 @@ mod tests {
 
     #[test]
     fn attr_needs_mixed_signals_unions_all_attrs() {
-        let signals = vec![
+        let signals = [
             CallSignal::AutomationId("foo"),
             CallSignal::NameContains("Leave"),
         ];
@@ -3628,7 +3628,7 @@ mod tests {
 
         let must_be_path_qualified = ["cal.com", "dialpad.com"];
         for host in must_be_path_qualified {
-            let bare_present = patterns.iter().any(|p| *p == host);
+            let bare_present = patterns.contains(&host);
             assert!(
                 !bare_present,
                 "url pattern {host:?} must be path-qualified (e.g. {host}/<call-route>), \

@@ -1355,7 +1355,7 @@ mod tests {
         assert_eq!(merged["access_token"], "new");
         assert_eq!(merged["refresh_token"], "rt");
         assert!(
-            merged.get("expires_at").map_or(true, Value::is_null),
+            merged.get("expires_at").is_none_or(Value::is_null),
             "stale expires_at must not survive a refresh that produced a new access_token; got {:?}",
             merged.get("expires_at"),
         );
@@ -1381,7 +1381,7 @@ mod tests {
         });
         let merged = merge_refresh_response(&stored, &resp);
         assert!(
-            merged.get("expires_at").map_or(true, Value::is_null),
+            merged.get("expires_at").is_none_or(Value::is_null),
             "merge should defer expires_at to write_oauth_token_instance"
         );
         assert_eq!(merged["expires_in"], 3599);

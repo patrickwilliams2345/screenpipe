@@ -161,17 +161,11 @@ pub enum ProxyAuth {
 /// whenever the last successful refresh is older than this duration, even
 /// if the access token is still valid. The value should leave headroom
 /// against the provider's published limit (e.g. Zoom's 15h ⇒ 12h floor).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RefreshPolicy {
     /// Maximum gap between successful refreshes. `None` = no keep-alive
     /// pressure beyond the access-token-expiry path.
     pub keep_alive: Option<std::time::Duration>,
-}
-
-impl Default for RefreshPolicy {
-    fn default() -> Self {
-        Self { keep_alive: None }
-    }
 }
 
 #[async_trait]

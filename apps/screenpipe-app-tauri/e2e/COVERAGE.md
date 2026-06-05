@@ -6,9 +6,9 @@ and layer declared in the manifest, weighted by confidence and criticality.
 
 - Manifest: `e2e/coverage-map.json`
 - Specs directory: `e2e/specs`
-- Mapped specs: 40
-- Declared test blocks: 143
-- Weighted coverage points: 114.2
+- Mapped specs: 41
+- Declared test blocks: 147
+- Weighted coverage points: 115.3
 
 Confidence weights: strong=1.0, partial=0.7, conditional=0.4, smoke=0.3.
 Criticality weights: high=1.0, medium=0.7, low=0.4.
@@ -19,9 +19,9 @@ can execute more runtime cases than this number shows.
 
 | Platform | Specs | Declared tests | Weighted points | Layers | Features | Critical score |
 | --- | --- | --- | --- | --- | --- | --- |
-| windows | 33 | 132 | 110.8 | 14 | 39 | 92% |
-| macos | 37 | 113 | 88.4 | 14 | 40 | 89% |
-| linux | 28 | 101 | 84.9 | 12 | 36 | 86% |
+| windows | 34 | 136 | 111.9 | 14 | 39 | 92% |
+| macos | 38 | 113 | 87.9 | 14 | 40 | 89% |
+| linux | 29 | 101 | 84.3 | 12 | 36 | 86% |
 
 ## Runtime Results
 
@@ -33,16 +33,16 @@ pass/fail/skip counts.
 
 | Layer | windows | macos | linux |
 | --- | --- | --- | --- |
-| audio-device | 2 specs / 22 tests / 17.8 pts | 1 specs / 1 tests / 0.3 pts | - |
-| capture-ocr | 2 specs / 9 tests / 3.6 pts | 2 specs / 3 tests / 1.2 pts | 1 specs / 2 tests / 0.8 pts |
-| chat-ai | 6 specs / 6 tests / 3.4 pts | 8 specs / 9 tests / 4.3 pts | 6 specs / 6 tests / 3.4 pts |
-| local-api | 10 specs / 73 tests / 63.5 pts | 9 specs / 52 tests / 46.1 pts | 8 specs / 51 tests / 45.7 pts |
+| audio-device | 2 specs / 26 tests / 19.4 pts | 1 specs / 1 tests / 0.3 pts | - |
+| capture-ocr | 2 specs / 13 tests / 5.2 pts | 2 specs / 3 tests / 1.2 pts | 1 specs / 2 tests / 0.8 pts |
+| chat-ai | 7 specs / 7 tests / 3.9 pts | 9 specs / 10 tests / 4.8 pts | 7 specs / 7 tests / 3.9 pts |
+| local-api | 10 specs / 76 tests / 64.1 pts | 9 specs / 51 tests / 45.1 pts | 8 specs / 50 tests / 44.7 pts |
 | notifications | 2 specs / 11 tests / 10.1 pts | 2 specs / 4 tests / 2.4 pts | 1 specs / 3 tests / 2.1 pts |
 | onboarding | 1 specs / 3 tests / 1.2 pts | 1 specs / 3 tests / 1.2 pts | 1 specs / 3 tests / 1.2 pts |
 | os-integration | 3 specs / 16 tests / 15.1 pts | 3 specs / 3 tests / 0.9 pts | - |
 | performance | 2 specs / 43 tests / 43.0 pts | 4 specs / 33 tests / 29.5 pts | 1 specs / 28 tests / 28.0 pts |
 | pipes | 1 specs / 7 tests / 7.0 pts | 1 specs / 7 tests / 7.0 pts | 1 specs / 7 tests / 7.0 pts |
-| real-ui-e2e | 16 specs / 64 tests / 54.5 pts | 17 specs / 55 tests / 45.6 pts | 14 specs / 49 tests / 43.7 pts |
+| real-ui-e2e | 16 specs / 67 tests / 55.1 pts | 17 specs / 54 tests / 44.6 pts | 14 specs / 48 tests / 42.7 pts |
 | settings | 4 specs / 19 tests / 18.4 pts | 4 specs / 12 tests / 10.7 pts | 3 specs / 11 tests / 10.4 pts |
 | storage-privacy | 4 specs / 19 tests / 18.4 pts | 3 specs / 11 tests / 10.4 pts | 3 specs / 11 tests / 10.4 pts |
 | tauri-command | 8 specs / 17 tests / 10.3 pts | 9 specs / 19 tests / 10.8 pts | 8 specs / 17 tests / 10.3 pts |
@@ -98,6 +98,7 @@ pass/fail/skip counts.
 | chat-newchat-duplicate.spec.ts | windows, macos, linux | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Synthetic chat event regression for duplicate sidebar rows. |
 | chat-parallel-jobs-duplicate.spec.ts | windows, macos, linux | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Parallel auto-send prefill dedupe regression. |
 | chat-prefill-duplicate.spec.ts | windows, macos, linux | chat-ai | chat, chat-prefill | medium | partial | synthetic | 1 | Cross-window prefill duplicate regression. |
+| chat-sidebar-stub-dedup.spec.ts | windows, macos, linux | chat-ai | chat, chat-sidebar-dedupe | medium | partial | synthetic | 1 | Listener-order regression for metadata-only sidebar stubs gaining dedup keys. |
 | chat-streaming-performance.spec.ts | macos | chat-ai, performance | chat, chat-streaming | medium | conditional | performance | 2 | macOS-only chat streaming responsiveness. |
 | chat-switch-context-loss.spec.ts | windows, macos, linux | chat-ai | chat, chat-context | medium | partial | synthetic | 1 | Switching conversations during streaming must not corrupt state. |
 | chat-window.spec.ts | windows, macos, linux | chat-ai, window-lifecycle, real-ui-e2e | chat, window-lifecycle | high | strong | real-user-flow | 1 | Opens Chat and focuses the composer for typing. |
@@ -125,7 +126,7 @@ pass/fail/skip counts.
 | viewer-deeplink.spec.ts | windows, macos, linux | window-lifecycle, tauri-command | viewer-deeplink, window-lifecycle | medium | partial | command | 3 | Viewer window creation and per-path dedupe. |
 | window-activation.spec.ts | macos | window-lifecycle, tauri-command, real-ui-e2e | window-lifecycle, chat | medium | conditional | real-user-flow | 2 | macOS-only show_window_activated focus coverage. |
 | window-lifecycle.spec.ts | windows, macos, linux | window-lifecycle, tauri-command, real-ui-e2e | window-lifecycle, onboarding, tray-search | high | strong | mixed | 3 | Home, Search, and onboarding window routing. |
-| windows-core-recording.spec.ts | windows | capture-ocr, local-api, audio-device, real-ui-e2e | capture-ocr, local-api-auth, local-api-search, audio-device-health, timeline | high | conditional | mixed | 7 | Windows recording-enabled lane; hosted runners can skip frame-dependent OCR assertions. |
+| windows-core-recording.spec.ts | windows | capture-ocr, local-api, audio-device, real-ui-e2e | capture-ocr, local-api-auth, local-api-search, audio-device-health, timeline | high | conditional | mixed | 11 | Windows recording-enabled lane; hosted runners can skip frame-dependent OCR assertions. |
 | windows-system-integration.spec.ts | windows | os-integration, local-api, audio-device, window-lifecycle, performance | app-launch, local-api-auth, audio-device-health, window-lifecycle, os-process-health, webview-stability | high | strong | mixed | 15 | Windows display, WebView2, loopback, process, Defender, audio, focus, and crash-report checks. |
 | windows-user-journey.spec.ts | windows | real-ui-e2e, settings, notifications, storage-privacy, window-lifecycle | home-search, timeline, settings-recording, meeting-notes, shortcut-reminder, notifications, storage-retention, settings-privacy-api-auth | high | strong | real-user-flow | 8 | Windows-first real UX journey across search, timeline, settings, meetings, notifications, storage, and privacy. |
 | zz-owned-browser-background-nav.spec.ts | windows, macos | os-integration, window-lifecycle | owned-browser, window-lifecycle | low | smoke | command | 0 | Owned browser background navigation visibility. |
