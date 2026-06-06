@@ -1413,9 +1413,333 @@ pub fn saudi_arabia_id(s: &str) -> bool {
     d.len() == 10 && (d[0] == 1 || d[0] == 2) && luhn_slice(&d)
 }
 
+// ---- healthcare / financial / telecom (US + intl) ----
+
+/// UK NHS number: 10 digits, weighted mod-11.
+pub fn nhs_number(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 10 {
+        return false;
+    }
+    let r = wsum(&d[..9], &[10, 9, 8, 7, 6, 5, 4, 3, 2]) % 11;
+    let check = (11 - r) % 11;
+    check != 10 && check == d[9] as u32
+}
+
+/// Mod-97 over an alphanumeric string (letters A=10..Z=35 expand to two
+/// digits). Used by LEI (ISO 7064 MOD 97-10).
+fn alnum_mod97(c: &[u8]) -> u64 {
+    let mut rem = 0u64;
+    for &b in c {
+        if b.is_ascii_digit() {
+            rem = (rem * 10 + (b - b'0') as u64) % 97;
+        } else {
+            rem = (rem * 100 + (b.to_ascii_uppercase() - b'A') as u64 + 10) % 97;
+        }
+    }
+    rem
+}
+
+/// LEI (ISO 17442): 20 chars, ISO 7064 MOD 97-10 (full string ≡ 1 mod 97).
+pub fn lei(s: &str) -> bool {
+    let c: Vec<u8> = s.bytes().filter(|b| b.is_ascii_alphanumeric()).collect();
+    c.len() == 20 && alnum_mod97(&c) == 1
+}
+
+/// Australia IHI: 16 digits, prefix 800360, Luhn.
+pub fn australia_ihi(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 16 && d[..6] == [8, 0, 0, 3, 6, 0] && luhn_slice(&d)
+}
+
+/// eSIM EID: 32 digits, prefix 89, Luhn.
+pub fn esim_eid(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 32 && d[0] == 8 && d[1] == 9 && luhn_slice(&d)
+}
+
+/// India ABHA health ID: 14 digits, Verhoeff.
+pub fn india_abha(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 14 && verhoeff_valid(&d)
+}
+
+// Note: FIGI is detected as a format/context-only shape (BBG + consonant
+// body). Its modified-Luhn check digit has an ambiguous parity convention
+// we could not pin to the published vector, so no unverified checksum.
+
+/// US Medicare Beneficiary Identifier (MBI): 11 chars, positional charset
+/// (no checksum, but a strict structural mask). Letters exclude S,L,O,I,B,Z.
+pub fn us_medicare_mbi(s: &str) -> bool {
+    let c: Vec<u8> = s
+        .bytes()
+        .filter(|b| b.is_ascii_alphanumeric())
+        .map(|b| b.to_ascii_uppercase())
+        .collect();
+    if c.len() != 11 {
+        return false;
+    }
+    let is_letter =
+        |b: u8| b.is_ascii_uppercase() && !matches!(b, b'S' | b'L' | b'O' | b'I' | b'B' | b'Z');
+    let is_digit = |b: u8| b.is_ascii_digit();
+    let is_alnum = |b: u8| is_letter(b) || is_digit(b);
+    // pos (1-based): 1 digit 1-9, 2 letter, 3 alnum, 4 digit, 5 letter,
+    // 6 alnum, 7 digit, 8 letter, 9 letter, 10 digit, 11 digit.
+    (c[0].is_ascii_digit() && c[0] != b'0')
+        && is_letter(c[1])
+        && is_alnum(c[2])
+        && is_digit(c[3])
+        && is_letter(c[4])
+        && is_alnum(c[5])
+        && is_digit(c[6])
+        && is_letter(c[7])
+        && is_letter(c[8])
+        && is_digit(c[9])
+        && is_digit(c[10])
+}
+
+// ---- more EU VAT + national IDs (second country batch) ----
+
+/// Two-pass mod-11 (Baltic personal codes, Kazakhstan IIN): pass-1 weights
+/// 1..9 cycling over the first `n` digits, pass-2 shifted by 2; returns the
+/// check digit (with the both-overflow case mapped to 0).
+fn two_pass_mod11(payload: &[u8]) -> u32 {
+    let w1: Vec<u32> = (0..payload.len() as u32).map(|i| 1 + i % 9).collect();
+    let r1 = payload
+        .iter()
+        .zip(&w1)
+        .map(|(&d, &w)| d as u32 * w)
+        .sum::<u32>()
+        % 11;
+    if r1 < 10 {
+        return r1;
+    }
+    let w2: Vec<u32> = (0..payload.len() as u32).map(|i| 1 + (i + 2) % 9).collect();
+    let r2 = payload
+        .iter()
+        .zip(&w2)
+        .map(|(&d, &w)| d as u32 * w)
+        .sum::<u32>()
+        % 11;
+    if r2 < 10 {
+        r2
+    } else {
+        0
+    }
+}
+
+/// Hungary VAT (ANUM): 8 digits, weighted mod-10.
+pub fn hungary_vat(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 8 && wsum(&d, &[9, 7, 3, 1, 9, 7, 3, 1]).is_multiple_of(10)
+}
+
+/// Slovenia VAT: 8 digits, weighted mod-11.
+pub fn slovenia_vat(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 8 {
+        return false;
+    }
+    let r = wsum(&d[..7], &[8, 7, 6, 5, 4, 3, 2]) % 11;
+    let check = 11 - r;
+    (if check == 11 { 0 } else { check }) == d[7] as u32 && check != 10
+}
+
+/// Estonia/Latvia/Lithuania VAT: Estonia 9-digit weighted mod-10.
+pub fn estonia_vat(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 9 && wsum(&d, &[3, 7, 1, 3, 7, 1, 3, 7, 1]).is_multiple_of(10)
+}
+
+/// Malta VAT: 8 digits, weighted mod-37.
+pub fn malta_vat(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 8 && wsum(&d, &[3, 4, 6, 7, 8, 9, 10, 1]).is_multiple_of(37)
+}
+
+/// Slovakia VAT: 10 digits divisible by 11.
+pub fn slovakia_vat(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 10 && digits_mod(&d, 11) == 0
+}
+
+/// Latvia VAT (legal entity, first digit > 3): weighted mod-11 ≡ 3.
+pub fn latvia_vat(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 11 && d[0] > 3 && wsum(&d, &[9, 1, 4, 8, 3, 10, 2, 5, 7, 6, 1]) % 11 == 3
+}
+
+/// Lithuania personal code (and Kazakhstan IIN share the engine): 11/12
+/// digits, two-pass mod-11.
+pub fn lithuania_personal(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 11 && two_pass_mod11(&d[..10]) == d[10] as u32
+}
+
+/// Kazakhstan IIN: 12 digits, two-pass mod-11.
+pub fn kazakhstan_iin(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 12 && two_pass_mod11(&d[..11]) == d[11] as u32
+}
+
+/// Latvia personal code: 11 digits, weighted mod-11 with the +1 offset.
+pub fn latvia_personal(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 11 {
+        return false;
+    }
+    let check = (1 + wsum(&d[..10], &[10, 5, 8, 4, 2, 1, 6, 3, 7, 9])) % 11 % 10;
+    check == d[10] as u32
+}
+
+/// Iran national ID (code melli): 10 digits, weighted mod-11.
+pub fn iran_national_id(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 10 {
+        return false;
+    }
+    let r = wsum(&d[..9], &[10, 9, 8, 7, 6, 5, 4, 3, 2]) % 11;
+    let check = if r < 2 { r } else { 11 - r };
+    check == d[9] as u32
+}
+
+/// Ukraine RNOKPP / tax number: 10 digits, weighted mod-11 (leading −1).
+pub fn ukraine_rnokpp(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 10 {
+        return false;
+    }
+    let w = [-1i64, 5, 7, 9, 4, 6, 10, 5, 7];
+    let s: i64 = d[..9].iter().zip(w).map(|(&x, w)| x as i64 * w).sum();
+    (s.rem_euclid(11) % 10) as u32 == d[9] as u32
+}
+
+/// Kuwait Civil ID: 12 digits, first 1-3, weighted mod-11.
+pub fn kuwait_civil_id(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 12 || !(1..=3).contains(&d[0]) {
+        return false;
+    }
+    let r = wsum(&d[..11], &[2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]) % 11;
+    11 - r == d[11] as u32
+}
+
+/// Ecuador cédula: 10 digits, Luhn-style mod-10, province 01-24/30.
+pub fn ecuador_cedula(s: &str) -> bool {
+    let d = digits(s);
+    if d.len() != 10 {
+        return false;
+    }
+    let prov = d[0] as u32 * 10 + d[1] as u32;
+    if !((1..=24).contains(&prov) || prov == 30) {
+        return false;
+    }
+    let mut sum = 0u32;
+    for (i, &x) in d[..9].iter().enumerate() {
+        if i % 2 == 0 {
+            let v = x as u32 * 2;
+            sum += if v > 9 { v - 9 } else { v };
+        } else {
+            sum += x as u32;
+        }
+    }
+    (10 - sum % 10) % 10 == d[9] as u32
+}
+
+/// Dominican Republic cédula: 11 digits, Luhn.
+pub fn dominican_cedula(s: &str) -> bool {
+    let d = digits(s);
+    d.len() == 11 && luhn_slice(&d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn country_batch2_vectors() {
+        assert!(hungary_vat("12892312"));
+        assert!(!hungary_vat("12892313"));
+        assert!(slovenia_vat("50223054"));
+        assert!(estonia_vat("100931558"));
+        assert!(malta_vat("11679112"));
+        assert!(slovakia_vat("2022749619"));
+        assert!(latvia_vat("40003521600"));
+        assert!(lithuania_personal("33309240064"));
+        assert!(!lithuania_personal("33309240164"));
+        assert!(latvia_personal("16117519997"));
+        assert!(latvia_personal("32867300679"));
+        assert!(iran_national_id("0932833810"));
+        assert!(ukraine_rnokpp("1759013776"));
+        assert!(!ukraine_rnokpp("1759013770"));
+        assert!(ecuador_cedula("1713175071"));
+        // construct the no-vector ones
+        let mut ok = true;
+        for (v, len, prefix) in [
+            (kazakhstan_iin as fn(&str) -> bool, 12usize, ""),
+            (kuwait_civil_id, 12, "2"),
+            (dominican_cedula, 11, ""),
+        ] {
+            let mut seed = 0x9E37u64;
+            let mut hit = false;
+            for _ in 0..400_000 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let body: String = (0..len - prefix.len())
+                    .map(|i| (b'0' + (seed.rotate_left(i as u32 * 3) % 10) as u8) as char)
+                    .collect();
+                if v(&format!("{prefix}{body}")) {
+                    hit = true;
+                    break;
+                }
+            }
+            ok &= hit;
+        }
+        assert!(ok, "a constructed validator never accepted");
+    }
+
+    #[test]
+    fn us_medical_financial_vectors() {
+        assert!(nhs_number("9434765919"));
+        assert!(!nhs_number("9434765918"));
+        assert!(lei("213800WSGIIZCXF1P572")); // Jaguar Land Rover (20 chars)
+        assert!(!lei("213800WSGIIZCXF1P573"));
+        assert!(!lei("549300084UKLVMY22DS16")); // 21 chars (not a valid LEI)
+        assert!(us_medicare_mbi("1EG4TE5MK73"));
+        assert!(!us_medicare_mbi("1SG4TE5MK73")); // 'S' not allowed
+                                                  // IHI: 800360 + 9 digits + Luhn check (no trustworthy public vector;
+                                                  // the agent's was not actually Luhn-valid). Construct one.
+        let mut ihi = None;
+        for last in 0..10u8 {
+            let s = format!("800360000000013{last}");
+            if australia_ihi(&s) {
+                ihi = Some(s);
+                break;
+            }
+        }
+        assert!(ihi.is_some());
+        // ABHA (Verhoeff) and EID (Luhn): construct valid instances.
+        let base = [2u8, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6];
+        let cd = verhoeff_check_digit(&base);
+        let abha: String = base
+            .iter()
+            .chain(std::iter::once(&cd))
+            .map(|d| (d + b'0') as char)
+            .collect();
+        assert!(india_abha(&abha));
+        // EID: 32 digits starting 89, Luhn-valid (brute the last digit).
+        let mut found = None;
+        for last in 0..10u8 {
+            let s = format!("8901234567890123456789012345678{last}");
+            assert_eq!(s.len(), 32);
+            if esim_eid(&s) {
+                found = Some(s);
+                break;
+            }
+        }
+        assert!(found.map(|s| esim_eid(&s)).unwrap_or(false));
+    }
 
     #[test]
     fn asia_americas_vectors() {

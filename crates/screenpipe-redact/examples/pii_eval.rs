@@ -261,6 +261,50 @@ fn shape(subtype: &str, r: &mut Rng) -> String {
             r.digits(13)
         ),
         "nigeria_nin" => r.digits(11),
+        // ---- healthcare / financial + country batch 2 ----
+        "nhs_number" | "ukraine_rnokpp" | "iran_national_id" => r.digits(10),
+        "lei" => format!(
+            "{}{}",
+            (0..18).map(|_| pick(r, CUSIP_CHARS)).collect::<String>(),
+            r.digits(2)
+        ),
+        "australia_ihi" => format!("800360{}", r.digits(10)),
+        "esim_eid" => format!("89{}", r.digits(30)),
+        "india_abha" => r.digits(14),
+        "us_medicare_mbi" => {
+            const L: &[u8] = b"ACDEFGHJKMNPQRTUVWXY";
+            let letter = |r: &mut Rng| L[r.below(L.len() as u64) as usize] as char;
+            let alnum = |r: &mut Rng| {
+                if r.below(2) == 0 {
+                    L[r.below(L.len() as u64) as usize] as char
+                } else {
+                    r.digit()
+                }
+            };
+            format!(
+                "{}{}{}{}{}{}{}{}{}{}{}",
+                (b'1' + r.below(9) as u8) as char,
+                letter(r),
+                alnum(r),
+                r.digit(),
+                letter(r),
+                alnum(r),
+                r.digit(),
+                letter(r),
+                letter(r),
+                r.digit(),
+                r.digit()
+            )
+        }
+        "hungary_vat" | "slovenia_vat" | "malta_vat" => r.digits(8),
+        "estonia_vat" => r.digits(9),
+        "slovakia_vat" => r.digits(10),
+        "latvia_vat" => format!("{}{}", (b'4' + r.below(6) as u8) as char, r.digits(10)),
+        "lithuania_personal" | "latvia_personal" => r.digits(11),
+        "kazakhstan_iin" => r.digits(12),
+        "kuwait_civil_id" => format!("2{}", r.digits(11)),
+        "ecuador_cedula" => format!("{:02}{}", 1 + r.below(24), r.digits(8)),
+        "dominican_cedula" => r.digits(11),
         other => panic!("no shape generator for {other}"),
     }
 }
@@ -339,6 +383,26 @@ fn validator(subtype: &str) -> Option<fn(&str) -> bool> {
         "israel_teudat_zehut" => nid::israel_teudat_zehut,
         "uae_emirates_id" => nid::uae_emirates_id,
         "saudi_arabia_id" => nid::saudi_arabia_id,
+        "nhs_number" => nid::nhs_number,
+        "lei" => nid::lei,
+        "australia_ihi" => nid::australia_ihi,
+        "esim_eid" => nid::esim_eid,
+        "india_abha" => nid::india_abha,
+        "us_medicare_mbi" => nid::us_medicare_mbi,
+        "hungary_vat" => nid::hungary_vat,
+        "slovenia_vat" => nid::slovenia_vat,
+        "estonia_vat" => nid::estonia_vat,
+        "malta_vat" => nid::malta_vat,
+        "slovakia_vat" => nid::slovakia_vat,
+        "latvia_vat" => nid::latvia_vat,
+        "lithuania_personal" => nid::lithuania_personal,
+        "kazakhstan_iin" => nid::kazakhstan_iin,
+        "latvia_personal" => nid::latvia_personal,
+        "iran_national_id" => nid::iran_national_id,
+        "ukraine_rnokpp" => nid::ukraine_rnokpp,
+        "kuwait_civil_id" => nid::kuwait_civil_id,
+        "ecuador_cedula" => nid::ecuador_cedula,
+        "dominican_cedula" => nid::dominican_cedula,
         // format-only (no checksum): btc treated as format here (a valid
         // base58check address can't be brute-forced), mexico_curp, us_ssn,
         // uk_nino, imsi, us_passport, icd10, ...
@@ -453,6 +517,26 @@ const CASES: &[(&str, &str)] = &[
     ("philippines_philsys", "PhilSys"),
     ("egypt_national_id", "national id"),
     ("nigeria_nin", "NIN"),
+    ("nhs_number", "NHS"),
+    ("lei", ""),
+    ("australia_ihi", ""),
+    ("esim_eid", "EID"),
+    ("india_abha", "ABHA"),
+    ("us_medicare_mbi", "Medicare"),
+    ("hungary_vat", "ANUM"),
+    ("slovenia_vat", "DDV"),
+    ("estonia_vat", "KMKR"),
+    ("malta_vat", "VAT"),
+    ("slovakia_vat", "DPH"),
+    ("latvia_vat", "PVN"),
+    ("lithuania_personal", "asmens kodas"),
+    ("kazakhstan_iin", "IIN"),
+    ("latvia_personal", "personas kods"),
+    ("iran_national_id", "code melli"),
+    ("ukraine_rnokpp", "RNOKPP"),
+    ("kuwait_civil_id", "civil id"),
+    ("ecuador_cedula", "cedula"),
+    ("dominican_cedula", "cedula"),
 ];
 
 const TEMPLATES: &[&str] = &[
