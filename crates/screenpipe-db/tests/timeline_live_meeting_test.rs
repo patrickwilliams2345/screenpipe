@@ -280,7 +280,7 @@ mod timeline_live_meeting_tests {
         let base = Utc::now();
 
         let mic_chunk_id = db
-            .insert_audio_chunk("Ruark's AirPods (input)_meeting.mp4", Some(base))
+            .insert_audio_chunk("AirPods (input)_meeting.mp4", Some(base))
             .await
             .unwrap();
         let meeting_id = db

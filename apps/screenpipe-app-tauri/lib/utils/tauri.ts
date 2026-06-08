@@ -67,7 +67,7 @@ async calendarGetEvents(hoursBack: number | null, hoursAhead: number | null) : P
 /**
  * Reset TCC (privacy) permission for Calendars on this app's bundle ID.
  *
- * Why: users (Mike, Jarad, Ruark, Louis's own Mac mini) clicked
+ * Why: multiple users (including Louis's own Mac mini) clicked
  * "Fix Calendar Permission" → macOS opened the Calendars privacy pane
  * with an EMPTY app list, so they had no way to grant access. Root cause
  * is a stale TCC record (dev-build → prod-build reinstall, OS update,
@@ -2376,17 +2376,19 @@ audioDevices: string[];
 useSystemDefaultAudio: boolean;
 /**
  * Experimental: capture System Audio via the CoreAudio Process Tap API
- * (macOS 14.4+) instead of ScreenCaptureKit. Avoids SCK's display
- * enumeration failures after sleep/wake, the GPU/compositor wake
- * overhead, and — most importantly — captures audio that's been
- * routed to a Bluetooth headset via HFP (which SCK can't see; see
- * Ruark Ferreira's 2026-04-24 Zoom call where AirPods-as-input
- * silently routed output away from the SCK-visible mixer).
+ * (macOS 14.4+) instead of ScreenCaptureKit. The tap sidesteps SCK's
+ * display-enumeration failures after sleep/wake and the GPU/compositor
+ * wake overhead, but it cannot see audio rendered through a
+ * VoiceProcessing AudioUnit (Zoom / Google Meet / Microsoft Teams all
+ * use one for echo cancellation), so on meeting audio it silently
+ * captures zeroed buffers even though tap creation succeeds.
  *
- * Default `true`: if tap creation fails for any reason (permission,
- * macOS <14.4, OS quirk), stream.rs falls back to the SCK path
- * automatically — so flipping the default on can't regress anyone.
- * Ignored on non-macOS platforms.
+ * Default `false` (see `default_experimental_coreaudio_system_audio`).
+ * SCK captures at the display compositor, which does see VoiceProcessing
+ * output, so it is the right default for anyone on calls. Users who hit
+ * SCK's sleep/wake display-enumeration bug can still opt in; when the tap
+ * is on and creation fails (permission, macOS <14.4, OS quirk), stream.rs
+ * falls back to the SCK path automatically. Ignored on non-macOS platforms.
  */
 experimentalCoreaudioSystemAudio?: boolean;
 /**

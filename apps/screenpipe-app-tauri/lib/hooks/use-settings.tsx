@@ -694,8 +694,8 @@ function createSettingsStore() {
 		// cancellation — so the tap silently captured zeroed buffers on every
 		// meeting. Users who explicitly want the tap (e.g. to dodge SCK's
 		// sleep/wake display-enumeration bug) can re-enable it in Settings.
-		// Reported by Ruark Ferreira on 2026-04-24 after his v2.4.46 calls
-		// kept dropping other participants.
+		// Reported on 2026-04-24 after v2.4.46 calls kept dropping
+		// other participants.
 		if (!(settings as any).coreaudioTapMigrationV2) {
 			settings.experimentalCoreaudioSystemAudio = false;
 			(settings as any).coreaudioTapMigrationV2 = true;
