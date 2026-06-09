@@ -3372,13 +3372,15 @@ impl DatabaseManager {
         .await
     }
 
-    /// Like [`search`](Self::search) but additionally restricts screen (OCR)
-    /// and audio results to captures carrying ALL of the given `tags`. An
-    /// empty `tags` slice behaves exactly like `search`.
+    /// Like [`search`](Self::search) but additionally restricts results to
+    /// items carrying ALL of the given `tags`. An empty `tags` slice behaves
+    /// exactly like `search`.
     ///
-    /// Tags are backed by the `vision_tags` / `audio_tags` junction tables,
-    /// so content types without tag tables (input, accessibility, memory)
-    /// return nothing when a tag filter is active rather than ignoring it.
+    /// Tags span three stores under one string namespace: the
+    /// `vision_tags` / `audio_tags` junction tables (screen + audio) and the
+    /// `memories.tags` JSON array (content_type=memory). Content types with no
+    /// tags (input, accessibility) return nothing when a tag filter is active
+    /// rather than ignoring it.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_with_tags(
         &self,
@@ -3413,15 +3415,11 @@ impl DatabaseManager {
             content_type = ContentType::OCR;
         }
 
-        // Tag filtering is backed by the vision_tags / audio_tags junction
-        // tables, which only cover screen frames and audio. Content types
-        // with no tag table can never satisfy a tag filter, so short-circuit
-        // them to empty rather than silently returning unfiltered rows.
+        // Input events and accessibility-only hits have no tag table, so a
+        // tag filter can never match them — short-circuit to empty. Screen
+        // (OCR), audio, and memories all carry tags and are filtered below.
         if !tags.is_empty()
-            && matches!(
-                content_type,
-                ContentType::Input | ContentType::Memory | ContentType::Accessibility
-            )
+            && matches!(content_type, ContentType::Input | ContentType::Accessibility)
         {
             return Ok(results);
         }
@@ -3676,6 +3674,7 @@ impl DatabaseManager {
                         offset,
                         None,
                         None,
+                        tags,
                     )
                     .await?;
                 results.extend(memory_results.into_iter().map(SearchResult::Memory));
@@ -4659,13 +4658,11 @@ impl DatabaseManager {
             content_type = ContentType::OCR;
         }
 
-        // Mirror `search_with_tags`: content types with no tag table can't
-        // satisfy a tag filter, so their count is zero.
+        // Mirror `search_with_tags`: input and accessibility have no tag
+        // table, so their tag-filtered count is zero. Memory is counted with
+        // its own tag filter below.
         if !tags.is_empty()
-            && matches!(
-                content_type,
-                ContentType::Input | ContentType::Memory | ContentType::Accessibility
-            )
+            && matches!(content_type, ContentType::Input | ContentType::Accessibility)
         {
             return Ok(0);
         }
@@ -4927,6 +4924,7 @@ impl DatabaseManager {
                         None,
                         start_str.as_deref(),
                         end_str.as_deref(),
+                        tags,
                     )
                     .await?;
                 return Ok(count as usize);
@@ -10333,6 +10331,7 @@ LIMIT ? OFFSET ?
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_memories(
         &self,
         query: Option<&str>,
@@ -10345,8 +10344,16 @@ LIMIT ? OFFSET ?
         offset: u32,
         order_by: Option<&str>,
         order_dir: Option<&str>,
+        // Exact-match tag filter with AND semantics: a memory must carry ALL
+        // of these tags (matched against its JSON `tags` array). Empty slice =
+        // no filter. This is the unified tag interface shared with
+        // `search_with_tags` (vs `tags_filter`, a single fuzzy substring used
+        // by the public `GET /memories?tags=`).
+        tags_all: &[String],
     ) -> Result<Vec<MemoryRecord>, SqlxError> {
         let use_fts = query.is_some_and(|q| !q.is_empty());
+        let tags_col = if use_fts { "m.tags" } else { "tags" };
+        let tags_all_json = serde_json::to_string(tags_all).unwrap_or_else(|_| "[]".to_string());
 
         let mut sql = if use_fts {
             String::from(
@@ -10382,6 +10389,14 @@ LIMIT ? OFFSET ?
         if end_time.is_some() {
             sql.push_str(" AND created_at <= ?6");
         }
+        // Exact-match AND tag filter. The `json_array_length(?9) = 0` guard
+        // short-circuits (SQLite evaluates OR left-to-right) so non-tag
+        // callers pay nothing.
+        sql.push_str(&format!(
+            " AND (json_array_length(?9) = 0 OR \
+             (SELECT COUNT(DISTINCT je.value) FROM json_each({tags_col}) je \
+              WHERE je.value IN (SELECT value FROM json_each(?9))) = json_array_length(?9))"
+        ));
 
         // Allow caller to control sort order; default to newest first
         let order_col = match order_by {
@@ -10408,10 +10423,12 @@ LIMIT ? OFFSET ?
             .bind(end_time)
             .bind(limit)
             .bind(offset)
+            .bind(&tags_all_json)
             .fetch_all(&self.pool)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn count_memories(
         &self,
         query: Option<&str>,
@@ -10420,8 +10437,13 @@ LIMIT ? OFFSET ?
         min_importance: Option<f64>,
         start_time: Option<&str>,
         end_time: Option<&str>,
+        // Exact-match AND tag filter; mirror of `list_memories`'s `tags_all`
+        // so a counted total matches a tag-filtered memory search.
+        tags_all: &[String],
     ) -> Result<i64, SqlxError> {
         let use_fts = query.is_some_and(|q| !q.is_empty());
+        let tags_col = if use_fts { "m.tags" } else { "tags" };
+        let tags_all_json = serde_json::to_string(tags_all).unwrap_or_else(|_| "[]".to_string());
 
         let mut sql = if use_fts {
             String::from(
@@ -10451,6 +10473,11 @@ LIMIT ? OFFSET ?
         if end_time.is_some() {
             sql.push_str(" AND created_at <= ?6");
         }
+        sql.push_str(&format!(
+            " AND (json_array_length(?7) = 0 OR \
+             (SELECT COUNT(DISTINCT je.value) FROM json_each({tags_col}) je \
+              WHERE je.value IN (SELECT value FROM json_each(?7))) = json_array_length(?7))"
+        ));
 
         let fts_query = query.map(crate::text_normalizer::sanitize_fts5_query);
 
@@ -10461,6 +10488,7 @@ LIMIT ? OFFSET ?
             .bind(min_importance)
             .bind(start_time)
             .bind(end_time)
+            .bind(&tags_all_json)
             .fetch_one(&self.pool)
             .await
     }

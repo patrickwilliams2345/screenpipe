@@ -133,11 +133,12 @@ pub(crate) struct SearchQuery {
     /// off unless the caller will forward these results to an LLM.
     #[serde(default, deserialize_with = "deserialize_flexible_bool")]
     filter_pii: bool,
-    /// Restrict results to screen (OCR) and audio captures carrying ALL of
-    /// these tags. Comma-separated, e.g. `tags=person:ada,project:atlas`.
-    /// These are the junction-table tags written via `POST /tags/:type/:id`.
-    /// Content types with no tag table (input, accessibility, memory) return
-    /// nothing when a tag filter is set. Omit for no tag filtering.
+    /// Restrict results to items carrying ALL of these tags. Comma-separated,
+    /// e.g. `tags=person:ada,project:atlas`. Tags span one string namespace
+    /// across three stores: screen + audio (junction tags written via
+    /// `POST /tags/:type/:id`) and memories (their JSON `tags`, filtered when
+    /// `content_type=memory`). Input and accessibility have no tags and return
+    /// nothing when this is set. Omit for no tag filtering.
     #[serde(default, deserialize_with = "from_comma_separated_string_array")]
     tags: Option<Vec<String>>,
 }
