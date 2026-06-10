@@ -89,7 +89,7 @@ jobs:
       - name: Compress .app bundle
         working-directory: apps/screenpipe-app-tauri/src-tauri/target/aarch64-apple-darwin/release/bundle/macos
         run: |
-          zip -r "screenpipe-aarch64-apple-darwin.app.zip" "screenpipe.app"
+          zip -r "screenpipe-aarch64-apple-darwin.app.zip" *.app
 
       - name: Upload DMG Artifact
         uses: actions/upload-artifact@v4
