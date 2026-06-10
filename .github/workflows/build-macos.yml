@@ -18,21 +18,16 @@ env:
 
 jobs:
   build:
-    name: Build macOS App
-    runs-on: macos-latest  # Apple Silicon M-series runner
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
-        include:
-          - target: aarch64-apple-darwin
-            features: "metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml,official-build"
-          - target: x86_64-apple-darwin
-            features: "metal,redact-onnx-coreml,official-build"
-
+    name: Build macOS App (ARM64)
+    runs-on: macos-14  # Apple Silicon runner
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Select Xcode 15.4
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.4.app
+          xcodebuild -version
 
       - name: Install system dependencies
         shell: bash
@@ -55,17 +50,17 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ runner.os }}-rust-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
           cache-directories: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}
+            apps/screenpipe-app-tauri/src-tauri/target/aarch64-apple-darwin
 
       - name: Cache Binary Dependencies
         uses: actions/cache@v4
@@ -77,9 +72,9 @@ jobs:
             apps/screenpipe-app-tauri/src-tauri/ollama-*
             apps/screenpipe-app-tauri/src-tauri/lib/ollama
             apps/screenpipe-app-tauri/src-tauri/ui_monitor-*
-          key: macos-${{ matrix.target }}-bins-v1
+          key: macos-aarch64-apple-darwin-bins-v1
           restore-keys: |
-            macos-${{ matrix.target }}-bins-
+            macos-aarch64-apple-darwin-bins-
 
       - name: Install frontend dependencies
         working-directory: apps/screenpipe-app-tauri
@@ -88,32 +83,32 @@ jobs:
       - name: Run pre-build script
         working-directory: apps/screenpipe-app-tauri
         env:
-          SCREENPIPE_RELEASE_TARGET: ${{ matrix.target }}
+          SCREENPIPE_RELEASE_TARGET: aarch64-apple-darwin
         run: bun scripts/pre_build.js
 
       - name: Build Tauri application
         working-directory: apps/screenpipe-app-tauri
         run: |
-          bun tauri build --target ${{ matrix.target }} --features "${{ matrix.features }}"
+          bun tauri build --target aarch64-apple-darwin --features "metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml,official-build"
 
       - name: Compress .app bundle
-        working-directory: apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos
+        working-directory: apps/screenpipe-app-tauri/src-tauri/target/aarch64-apple-darwin/release/bundle/macos
         run: |
-          zip -r "screenpipe-${{ matrix.target }}.app.zip" "screenpipe.app"
+          zip -r "screenpipe-aarch64-apple-darwin.app.zip" "screenpipe.app"
 
       - name: Upload DMG Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: screenpipe-macos-${{ matrix.target }}-dmg
-          path: apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          name: screenpipe-macos-arm64-dmg
+          path: apps/screenpipe-app-tauri/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
           retention-days: 7
 
       - name: Upload APP Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: screenpipe-macos-${{ matrix.target }}-app
-          path: apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/screenpipe-${{ matrix.target }}.app.zip
+          name: screenpipe-macos-arm64-app
+          path: apps/screenpipe-app-tauri/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/screenpipe-aarch64-apple-darwin.app.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -122,5 +117,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ github.event.release.tag_name }} apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg --clobber
-          gh release upload ${{ github.event.release.tag_name }} apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/macos/screenpipe-${{ matrix.target }}.app.zip --clobber
+          gh release upload ${{ github.event.release.tag_name }} apps/screenpipe-app-tauri/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg --clobber
+          gh release upload ${{ github.event.release.tag_name }} apps/screenpipe-app-tauri/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/screenpipe-aarch64-apple-darwin.app.zip --clobber
