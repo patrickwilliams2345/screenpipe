@@ -89,7 +89,7 @@ jobs:
       - name: Build Tauri application
         working-directory: apps/screenpipe-app-tauri
         run: |
-          bun tauri build --target aarch64-apple-darwin --features "metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml,official-build"
+          bun tauri build --target aarch64-apple-darwin --features "metal,redact-onnx-coreml,official-build"
 
       - name: Compress .app bundle
         working-directory: apps/screenpipe-app-tauri/src-tauri/target/aarch64-apple-darwin/release/bundle/macos
