@@ -541,9 +541,18 @@ mod tests {
             "third".to_string(),
         ];
 
-        assert_eq!(registry.pick_preset_with_floor(&presets, 0), Some(("primary", 0)));
-        assert_eq!(registry.pick_preset_with_floor(&presets, 1), Some(("fallback", 1)));
-        assert_eq!(registry.pick_preset_with_floor(&presets, 2), Some(("third", 2)));
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 0),
+            Some(("primary", 0))
+        );
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 1),
+            Some(("fallback", 1))
+        );
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 2),
+            Some(("third", 2))
+        );
     }
 
     #[test]
@@ -552,7 +561,10 @@ mod tests {
         let presets = vec!["primary".to_string(), "fallback".to_string()];
         // Floor beyond the last index clamps to the last preset rather than
         // returning None / panicking.
-        assert_eq!(registry.pick_preset_with_floor(&presets, 9), Some(("fallback", 1)));
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 9),
+            Some(("fallback", 1))
+        );
     }
 
     #[test]
@@ -566,8 +578,14 @@ mod tests {
         // Trip the fallback's breaker; from floor 1 it should be skipped to
         // "third", while floor 0 still returns the (closed) primary.
         registry.record_failure("fallback", Some("rate_limited"));
-        assert_eq!(registry.pick_preset_with_floor(&presets, 0), Some(("primary", 0)));
-        assert_eq!(registry.pick_preset_with_floor(&presets, 1), Some(("third", 2)));
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 0),
+            Some(("primary", 0))
+        );
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 1),
+            Some(("third", 2))
+        );
     }
 
     #[test]
