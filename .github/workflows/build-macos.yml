@@ -19,15 +19,10 @@ env:
 jobs:
   build:
     name: Build macOS App (ARM64)
-    runs-on: macos-14  # Apple Silicon runner
+    runs-on: macos-15  # macOS 15 Sequoia (includes Xcode 16 / Swift 6.0 by default)
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Select Xcode 15.4
-        run: |
-          sudo xcode-select -s /Applications/Xcode_15.4.app
-          xcodebuild -version
 
       - name: Install system dependencies
         shell: bash
