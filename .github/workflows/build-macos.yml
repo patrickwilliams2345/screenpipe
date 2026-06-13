@@ -24,6 +24,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Apply Paywall Bypass Patch
+        run: |
+          git apply bypass_paywall.patch
+
       - name: Install system dependencies
         shell: bash
         run: |
