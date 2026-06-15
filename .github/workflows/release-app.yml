@@ -970,6 +970,7 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
           CARGO_INCREMENTAL: "false"
           CARGO_PROFILE_RELEASE_STRIP: none
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
           CARGO_PROFILE_RELEASE_PANIC: unwind
           CARGO_PROFILE_RELEASE_INCREMENTAL: "true"
           # Fix linuxdeploy crash on AppImage bundling
@@ -1052,6 +1053,43 @@ jobs:
               cat /tmp/tauri-build-$attempt.log | tail -50
               exit 1
             fi
+          done
+
+      - name: Create macOS dSYM archive
+        if: matrix.os_type == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          MACOS_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle/macos"
+          SYMBOLS_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle/debug-symbols"
+          mkdir -p "$SYMBOLS_DIR"
+
+          shopt -s nullglob
+          apps=( "${MACOS_DIR}"/*.app )
+          if [ ${#apps[@]} -eq 0 ]; then
+            echo "::error::no .app bundle in ${MACOS_DIR}"
+            exit 1
+          fi
+
+          for app in "${apps[@]}"; do
+            app_name="$(basename "$app" .app)"
+            executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app}/Contents/Info.plist")"
+            binary="${app}/Contents/MacOS/${executable}"
+            if [ ! -x "$binary" ]; then
+              echo "::error::expected executable missing: ${binary}"
+              exit 1
+            fi
+
+            safe_app_name="${app_name// /-}"
+            dsym="${SYMBOLS_DIR}/${safe_app_name}-${TARGET}.dSYM"
+            zip_path="${SYMBOLS_DIR}/${safe_app_name}-${TARGET}.dSYM.zip"
+            rm -rf "$dsym" "$zip_path"
+            xcrun dsymutil "$binary" -o "$dsym"
+            xcrun dwarfdump --uuid "$binary"
+            xcrun dwarfdump --uuid "$dsym"
+            ( cd "$SYMBOLS_DIR" && zip -qry "$(basename "$zip_path")" "$(basename "$dsym")" )
+            echo "created ${zip_path}"
           done
 
       - name: Verify codesign on .app (macOS)
@@ -1543,6 +1581,15 @@ jobs:
             exit 1
           fi
           echo "R2 upload complete for ${TARGET}"
+
+      - name: Upload macOS dSYM artifact
+        if: matrix.os_type == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenpipe-${{ matrix.target }}-dsym
+          path: apps/screenpipe-app-tauri/src-tauri/target/${{ matrix.target }}/release/bundle/debug-symbols/*.dSYM.zip
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload to Cloudflare R2 (Windows)
         if: matrix.os_type == 'windows'
