@@ -7,8 +7,9 @@ env:
   CARGO_PROFILE_DEV_CODEGEN_UNITS: "16"
 
 on:
-  # disabled in fork — upstream E2E broken; re-enable when upstream fixes Brain section tests
-    branches: [main]
+  # Disabled in fork — upstream E2E broken (Brain section tests fail across all platforms).
+  # Re-enable when upstream mediar-ai/screenpipe fixes the Brain section E2E tests.
+  # Original triggers: push/pull_request on branches: [main]
   workflow_dispatch:
 
 concurrency:
