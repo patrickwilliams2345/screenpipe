@@ -8,17 +8,10 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: tgymnich/fork-sync@v2.0
         with:
-          fetch-depth: 0
-
-      - name: Sync upstream
-        uses: repo-sync/github-actions@v1
-        with:
-          upstream_branch: main
-          head_branch: main
           token: ${{ secrets.PAT }}
+          owner: screenpipe
+          base: main
+          head: main
