@@ -524,9 +524,12 @@ async fn main() {
             })
         })
     };
+    // CI / automation (GitHub Actions, etc.) always wins over the settings
+    // opt-in so the desktop-app e2e suite never reaches Sentry/PostHog.
     let telemetry_disabled = store_bool("analyticsEnabled")
         .map(|enabled| !enabled)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || screenpipe_engine::analytics::telemetry_disabled_by_env();
     let _posthog_disabled = telemetry_disabled;
 
     let app_version = env!("CARGO_PKG_VERSION");
