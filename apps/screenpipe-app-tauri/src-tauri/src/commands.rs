@@ -76,6 +76,16 @@ fn native_notif_action_callback_inner(json_ptr: *const std::os::raw::c_char) {
         .as_ref()
         .and_then(|v| v.get("type"))
         .and_then(|v| v.as_str());
+    crate::events::emit_notification_action(
+        app,
+        crate::events::NotificationActionEvent {
+            action_type: action_type.map(str::to_string),
+            raw_json: json.clone(),
+            payload: parsed
+                .clone()
+                .unwrap_or_else(|| serde_json::Value::String(json.clone())),
+        },
+    );
 
     // "manage" — open the Home window to notifications settings. Handled in
     // Rust rather than via JS emit so it works even when no React window is
@@ -753,27 +763,35 @@ pub fn get_enterprise_team_api_token() -> Option<String> {
         .map(String::from)
 }
 
-/// Read the user's screenpipe cloud session JWT from `~/.screenpipe/
-/// auth.json`. Returns None when the file is missing, malformed, or the
-/// token field is empty.
+/// Read the user's screenpipe cloud session JWT.
 ///
-/// The settings store (`store.bin → user.token`) is the canonical
-/// runtime cache for this token but is only populated after a fresh
-/// in-app sign-in. `auth.json` is the durable on-disk copy written by
-/// the pi-agent configuration flow — it survives store resets and dev-
-/// mode launches where the in-memory user object hasn't been hydrated
-/// yet. Used by the enterprise-policy hook to send the Bearer header
-/// even when the in-app user object is still null.
+/// #3943: the authoritative copy lives in the encrypted secret store and is
+/// mirrored into an in-process cache at startup and on every
+/// `set_cloud_token`; that cache is served first. The legacy plaintext
+/// `~/.screenpipe/auth.json` (the CLI credential file) remains as a fallback
+/// for installs that have not migrated yet; sign-out removes it. Returns
+/// None when signed out. Used by the settings hydration and the
+/// enterprise-policy hook to send the Bearer header even when the in-app
+/// user object is still null.
 #[tauri::command]
 #[specta::specta]
 pub fn get_cloud_token() -> Option<String> {
+    // #3943: the authoritative token now lives in the encrypted secret store and
+    // is mirrored into an in-process cache at startup + on every `set_cloud_token`.
+    // Prefer that; fall back to the legacy `auth.json` for installs that haven't
+    // migrated yet (and for the pi-agent config flow that still writes it).
+    if let Some(token) = crate::auth_token::cached_cloud_token() {
+        return Some(token);
+    }
     let path = screenpipe_core::paths::default_screenpipe_data_dir().join("auth.json");
     let raw = std::fs::read_to_string(&path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
     parsed
         .get("token")
         .and_then(|t| t.as_str())
-        .filter(|s| !s.is_empty())
+        // The same file historically held the LOCAL api key (`sp-<uuid8>`,
+        // engine auth_key.rs) — never serve a non-JWT value as a cloud login.
+        .filter(|s| crate::auth_token::looks_like_jwt(s))
         .map(String::from)
 }
 
@@ -801,7 +819,31 @@ pub async fn set_cloud_token(
     state: tauri::State<'_, crate::recording::RecordingState>,
 ) -> Result<(), String> {
     let normalized = token.filter(|t| !t.is_empty());
-    state.cloud_token.store(std::sync::Arc::new(normalized));
+    let should_clear_pi_auth = normalized.is_none();
+    // Unblock cloud calls for THIS session first — the ArcSwap + cache are the
+    // runtime source of truth, so a failed durable write below never breaks an
+    // active sign-in.
+    state
+        .cloud_token
+        .store(std::sync::Arc::new(normalized.clone()));
+
+    // Sign-out: scrub the screenpipe token from pi's auth files before the
+    // fallible secret-store write so the on-disk copies never outlive the
+    // session even if persistence below fails.
+    if should_clear_pi_auth {
+        if let Err(e) = crate::pi::clear_screenpipe_auth_token_files() {
+            warn!("failed to clear pi screenpipe auth token: {}", e);
+        }
+    }
+
+    // #3943: persist to the encrypted secret store (authoritative at-rest copy)
+    // and refresh the in-process cache. We surface a persistence failure as an
+    // Err so the frontend won't strip the last plaintext copy of a token it
+    // couldn't durably save (the caller ignores the Result for session purposes;
+    // only the save-and-strip path checks it).
+    crate::auth_token::store_cloud_token(normalized.as_deref())
+        .await
+        .map_err(|e| format!("failed to persist cloud token to secret store: {e}"))?;
     Ok(())
 }
 
@@ -864,30 +906,147 @@ pub fn save_enterprise_team_config(
 #[tauri::command]
 #[specta::specta]
 pub fn write_browser_log(level: String, message: String) {
-    match level.as_str() {
-        "error" => error!("[webview] {}", message),
-        "warn" => warn!("[webview] {}", message),
-        "debug" => debug!("[webview] {}", message),
-        _ => info!("[webview] {}", message),
-    }
+    write_browser_log_entry(BrowserLogEntry {
+        level,
+        message,
+        window_label: None,
+        route: None,
+        session_id: None,
+        job_id: None,
+        conversation_id: None,
+        stack: None,
+        timestamp_ms: None,
+    });
 }
 
-#[derive(serde::Deserialize, specta::Type)]
+#[derive(Debug, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct BrowserLogEntry {
     pub level: String,
     pub message: String,
+    pub window_label: Option<String>,
+    pub route: Option<String>,
+    pub session_id: Option<String>,
+    pub job_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub stack: Option<String>,
+    pub timestamp_ms: Option<f64>,
 }
 
 #[tauri::command]
 #[specta::specta]
 pub fn write_browser_logs(entries: Vec<BrowserLogEntry>) {
-    for entry in entries {
-        match entry.level.as_str() {
-            "error" => error!("[webview] {}", entry.message),
-            "warn" => warn!("[webview] {}", entry.message),
-            "debug" => debug!("[webview] {}", entry.message),
-            _ => info!("[webview] {}", entry.message),
-        }
+    for entry in entries.into_iter().take(200) {
+        write_browser_log_entry(entry);
+    }
+}
+
+fn truncate_browser_log_field(value: String, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    out.push_str("... [truncated]");
+    out
+}
+
+fn write_browser_log_entry(mut entry: BrowserLogEntry) {
+    entry.message = truncate_browser_log_field(entry.message, 16_000);
+    entry.stack = entry
+        .stack
+        .map(|stack| truncate_browser_log_field(stack, 16_000));
+
+    match entry.level.as_str() {
+        "error" => error!(
+            target: "screenpipe::browser",
+            window_label = ?entry.window_label,
+            route = ?entry.route,
+            session_id = ?entry.session_id,
+            job_id = ?entry.job_id,
+            conversation_id = ?entry.conversation_id,
+            stack = ?entry.stack,
+            timestamp_ms = ?entry.timestamp_ms,
+            "[webview] {}",
+            entry.message
+        ),
+        "warn" => warn!(
+            target: "screenpipe::browser",
+            window_label = ?entry.window_label,
+            route = ?entry.route,
+            session_id = ?entry.session_id,
+            job_id = ?entry.job_id,
+            conversation_id = ?entry.conversation_id,
+            stack = ?entry.stack,
+            timestamp_ms = ?entry.timestamp_ms,
+            "[webview] {}",
+            entry.message
+        ),
+        "debug" => debug!(
+            target: "screenpipe::browser",
+            window_label = ?entry.window_label,
+            route = ?entry.route,
+            session_id = ?entry.session_id,
+            job_id = ?entry.job_id,
+            conversation_id = ?entry.conversation_id,
+            stack = ?entry.stack,
+            timestamp_ms = ?entry.timestamp_ms,
+            "[webview] {}",
+            entry.message
+        ),
+        _ => info!(
+            target: "screenpipe::browser",
+            window_label = ?entry.window_label,
+            route = ?entry.route,
+            session_id = ?entry.session_id,
+            job_id = ?entry.job_id,
+            conversation_id = ?entry.conversation_id,
+            stack = ?entry.stack,
+            timestamp_ms = ?entry.timestamp_ms,
+            "[webview] {}",
+            entry.message
+        ),
+    }
+}
+
+#[cfg(test)]
+mod browser_log_tests {
+    use super::BrowserLogEntry;
+
+    #[test]
+    fn browser_log_entry_accepts_legacy_shape() {
+        let entry: BrowserLogEntry =
+            serde_json::from_value(serde_json::json!({ "level": "info", "message": "hello" }))
+                .unwrap();
+
+        assert_eq!(entry.level, "info");
+        assert_eq!(entry.message, "hello");
+        assert!(entry.window_label.is_none());
+        assert!(entry.route.is_none());
+        assert!(entry.job_id.is_none());
+    }
+
+    #[test]
+    fn browser_log_entry_accepts_context_shape() {
+        let entry: BrowserLogEntry = serde_json::from_value(serde_json::json!({
+            "level": "error",
+            "message": "failed",
+            "windowLabel": "main",
+            "route": "/home",
+            "sessionId": "s1",
+            "jobId": "j1",
+            "conversationId": "c1",
+            "stack": "stack",
+            "timestampMs": 123.0
+        }))
+        .unwrap();
+
+        assert_eq!(entry.window_label.as_deref(), Some("main"));
+        assert_eq!(entry.route.as_deref(), Some("/home"));
+        assert_eq!(entry.session_id.as_deref(), Some("s1"));
+        assert_eq!(entry.job_id.as_deref(), Some("j1"));
+        assert_eq!(entry.conversation_id.as_deref(), Some("c1"));
+        assert_eq!(entry.stack.as_deref(), Some("stack"));
+        assert_eq!(entry.timestamp_ms, Some(123.0));
     }
 }
 
@@ -1467,11 +1626,26 @@ pub async fn get_disk_usage(
     }
 }
 
-/// Open the screenpi.pe login page.
-/// On Windows, opens in the system browser (WebView2 has issues with some auth
-/// providers; the registered deep-link scheme handles the redirect back).
-/// On macOS/Linux, uses an in-app WebView that intercepts the screenpipe://
-/// deep-link redirect (Safari blocks custom-scheme redirects).
+const LOGIN_URL: &str = "https://screenpipe.com/login";
+
+/// The custom URL scheme this build registers for deep links. The enterprise
+/// build uses a distinct scheme so it does not collide with the consumer app's
+/// `screenpipe://` on machines that have both installed (see #3890). Login
+/// URLs pass a `return_scheme` query param so the website can redirect back
+/// to the right build; until the website supports the param it is ignored and
+/// redirects stay on `screenpipe://`, matching the consumer path.
+pub fn deep_link_scheme() -> &'static str {
+    if cfg!(feature = "enterprise-build") {
+        "screenpipe-enterprise"
+    } else {
+        "screenpipe"
+    }
+}
+
+/// Open the screenpipe.com login page.
+/// Windows: system browser + registered deep-link scheme handles the redirect.
+/// macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
+/// Linux: in-app WebView that intercepts the screenpipe:// redirect.
 #[tauri::command]
 #[specta::specta]
 pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), String> {
@@ -1482,13 +1656,44 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
         use tauri_plugin_opener::OpenerExt;
         app_handle
             .opener()
-            .open_url("https://screenpipe.com/login", None::<&str>)
+            .open_url(
+                format!("{}?return_scheme={}", LOGIN_URL, deep_link_scheme()),
+                None::<&str>,
+            )
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
 
-    // macOS / Linux: in-app WebView to intercept the deep-link redirect
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        // ASWebAuthenticationSession intercepts the redirect itself (no OS
+        // scheme routing), so the consumer `screenpipe` scheme cannot collide
+        // with another installed build here (#3890) and stays correct until
+        // the website honours `return_scheme`.
+        let callback_url = match crate::auth_session::start_session(
+            LOGIN_URL.to_string(),
+            "screenpipe".to_string(),
+            false,
+        )
+        .await
+        {
+            Ok(url) => url,
+            Err(e) if e == "user_cancelled" => {
+                info!("login auth session cancelled");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
+        info!("login auth session completed, forwarding callback");
+        app_handle
+            .emit("deep-link-received", callback_url)
+            .map_err(|e| e.to_string())?;
+
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
     {
         use tauri::{WebviewUrl, WebviewWindowBuilder};
 
@@ -1503,30 +1708,20 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
 
         let app_for_nav = app_handle.clone();
 
-        const LOGIN_URL: &str = "https://screenpipe.com/login";
+        let login_url = format!("{}?return_scheme={}", LOGIN_URL, deep_link_scheme());
         let mut builder = WebviewWindowBuilder::new(
             &app_handle,
             label,
-            WebviewUrl::External(LOGIN_URL.parse().unwrap()),
+            WebviewUrl::External(login_url.parse().unwrap()),
         )
         .title("sign in to screenpipe")
         .inner_size(460.0, 700.0)
         .focused(true);
 
-        // Hide the title text on macOS — traffic lights stay, title bar
-        // stays opaque (no Overlay style), so the remote login page isn't
-        // covered by the bar. Same pattern used elsewhere in window/show.rs.
-        #[cfg(target_os = "macos")]
-        {
-            builder = builder.hidden_title(true);
-        }
-
         builder = builder.on_navigation(move |url| {
-            if url.scheme() == "screenpipe" {
-                info!("login window intercepted deep link: {}", url);
+            if url.scheme() == deep_link_scheme() {
+                info!("login window intercepted deep link callback");
                 let _ = app_for_nav.emit("deep-link-received", url.to_string());
-                // Close the login window after a short delay to avoid
-                // closing before the event is delivered
                 if let Some(w) = app_for_nav.get_webview_window("login-browser") {
                     let _ = w.close();
                 }
@@ -1539,7 +1734,7 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
             .build()
             .map(crate::window::finalize_webview_window)
             .map_err(|e| {
-                log_webview_build_failure(label, LOGIN_URL, &e);
+                log_webview_build_failure(label, &login_url, &e);
                 e.to_string()
             })?;
 
@@ -1583,7 +1778,7 @@ pub async fn open_google_calendar_auth_window(
     }
 
     builder = builder.on_navigation(move |url| {
-        if url.scheme() == "screenpipe" {
+        if url.scheme() == deep_link_scheme() {
             info!("google calendar auth window intercepted deep link: {}", url);
             let _ = app_for_nav.emit("deep-link-received", url.to_string());
             if let Some(w) = app_for_nav.get_webview_window("google-calendar-auth") {
@@ -1706,7 +1901,8 @@ pub async fn set_window_always_on_top_native(
                 if let raw_window_handle::RawWindowHandle::AppKit(appkit_handle) = handle.as_raw() {
                     use objc::{msg_send, sel, sel_impl};
                     let ns_view = appkit_handle.ns_view.as_ptr() as *mut objc::runtime::Object;
-                    let ns_window: *mut objc::runtime::Object = unsafe { msg_send![ns_view, window] };
+                    let ns_window: *mut objc::runtime::Object =
+                        unsafe { msg_send![ns_view, window] };
                     if !ns_window.is_null() {
                         // NSNormalWindowLevel = 0. NSFloatingWindowLevel = 3.
                         // Floating keeps recovery/onboarding above normal app
@@ -2059,19 +2255,20 @@ pub async fn enable_keychain_encryption() -> Result<KeychainStatus, String> {
     }
 
     let db_path = data_dir.join("db.sqlite");
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    if let Ok(pool) = sqlx::SqlitePool::connect(&db_url).await {
-        if let Ok(store) = screenpipe_secrets::SecretStore::new(pool, Some(key)).await {
-            match store.reencrypt_unencrypted_secrets(&key).await {
-                Ok(count) if count > 0 => {
-                    tracing::info!("re-encrypted {} secrets after keychain opt-in", count);
-                }
-                Err(e) => {
-                    tracing::warn!("failed to re-encrypt secrets: {}", e);
-                }
-                _ => {}
+    // Shared, engine-matched pool (never an ad-hoc per-call connection — that
+    // churn corrupts db.sqlite, #4263).
+    if let Ok(store) =
+        screenpipe_secrets::SecretStore::open(&db_path.to_string_lossy(), Some(key)).await
+    {
+        match store.reencrypt_unencrypted_secrets(&key).await {
+            Ok(count) if count > 0 => {
+                tracing::info!("re-encrypted {} secrets after keychain opt-in", count);
             }
+            Err(e) => {
+                tracing::warn!("failed to re-encrypt secrets: {}", e);
+            }
+            _ => {}
         }
     }
 
@@ -2085,13 +2282,12 @@ pub async fn enable_keychain_encryption() -> Result<KeychainStatus, String> {
 pub async fn disable_keychain_encryption() -> Result<KeychainStatus, String> {
     let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
     let db_path = data_dir.join("db.sqlite");
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
     if db_path.exists() {
-        let pool = sqlx::SqlitePool::connect(&db_url).await.map_err(|e| {
-            format!("failed to open secret database before disabling encryption: {e}")
-        })?;
-        let plain_store = screenpipe_secrets::SecretStore::new(pool.clone(), None)
+        // Shared, engine-matched pool (never an ad-hoc per-call connection —
+        // that churn corrupts db.sqlite, #4263). The later encrypted-store open
+        // reuses this same cached pool.
+        let plain_store = screenpipe_secrets::SecretStore::open(&db_path.to_string_lossy(), None)
             .await
             .map_err(|e| format!("failed to open secret store: {e}"))?;
         let encrypted_count = plain_store
@@ -2119,9 +2315,10 @@ pub async fn disable_keychain_encryption() -> Result<KeychainStatus, String> {
                 }
             };
 
-            let encrypted_store = screenpipe_secrets::SecretStore::new(pool, Some(key))
-                .await
-                .map_err(|e| format!("failed to open encrypted secret store: {e}"))?;
+            let encrypted_store =
+                screenpipe_secrets::SecretStore::open(&db_path.to_string_lossy(), Some(key))
+                    .await
+                    .map_err(|e| format!("failed to open encrypted secret store: {e}"))?;
             match encrypted_store.decrypt_encrypted_secrets().await {
                 Ok(count) => {
                     tracing::info!("decrypted {} secrets before keychain opt-out", count);
@@ -2193,7 +2390,10 @@ fn shortcut_reminder_label(
     setting_key: &str,
     disabled_shortcuts: &[String],
 ) -> String {
-    if disabled_shortcuts.iter().any(|disabled| disabled == setting_key) {
+    if disabled_shortcuts
+        .iter()
+        .any(|disabled| disabled == setting_key)
+    {
         String::new()
     } else if value.trim().is_empty() {
         String::new()
@@ -3174,6 +3374,12 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<(), String> {
 #[tauri::command]
 #[specta::specta]
 pub async fn open_note_path(path: String) -> Result<(), String> {
+    // Citations from the pi agent can be relative (e.g. `.pi/skills/…`); resolve
+    // to the real file so "open in default app" doesn't hand a dangling path to
+    // LaunchServices / Obsidian.
+    let path = crate::viewer::resolve_local_path(&path)
+        .to_string_lossy()
+        .into_owned();
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
@@ -3276,7 +3482,6 @@ pub struct CacheFile {
 #[specta::specta]
 pub async fn list_cache_files() -> Result<Vec<CacheFile>, String> {
     let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
-    let home_dir = dirs::home_dir().ok_or("no home directory")?;
     let mut files = Vec::new();
 
     // Pi agent node_modules (~/.screenpipe/pi-agent/)
@@ -3290,13 +3495,16 @@ pub async fn list_cache_files() -> Result<Vec<CacheFile>, String> {
         });
     }
 
-    // Pi config (~/.pi/agent/)
-    let pi_config = home_dir.join(".pi").join("agent");
+    // Pi config (~/.screenpipe/pi-config/). Never list the user's global
+    // ~/.pi/agent here — that belongs to their standalone pi install and
+    // offering to delete it risked destroying the user's own setup
+    // (https://github.com/screenpipe/screenpipe/issues/4002).
+    let pi_config = data_dir.join("pi-config");
     if pi_config.exists() {
         let size = dir_size(&pi_config);
         files.push(CacheFile {
             path: pi_config.to_string_lossy().to_string(),
-            label: "AI agent config (.pi/agent)".to_string(),
+            label: "AI agent config (pi-config)".to_string(),
             size_bytes: size,
         });
     }

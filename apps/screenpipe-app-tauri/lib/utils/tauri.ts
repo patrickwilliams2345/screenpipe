@@ -375,6 +375,23 @@ async e2eMainOverlayVisible() : Promise<boolean> {
     return await TAURI_INVOKE("e2e_main_overlay_visible");
 },
 /**
+ * E2E-only: detach and close the owned-browser child webview, resetting the
+ * singleton to its "no child attached" state. Lets
+ * `zzz-owned-browser-headless.spec.ts` establish a deterministic baseline so it
+ * can prove that a *fresh* background (headless) eval actually creates a
+ * working webview — not merely reuse one a prior spec left attached. Mirrors
+ * `e2e_owned_browser_visible`'s gating: a no-op in production binaries, only
+ * active under the `e2e` feature.
+ */
+async e2eOwnedBrowserDetach() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("e2e_owned_browser_detach") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * E2E-only probe: whether the owned-browser native webview is currently shown.
  * Mirrors `e2e_main_overlay_visible` — internal visibility state stays hidden
  * in production binaries and is only exposed under the `e2e` feature. Used by
@@ -436,6 +453,19 @@ async ensureWebviewFocus() : Promise<Result<null, string>> {
 async exportRecording(meetingId: number | null, start: string | null, end: string | null, outputPath: string) : Promise<Result<MeetingExportSummary, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("export_recording", { meetingId, start, end, outputPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Return the curated catalog, each entry flagged `imported` against the store.
+ * Prefers the remote catalog so it can grow without an app release, but never
+ * fails the panel — any hiccup falls back to the bundled copy.
+ */
+async fetchSkillsRegistry() : Promise<Result<RegistrySkill[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_skills_registry") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -514,17 +544,16 @@ async getCachedSuggestions() : Promise<Result<CachedSuggestions, string>> {
 }
 },
 /**
- * Read the user's screenpipe cloud session JWT from `~/.screenpipe/
- * auth.json`. Returns None when the file is missing, malformed, or the
- * token field is empty.
+ * Read the user's screenpipe cloud session JWT.
  *
- * The settings store (`store.bin → user.token`) is the canonical
- * runtime cache for this token but is only populated after a fresh
- * in-app sign-in. `auth.json` is the durable on-disk copy written by
- * the pi-agent configuration flow — it survives store resets and dev-
- * mode launches where the in-memory user object hasn't been hydrated
- * yet. Used by the enterprise-policy hook to send the Bearer header
- * even when the in-app user object is still null.
+ * #3943: the authoritative copy lives in the encrypted secret store and is
+ * mirrored into an in-process cache at startup and on every
+ * `set_cloud_token`; that cache is served first. The legacy plaintext
+ * `~/.screenpipe/auth.json` (the CLI credential file) remains as a fallback
+ * for installs that have not migrated yet; sign-out removes it. Returns
+ * None when signed out. Used by the settings hydration and the
+ * enterprise-policy hook to send the Bearer header even when the in-app
+ * user object is still null.
  */
 async getCloudToken() : Promise<string | null> {
     return await TAURI_INVOKE("get_cloud_token");
@@ -766,6 +795,19 @@ async initSync(password: string) : Promise<Result<boolean, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Install a catalog skill: download its folder into a staging dir, then swap it
+ * into the store atomically so a failed download never leaves a half-written
+ * skill behind. Re-installing the same name refreshes it.
+ */
+async installRegistrySkill(repo: string, gitRef: string, path: string, name: string) : Promise<Result<ImportedSkill, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_registry_skill", { repo, gitRef, path, name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
 },
@@ -914,9 +956,9 @@ async oauthCancel(integrationId: string) : Promise<Result<null, string>> {
  * `integration_id` must match the integration's `def().id`.
  * `instance` is an optional name for multi-account support (e.g. email address).
  */
-async oauthConnect(integrationId: string, instance: string | null) : Promise<Result<OAuthStatus, string>> {
+async oauthConnect(integrationId: string, instance: string | null, variant: string | null) : Promise<Result<OAuthStatus, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("oauth_connect", { integrationId, instance }) };
+    return { status: "ok", data: await TAURI_INVOKE("oauth_connect", { integrationId, instance, variant }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -969,11 +1011,10 @@ async openGoogleCalendarAuthWindow(authUrl: string) : Promise<Result<null, strin
 }
 },
 /**
- * Open the screenpi.pe login page.
- * On Windows, opens in the system browser (WebView2 has issues with some auth
- * providers; the registered deep-link scheme handles the redirect back).
- * On macOS/Linux, uses an in-app WebView that intercepts the screenpipe://
- * deep-link redirect (Safari blocks custom-scheme redirects).
+ * Open the screenpipe.com login page.
+ * Windows: system browser + registered deep-link scheme handles the redirect.
+ * macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
+ * Linux: in-app WebView that intercepts the screenpipe:// redirect.
  */
 async openLoginWindow() : Promise<Result<null, string>> {
     try {
@@ -1059,14 +1100,17 @@ async ownedBrowserHide() : Promise<Result<null, string>> {
 }
 },
 /**
- * Navigate the embedded webview to `url`. Used by the sidebar when restoring
- * per-chat state or on user reload — i.e. always an action of the chat that's
- * on screen, so it carries no owner (`None`) and the frontend always honors
- * it. The agent/pipe path is the connect-trait `navigate` (owner-tagged).
+ * Navigate the embedded webview to `url`.
+ *
+ * Frontend restore/reload calls pass the foreground conversation id as
+ * `owner`, so the entire browser lifecycle stays scoped to that chat. Retry
+ * paths that are continuing a pipe/chat-owned navigation (for example after an
+ * extension or cookie-consent flow) can pass the original `owner` through so
+ * the follow-up navigate does not look like a fresh restore in every chat.
  */
-async ownedBrowserNavigate(url: string) : Promise<Result<null, string>> {
+async ownedBrowserNavigate(url: string, owner: string | null, reveal: boolean | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("owned_browser_navigate", { url }) };
+    return { status: "ok", data: await TAURI_INVOKE("owned_browser_navigate", { url, owner, reveal }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1152,6 +1196,14 @@ async piCheck() : Promise<Result<PiCheckResult, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async piGetThinkingLevel() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_get_thinking_level") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Get Pi info
  */
@@ -1226,6 +1278,14 @@ async piQueuePrompt(sessionId: string | null, message: string, images: PiImageCo
     else return { status: "error", error: e  as any };
 }
 },
+async piRequestState(sessionId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_request_state", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Hot-swap Pi's active model without killing the subprocess. Preserves the
  * full conversation state in-place — the user can switch haiku ↔ sonnet ↔ opus
@@ -1240,6 +1300,14 @@ async piQueuePrompt(sessionId: string | null, message: string, images: PiImageCo
 async piSetModel(sessionId: string | null, providerConfig: PiProviderConfig) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("pi_set_model", { sessionId, providerConfig }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async piSetThinkingLevel(sessionId: string | null, level: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_set_thinking_level", { sessionId, level }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1581,6 +1649,21 @@ async resizeSearchWindow(width: number, height: number) : Promise<Result<null, s
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Banner-click restart. plugin-process `relaunch()` fires
+ * `ExitRequested` which `main.rs` blocks unless `QUIT_REQUESTED` is set —
+ * banner never set it, so the exit was silently cancelled and the button
+ * hung on "restarting…". Mirror the auto-update path: gate, stop server,
+ * set `QUIT_REQUESTED`, then `app.restart()`. See 2026-06-10 report.
+ */
+async restartForUpdate(timeoutSecs: number | null) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restart_for_update", { timeoutSecs }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async resumeGlobalShortcuts() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("resume_global_shortcuts") };
@@ -1785,6 +1868,14 @@ async setEnhancedAiSuggestions(enabled: boolean, token: string) : Promise<Result
 async setEnterprisePolicy(hiddenSections: string[]) : Promise<void> {
     await TAURI_INVOKE("set_enterprise_policy", { hiddenSections });
 },
+async setKeepAwake(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_keep_awake", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async setNativeTheme(theme: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_native_theme", { theme }) };
@@ -1814,11 +1905,13 @@ async setSyncEnabled(enabled: boolean) : Promise<Result<null, string>> {
 },
 /**
  * Called by the frontend after fetching the `syncStreams` block from
- * `/api/enterprise/policy`. Flat booleans rather than a struct so the
- * specta-generated TS binding stays trivial.
+ * `/api/enterprise/policy`. Flat params rather than a struct so the
+ * specta-generated TS binding stays trivial. `frame_images` is the mode
+ * string ("off" | "cited" | "all"; legacy "true" accepted) — parsed
+ * fail-closed by FrameImagesMode::parse.
  */
-async setSyncStreams(frames: boolean, audio: boolean, uiEvents: boolean, memories: boolean, snapshots: boolean) : Promise<void> {
-    await TAURI_INVOKE("set_sync_streams", { frames, audio, uiEvents, memories, snapshots });
+async setSyncStreams(frames: boolean, audio: boolean, uiEvents: boolean, memories: boolean, snapshots: boolean, frameImages: string) : Promise<void> {
+    await TAURI_INVOKE("set_sync_streams", { frames, audio, uiEvents, memories, snapshots, frameImages });
 },
 async setTrayHealthIcon() : Promise<void> {
     await TAURI_INVOKE("set_tray_health_icon");
@@ -1936,6 +2029,17 @@ async spawnScreenpipe(overrideArgs: string[] | null) : Promise<Result<null, stri
 async startCapture() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("start_capture") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start an MP4 export in the background and return its job id immediately.
+ */
+async startExportRecording(meetingId: number | null, start: string | null, end: string | null, outputPath: string) : Promise<Result<StartExportRecordingResponse, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_export_recording", { meetingId, start, end, outputPath }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2153,7 +2257,7 @@ sinceEpochSecs: number }
  * Also includes whether the browser is currently running.
  */
 export type BrowserAutomationStatus = { name: string; status: string; running: boolean }
-export type BrowserLogEntry = { level: string; message: string }
+export type BrowserLogEntry = { level: string; message: string; windowLabel: string | null; route: string | null; sessionId: string | null; jobId: string | null; conversationId: string | null; stack: string | null; timestampMs: number | null }
 export type CacheFile = { path: string; label: string; size_bytes: number }
 export type CachedSuggestions = { suggestions: Suggestion[]; generatedAt: string; mode: string; aiGenerated: boolean; tags: string[] }
 export type CalendarEventItem = { id: string; title: string;
@@ -2216,8 +2320,11 @@ export type DiscoveredHost = { host: string; port: number; user: string | null; 
 alias?: string | null }
 export type E2eAgentStreamResult = { emitted_deltas: number; emit_ms: number }
 export type EmbeddedLLM = { enabled: boolean; model: string; port: number }
+export type EngineEvent = { name: string; data: JsonValue }
 export type EnterpriseInstallMetadata = { install_source: string; update_manager: string; managed: boolean; detected_by: string[] }
 export type ExcludedApp = { bundleId: string; name: string | null; icon: string | null }
+export type ExportEvent = { kind: "started"; jobId: string; request: ExportRequestInfo } | { kind: "completed"; jobId: string; request: ExportRequestInfo; summary: MeetingExportSummary } | { kind: "failed"; jobId: string; request: ExportRequestInfo; error: string }
+export type ExportRequestInfo = { meetingId: number | null; start: string | null; end: string | null; outputPath: string }
 export type HardwareCapability = { hasGpu: boolean; cpuCores: number; totalMemoryGb: number; recommendedEngine: string; reason: string }
 export type IcsCalendarEntry = { name: string; url: string; enabled: boolean }
 /**
@@ -2228,11 +2335,13 @@ export type ImportedSkill = { name: string; description: string;
  * Absolute path inside `<data_dir>/skills/`.
  */
 path: string }
+export type JobEvent = { kind: "started"; jobId: string; label: string; message: string | null } | { kind: "progress"; jobId: string; label: string; progress: number; message: string | null } | { kind: "completed"; jobId: string; label: string; outputPath: string | null; message: string | null } | { kind: "failed"; jobId: string; label: string; error: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue }
 export type KeychainStatus = { state: string }
 export type LogFile = { name: string; path: string; modified_at: number }
-export type MeetingExportSummary = { output_path: string; frame_count: number; audio_chunk_count: number; duration_secs: number; file_size_bytes: number }
+export type MeetingExportSummary = { job_id: string; output_path: string; frame_count: number; audio_chunk_count: number; duration_secs: number; file_size_bytes: number }
 export type MonitorDevice = { id: number; stableId: string; name: string; isDefault: boolean; width: number; height: number }
+export type NotificationActionEvent = { actionType: string | null; rawJson: string; payload: JsonValue }
 export type OAuthInstanceInfo = { instance: string | null; display_name: string | null }
 export type OAuthStatus = { connected: boolean; display_name: string | null;
 /**
@@ -2323,6 +2432,57 @@ preview: string;
 queuedAtMs: number }
 export type PipeSuggestionsSettings = { enabled: boolean; frequencyHours: number }
 /**
+ * A skill offered by the curated registry. Installing one downloads its folder
+ * (the directory containing `SKILL.md`) from a public GitHub repo into the
+ * store, reusing the same store the device/folder importers write to.
+ */
+export type RegistrySkill = {
+/**
+ * Display name.
+ */
+name: string;
+/**
+ * One-line summary.
+ */
+description?: string;
+/**
+ * `owner/repo` on GitHub the skill folder lives in.
+ */
+repo: string;
+/**
+ * Git ref (branch / tag / commit) the download is pinned to.
+ */
+git_ref?: string;
+/**
+ * Path of the folder that directly contains `SKILL.md`, e.g. `skills/pdf`.
+ */
+path: string;
+/**
+ * Provenance for the badge: `anthropic` | `openai` | `screenpipe` | `community`.
+ */
+source?: string;
+/**
+ * Optional link to browse the skill's source.
+ */
+repo_url?: string | null;
+/**
+ * Optional docs / homepage link.
+ */
+homepage?: string | null;
+/**
+ * App-name keywords this skill is relevant to — used to rank skills the
+ * user is more likely to want first, against their recent app usage.
+ */
+apps?: string[];
+/**
+ * Curated "recommended" flag — surfaced first before any usage signal.
+ */
+featured?: boolean;
+/**
+ * True when a skill of the same normalized name is already in the store.
+ */
+imported?: boolean }
+/**
  * Configuration for remote sync.
  */
 export type RemoteSyncConfig = { host: string; port: number; user: string; key_path: string; remote_path: string; interval_minutes: number; enabled: boolean }
@@ -2372,6 +2532,10 @@ audioTranscriptionEngine: string;
  * Previously stored in SettingsStore.extra["transcriptionMode"].
  */
 transcriptionMode: string;
+/**
+ * When to capture audio: "always" (default), "meetings_only", or "disabled".
+ */
+audioCaptureMode?: string;
 /**
  * Stream live notes only for manually-started live meetings. This is
  * separate from 24/7 background transcription: the recorder still writes
@@ -2616,6 +2780,13 @@ disableClipboardCapture?: boolean;
  */
 disableKeyboardCapture?: boolean;
 /**
+ * Skip persisting mouse-click rows in the UI recorder. Defaults to
+ * `false` (click DB capture ON — clicks carry no text payload and are
+ * the backbone of workflow/task mining). Clicks still wake event-driven
+ * capture when disabled; only the `ui_events` click rows are skipped.
+ */
+disableClickCapture?: boolean;
+/**
  * Continue recording audio when the screen is locked.
  * Default: false (audio pauses when screen is locked to save resources).
  */
@@ -2688,6 +2859,31 @@ piiBackend?: string;
  */
 piiRedactionLabels?: string[];
 /**
+ * WHICH captured columns the redaction worker scrubs (orthogonal to
+ * `pii_redaction_labels`, which picks the PII *categories*). The full
+ * list of columns to redact, by stable key (see `RedactColumns` in
+ * screenpipe-redact). Default = the clear, lighter capture surfaces ON,
+ * with the debatable / lossy / heavy ones OFF (opt-in): `browser_url`,
+ * `ui_element_name`, `ui_element_description`, `a11y_url_field`, and
+ * `element_properties` (per-element a11y value JSON — millions of rows;
+ * the focused-field value is still caught via `accessibility_tree` /
+ * `ui_element_value`). `full_text` is always redacted regardless.
+ */
+piiRedactionColumns?: string[];
+/**
+ * Render redacted PII as **consistent pseudonyms** instead of static
+ * `[LABEL]` tags when `asyncPiiRedaction` is on. Same value → same
+ * stable token (e.g. `[PERSON_1a2b3c4d5e6f]`), so the timeline stays
+ * correlatable without exposing the value. Irreversible: a one-way
+ * keyed hash with a random per-install key, no `token -> value`
+ * store. Applies to newly-redacted rows only — rows already redacted
+ * keep their existing tags (the worker redacts each row once).
+ * Ignored for the Tinfoil backend (the enclave returns no spans to
+ * tokenize). Off by default. See issue #4206 and `screenpipe-redact`'s
+ * `Pseudonymizer`.
+ */
+piiRedactionPseudonyms?: boolean;
+/**
  * Screenpipe cloud user ID. Empty string means not logged in.
  * Kept as String (not Option) to match existing store.bin schema.
  */
@@ -2732,6 +2928,11 @@ port: number;
  * Previously stored in SettingsStore.extra["powerMode"].
  */
 powerMode?: string | null;
+/**
+ * Keep the computer awake while screenpipe is running.
+ * Default off so existing installs keep the OS sleep behavior they chose.
+ */
+keepComputerAwake?: boolean;
 /**
  * Use Chinese mirror for Hugging Face model downloads.
  */
@@ -2848,6 +3049,7 @@ uiTheme?: string;
  */
 minimizeToTrayOnClose?: boolean }
 export type ShowRewindWindow = "Main" | { Home: { page: string | null } } | { Search: { query: string | null } } | "Onboarding" | "Chat" | "PermissionRecovery"
+export type StartExportRecordingResponse = { jobId: string }
 export type Suggestion = { text: string;
 /**
  * Short preview with real data (e.g. "1h20m in VS Code — auth.rs, api.rs")

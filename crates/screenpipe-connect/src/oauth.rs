@@ -100,6 +100,28 @@ pub struct OAuthConfig {
     pub redirect_uri_override: Option<&'static str>,
 }
 
+/// One user-selectable access level for an OAuth integration.
+///
+/// Lets the user pick *how much* to grant at connect time (e.g. Slack
+/// send-only vs send+read). The scope strings stay here, server-side — the
+/// frontend only passes a variant `id`, so it can never request arbitrary
+/// scopes. An integration exposes its variants via
+/// [`crate::connections::Integration::oauth_scope_variants`]; when empty, the
+/// connect flow uses [`OAuthConfig::extra_auth_params`] verbatim (no choice).
+pub struct ScopeVariant {
+    /// Stable id passed from the UI (e.g. "send", "read_write").
+    pub id: &'static str,
+    /// Short label shown in the UI.
+    pub label: &'static str,
+    /// One-line description of what this access level grants.
+    pub description: &'static str,
+    /// Auth params used *instead of* `OAuthConfig::extra_auth_params` when this
+    /// variant is selected (e.g. a wider `user_scope` value).
+    pub params: &'static [(&'static str, &'static str)],
+    /// Whether this is the default selection.
+    pub default: bool,
+}
+
 // ---------------------------------------------------------------------------
 // SecretStore key helper
 // ---------------------------------------------------------------------------
@@ -245,13 +267,15 @@ pub(crate) async fn load_oauth_json_with_instance(
     }
 
     // Fallback B: callers that don't know about instances (instance=None)
-    // should still find the token when the user has a single named instance.
-    let instances = list_oauth_instances(store, integration_id).await;
-    let named: Vec<String> = instances.into_iter().flatten().collect();
-    match named.len() {
+    // should still find the token when the user has a single usable named
+    // instance. Count recoverable instances, not raw rows: old app versions
+    // and interrupted reconnects can leave stale named rows behind, and those
+    // must not make a single healthy account look ambiguous.
+    let recoverable_named = list_recoverable_named_oauth_instances(store, integration_id).await;
+    match recoverable_named.len() {
         0 => None,
         1 => {
-            let inst = named.into_iter().next().unwrap();
+            let inst = recoverable_named.into_iter().next().unwrap();
             tracing::debug!(
                 "oauth: {} default lookup empty, falling back to single instance {:?}",
                 integration_id,
@@ -266,10 +290,10 @@ pub(crate) async fn load_oauth_json_with_instance(
             // gets None (returning a random instance would be worse — we
             // could leak the wrong account's data).
             tracing::warn!(
-                "oauth: {} default lookup empty and {} instances exist ({}) — caller passed instance=None; pick one explicitly",
+                "oauth: {} default lookup empty and {} recoverable instances exist ({}) — caller passed instance=None; pick one explicitly",
                 integration_id,
-                named.len(),
-                named.join(", "),
+                recoverable_named.len(),
+                recoverable_named.join(", "),
             );
             None
         }
@@ -432,6 +456,26 @@ pub async fn list_connected_oauth_instances(
     connected
 }
 
+async fn list_recoverable_named_oauth_instances(
+    store: Option<&SecretStore>,
+    integration_id: &str,
+) -> Vec<String> {
+    let mut instances = Vec::new();
+    for inst in list_oauth_instances(store, integration_id).await {
+        let Some(name) = inst else {
+            continue;
+        };
+        if load_oauth_json_exact(store, integration_id, Some(&name))
+            .await
+            .as_ref()
+            .is_some_and(oauth_json_is_recoverable)
+        {
+            instances.push(name);
+        }
+    }
+    instances
+}
+
 /// Build a human/AI-readable explanation of why an OAuth lookup failed for
 /// `(integration_id, instance)`. Without this, every miss collapses to the
 /// same "not connected" string — which is wrong (and infuriating) when the
@@ -449,22 +493,28 @@ pub async fn describe_oauth_error(
     display_name: &str,
     instance: Option<&str>,
 ) -> String {
-    let instances: Vec<String> = list_oauth_instances(store, integration_id)
+    let instances: Vec<String> =
+        list_recoverable_named_oauth_instances(store, integration_id).await;
+    let all_instances: Vec<String> = list_oauth_instances(store, integration_id)
         .await
         .into_iter()
         .flatten()
         .collect();
-    match (instance, instances.as_slice()) {
-        (Some(inst), _) => format!(
+    match (instance, instances.as_slice(), all_instances.as_slice()) {
+        (Some(inst), _, _) => format!(
             "{display_name} account '{inst}' is not connected or its token can't be refreshed — reconnect it in Settings > Connections"
         ),
-        (None, []) => format!(
+        (None, [], []) => format!(
             "{display_name} not connected — use 'Connect {display_name}' in Settings > Connections"
         ),
-        (None, [only]) => format!(
+        (None, [], stale) => format!(
+            "{display_name} has saved account row(s) ({}) but none can be refreshed — reconnect it in Settings > Connections",
+            stale.join(", "),
+        ),
+        (None, [only], _) => format!(
             "{display_name} account '{only}' token can't be refreshed — reconnect it in Settings > Connections"
         ),
-        (None, many) => format!(
+        (None, many, _) => format!(
             "multiple {display_name} accounts connected ({}) — specify which one with `instance`. On JSON-body endpoints add `\"instance\": \"<email>\"` to the request body; on proxy/query endpoints add `?instance=<email>` (e.g. instance=\"{}\")",
             many.join(", "),
             many[0],
@@ -721,24 +771,34 @@ pub async fn list_oauth_instances(
 /// once-per-startup cleanup so users don't have to touch SQLite.
 ///
 /// Safe to call on every app launch: no-op when there's no shadowing.
-/// Returns the number of entries deleted.
+/// Returns the number of default-slot entries removed (whether deleted as
+/// stale or cleared after promoting their account to a named slot).
+///
+/// A default slot is only "shadowed" (safe to drop) when it is unrecoverable
+/// OR it duplicates an account that already owns a named slot. A *distinct,
+/// recoverable* account left in the default slot beside a named one is a REAL
+/// second account — promote it to its own named slot instead of deleting it,
+/// so multi-account users never lose the first account they connected.
 pub async fn sweep_shadowed_default_slots(store: &SecretStore) -> Result<usize> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     let keys = store.list("oauth:").await?;
 
-    // Partition keys into "has default slot" vs "has at least one named
-    // instance" per integration id. A key like `oauth:gmail` has no colon
-    // after the prefix → default slot. `oauth:gmail:alice@x.com` → named.
+    // Per integration id: whether a default slot exists, and the set of named
+    // instance keys present. A key like `oauth:gmail` has no colon after the
+    // prefix → default slot. `oauth:gmail:alice@x.com` → named instance.
     let mut has_default: HashSet<String> = HashSet::new();
-    let mut has_named: HashSet<String> = HashSet::new();
+    let mut named: HashMap<String, HashSet<String>> = HashMap::new();
     for key in &keys {
         let Some(rest) = key.strip_prefix("oauth:") else {
             continue;
         };
         match rest.split_once(':') {
-            Some((id, _)) => {
-                has_named.insert(id.to_string());
+            Some((id, inst)) => {
+                named
+                    .entry(id.to_string())
+                    .or_default()
+                    .insert(inst.to_string());
             }
             None => {
                 has_default.insert(rest.to_string());
@@ -747,22 +807,122 @@ pub async fn sweep_shadowed_default_slots(store: &SecretStore) -> Result<usize> 
     }
 
     let mut deleted = 0usize;
-    for id in has_default.intersection(&has_named) {
+    for id in &has_default {
+        let Some(named_for_id) = named.get(id) else {
+            // Lonely default slot — the normal single-account happy path.
+            continue;
+        };
+
+        let default_val = load_oauth_json_exact(Some(store), id, None).await;
+        let default_email = default_val
+            .as_ref()
+            .and_then(|v| v["email"].as_str().map(String::from));
+        let is_distinct_recoverable = default_val.as_ref().is_some_and(oauth_json_is_recoverable)
+            && default_email
+                .as_ref()
+                .is_some_and(|e| !named_for_id.contains(e));
+
         let key = format!("oauth:{}", id);
-        match store.delete(&key).await {
-            Ok(()) => {
-                tracing::info!(
-                    "oauth: swept shadowed default-slot entry for {} (instance-suffixed entry still present)",
-                    id
+        if is_distinct_recoverable {
+            // A real, separate account sitting in the default slot — promote it
+            // to its own named slot before clearing the default key.
+            let email = default_email.expect("distinct_recoverable implies Some email");
+            if let Err(e) =
+                write_oauth_token_instance(Some(store), id, Some(&email), &default_val.unwrap())
+                    .await
+            {
+                // Promotion failed — leave the default slot intact rather than
+                // risk losing the account; we'll retry on the next launch.
+                tracing::warn!(
+                    "oauth: failed to promote default-slot account {} for {} during sweep, leaving default slot intact: {e:#}",
+                    email,
+                    id,
                 );
-                deleted += 1;
+                continue;
             }
-            Err(e) => {
-                tracing::warn!("oauth: failed to sweep default slot for {}: {e:#}", id);
+            match store.delete(&key).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "oauth: promoted shadowed default-slot account {} to its own instance for {}",
+                        email,
+                        id,
+                    );
+                    deleted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "oauth: promoted {} but failed to drop default slot for {}: {e:#}",
+                        email,
+                        id,
+                    );
+                }
+            }
+        } else {
+            match store.delete(&key).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "oauth: swept shadowed default-slot entry for {} (instance-suffixed entry still present)",
+                        id,
+                    );
+                    deleted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!("oauth: failed to sweep default slot for {}: {e:#}", id);
+                }
             }
         }
     }
     Ok(deleted)
+}
+
+/// Reconcile the default slot (`oauth:{id}`) right after a new account was
+/// saved under an instance-suffixed key (`oauth:{id}:{new_instance}`).
+///
+/// Older single-account builds parked the *first* connected account in the
+/// default slot. When the user later connected a *second* account, the
+/// post-save cleanup used to blindly delete that default slot — silently
+/// wiping the first account ("adding a 2nd Gmail overwrote the 1st"). This
+/// keeps both:
+///
+/// - default slot is empty, unrecoverable, or the *same* account as the one
+///   just saved → delete it (stale-duplicate / zombie cleanup, the original
+///   intent — a stale default slot otherwise shadows every `instance=None`
+///   read).
+/// - default slot holds a *distinct, recoverable* account → promote it to its
+///   own named slot (`oauth:{id}:{email}`) first, so it survives alongside the
+///   account we just saved, then clear the default key.
+pub async fn reconcile_default_slot_after_instanced_save(
+    store: Option<&SecretStore>,
+    integration_id: &str,
+    new_instance: &str,
+) -> Result<()> {
+    let Some(default_val) = load_oauth_json_exact(store, integration_id, None).await else {
+        return Ok(());
+    };
+
+    let default_email = default_val["email"].as_str();
+    let is_distinct_recoverable =
+        oauth_json_is_recoverable(&default_val) && default_email.is_some_and(|e| e != new_instance);
+
+    if is_distinct_recoverable {
+        let email = default_email.expect("distinct_recoverable implies Some email");
+        // Don't clobber an existing named slot for the same account (e.g. the
+        // user just reconnected it under its own instance).
+        let already_named = list_oauth_instances(store, integration_id)
+            .await
+            .into_iter()
+            .any(|i| i.as_deref() == Some(email));
+        if !already_named {
+            write_oauth_token_instance(store, integration_id, Some(email), &default_val).await?;
+            tracing::info!(
+                "oauth: promoted default-slot account {} to its own instance for {} (multi-account)",
+                email,
+                integration_id,
+            );
+        }
+    }
+
+    delete_oauth_token_instance(store, integration_id, None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -815,13 +975,23 @@ pub async fn refresh_token_instance(
     let mut attempt = 0u8;
     let resp: Value = loop {
         attempt += 1;
+        let mut refresh_body = serde_json::json!({
+            "integration_id": integration_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_tok,
+        });
+        // Per-account providers (Zendesk) host their token endpoint on the
+        // customer's subdomain. Echo the stored routing field so the proxy can
+        // rebuild that URL on refresh; harmless for every other provider.
+        if let (Some(sub), Some(obj)) = (
+            stored.get("subdomain").and_then(|v| v.as_str()),
+            refresh_body.as_object_mut(),
+        ) {
+            obj.insert("subdomain".to_string(), Value::from(sub));
+        }
         let raw = client
             .post(EXCHANGE_PROXY_URL)
-            .json(&serde_json::json!({
-                "integration_id": integration_id,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_tok,
-            }))
+            .json(&refresh_body)
             .send()
             .await?;
         let status = raw.status();
@@ -951,6 +1121,25 @@ pub async fn get_valid_token_instance(
     if let Some(token) = read_oauth_token_instance(store, integration_id, instance).await {
         return Some(token);
     }
+    // No token stored at all (never connected, or an interrupted OAuth flow
+    // that never reached the token write): a refresh cannot possibly succeed,
+    // so don't attempt one and don't WARN. Callers poll this path on a timer
+    // (the app's 60s calendar publisher, status checks), and the old
+    // unconditional WARN ("oauth refresh failed ...: no stored token") filled
+    // user log bundles twice a minute forever. This is an expected state, not
+    // a failure — keep it at debug. Real refresh failures (a token exists but
+    // the provider rejected it) still WARN below.
+    if load_oauth_json_with_instance(store, integration_id, instance)
+        .await
+        .is_none()
+    {
+        tracing::debug!(
+            "oauth: no stored token for {}(instance={:?}) — skipping refresh",
+            integration_id,
+            instance,
+        );
+        return None;
+    }
     match refresh_token_instance(store, client, integration_id, instance).await {
         Ok(token) => Some(token),
         Err(e) => {
@@ -1039,6 +1228,22 @@ mod tests {
     // never matches a real stored file on the developer's machine. Without
     // this, tests would pass/fail based on whether the tester happens to have
     // gmail connected locally.
+
+    #[tokio::test]
+    async fn get_valid_token_with_no_stored_token_returns_none_without_refresh() {
+        // Never-connected integration: there is nothing to refresh. The old
+        // path attempted a refresh anyway, hit "no stored token", and WARNed —
+        // and because the app polls calendar endpoints every 60s, that WARN
+        // (plus the resulting 5xx) repeated twice a minute in user logs
+        // forever. The short-circuit returns None before any network attempt
+        // (this test performs no real HTTP: with the pre-check the exchange
+        // proxy is never contacted).
+        let store = mem_store().await;
+        let client = reqwest::Client::new();
+        let token =
+            get_valid_token_instance(Some(&store), &client, "_t_never_connected", None).await;
+        assert!(token.is_none());
+    }
 
     #[tokio::test]
     async fn load_with_explicit_instance_hits_exact_key() {
@@ -1160,6 +1365,38 @@ mod tests {
 
         let got = load_oauth_json(Some(&store), id, None).await;
         assert!(got.is_none(), "expected ambiguous None, got {got:?}");
+    }
+
+    #[tokio::test]
+    async fn load_with_none_ignores_stale_named_instances_when_one_is_recoverable() {
+        // M365 support case: reconnects can leave stale named rows behind.
+        // A default proxy call should not fail as "ambiguous" when only one
+        // named account is actually usable.
+        let store = mem_store().await;
+        let id = "_t_stale_named_rows";
+        let expired = unix_now().saturating_sub(3600);
+        store
+            .set_json(
+                &format!("oauth:{}:old@example.com", id),
+                &json!({"access_token": "old", "expires_at": expired}),
+            )
+            .await
+            .unwrap();
+        store
+            .set_json(
+                &format!("oauth:{}:kevin.sharpen@ami.ca", id),
+                &json!({
+                    "access_token": "fresh",
+                    "refresh_token": "rt",
+                    "expires_at": expired,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let got = load_oauth_json(Some(&store), id, None).await.unwrap();
+        assert_eq!(got["access_token"], "fresh");
+        assert_eq!(got["refresh_token"], "rt");
     }
 
     #[tokio::test]
@@ -1477,6 +1714,240 @@ mod tests {
         assert_eq!(sweep_shadowed_default_slots(&store).await.unwrap(), 0);
     }
 
+    #[tokio::test]
+    async fn sweep_promotes_distinct_recoverable_default() {
+        // Defense-in-depth for the multi-account fix: if a distinct, recoverable
+        // account is left in the default slot beside a named one (e.g. a connect
+        // reconcile that didn't finish), the startup sweep must PROMOTE it to its
+        // own slot, not delete it. This is what used to silently drop the first
+        // Gmail account.
+        let store = mem_store().await;
+        let id = "_t_sweep_promote";
+        store
+            .set_json(
+                &format!("oauth:{}", id),
+                &json!({"access_token": "a", "refresh_token": "ra", "email": "alice@x.com"}),
+            )
+            .await
+            .unwrap();
+        store
+            .set_json(
+                &format!("oauth:{}:bob@x.com", id),
+                &json!({"access_token": "b", "refresh_token": "rb", "email": "bob@x.com"}),
+            )
+            .await
+            .unwrap();
+
+        let n = sweep_shadowed_default_slots(&store).await.unwrap();
+        assert_eq!(n, 1);
+
+        // default slot gone, alice promoted to her own slot, bob untouched
+        assert!(store
+            .get_json::<Value>(&format!("oauth:{}", id))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .get_json::<Value>(&format!("oauth:{}:alice@x.com", id))
+                .await
+                .unwrap()
+                .unwrap()["access_token"],
+            "a"
+        );
+        assert_eq!(
+            store
+                .get_json::<Value>(&format!("oauth:{}:bob@x.com", id))
+                .await
+                .unwrap()
+                .unwrap()["access_token"],
+            "b"
+        );
+
+        // Idempotent: no default slot left to sweep.
+        assert_eq!(sweep_shadowed_default_slots(&store).await.unwrap(), 0);
+    }
+
+    // ---- reconcile_default_slot_after_instanced_save ------------------
+    //
+    // The "connecting a 2nd Gmail wiped the 1st" bug: the first account used to
+    // live in the default slot, and saving a second account deleted it.
+
+    #[tokio::test]
+    async fn reconcile_promotes_distinct_default_account() {
+        // alice is parked in the default slot (old single-account layout). bob
+        // just connected under his own instance. alice must survive — promoted
+        // into her own named slot, not deleted.
+        let store = mem_store().await;
+        let id = "_t_recon_promote";
+        store
+            .set_json(
+                &format!("oauth:{}", id),
+                &json!({"access_token": "a", "refresh_token": "ra", "email": "alice@x.com"}),
+            )
+            .await
+            .unwrap();
+        // bob's slot — written by oauth_connect before reconcile runs
+        store
+            .set_json(
+                &format!("oauth:{}:bob@x.com", id),
+                &json!({"access_token": "b", "refresh_token": "rb", "email": "bob@x.com"}),
+            )
+            .await
+            .unwrap();
+
+        reconcile_default_slot_after_instanced_save(Some(&store), id, "bob@x.com")
+            .await
+            .unwrap();
+
+        // default slot cleared
+        assert!(store
+            .get_json::<Value>(&format!("oauth:{}", id))
+            .await
+            .unwrap()
+            .is_none());
+        // alice promoted, keeping her token + refresh token
+        let alice = store
+            .get_json::<Value>(&format!("oauth:{}:alice@x.com", id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice["access_token"], "a");
+        assert_eq!(alice["refresh_token"], "ra");
+        // bob untouched
+        assert_eq!(
+            store
+                .get_json::<Value>(&format!("oauth:{}:bob@x.com", id))
+                .await
+                .unwrap()
+                .unwrap()["access_token"],
+            "b"
+        );
+
+        // both accounts now enumerable
+        let mut names: Vec<String> = list_oauth_instances(Some(&store), id)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["alice@x.com".to_string(), "bob@x.com".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_same_account_default() {
+        // Reconnecting the same account: the fresh token was written under the
+        // named slot; the stale default-slot copy of the SAME email is a
+        // duplicate and must be dropped so it can't shadow instance=None reads.
+        let store = mem_store().await;
+        let id = "_t_recon_same";
+        store
+            .set_json(
+                &format!("oauth:{}", id),
+                &json!({"access_token": "old", "refresh_token": "r", "email": "alice@x.com"}),
+            )
+            .await
+            .unwrap();
+        store
+            .set_json(
+                &format!("oauth:{}:alice@x.com", id),
+                &json!({"access_token": "new", "refresh_token": "r", "email": "alice@x.com"}),
+            )
+            .await
+            .unwrap();
+
+        reconcile_default_slot_after_instanced_save(Some(&store), id, "alice@x.com")
+            .await
+            .unwrap();
+
+        assert!(store
+            .get_json::<Value>(&format!("oauth:{}", id))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .get_json::<Value>(&format!("oauth:{}:alice@x.com", id))
+                .await
+                .unwrap()
+                .unwrap()["access_token"],
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_drops_unrecoverable_default() {
+        // A zombie default slot (expired, no refresh token) must not survive to
+        // shadow instance=None reads — the original cleanup intent — and must
+        // NOT be promoted (it can't be recovered).
+        let store = mem_store().await;
+        let id = "_t_recon_zombie";
+        let expired = unix_now().saturating_sub(3600);
+        store
+            .set_json(
+                &format!("oauth:{}", id),
+                &json!({"access_token": "dead", "expires_at": expired, "email": "ghost@x.com"}),
+            )
+            .await
+            .unwrap();
+        store
+            .set_json(
+                &format!("oauth:{}:bob@x.com", id),
+                &json!({"access_token": "b", "refresh_token": "rb", "email": "bob@x.com"}),
+            )
+            .await
+            .unwrap();
+
+        reconcile_default_slot_after_instanced_save(Some(&store), id, "bob@x.com")
+            .await
+            .unwrap();
+
+        assert!(store
+            .get_json::<Value>(&format!("oauth:{}", id))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            store
+                .get_json::<Value>(&format!("oauth:{}:ghost@x.com", id))
+                .await
+                .unwrap()
+                .is_none(),
+            "unrecoverable default must not be promoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_noop_without_default_slot() {
+        // The common case after the first account: nothing in the default slot,
+        // so reconcile is a cheap no-op that leaves the new account alone.
+        let store = mem_store().await;
+        let id = "_t_recon_noop";
+        store
+            .set_json(
+                &format!("oauth:{}:bob@x.com", id),
+                &json!({"access_token": "b", "refresh_token": "rb", "email": "bob@x.com"}),
+            )
+            .await
+            .unwrap();
+
+        reconcile_default_slot_after_instanced_save(Some(&store), id, "bob@x.com")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_json::<Value>(&format!("oauth:{}:bob@x.com", id))
+                .await
+                .unwrap()
+                .unwrap()["access_token"],
+            "b"
+        );
+    }
+
     // ---- merge_refresh_response --------------------------------------
     //
     // Google's refresh response only echoes refresh_token when it rotates,
@@ -1715,14 +2186,24 @@ pub async fn exchange_code(
     integration_id: &str,
     code: &str,
     redirect_uri: &str,
+    extra: Option<&serde_json::Map<String, Value>>,
 ) -> Result<Value> {
+    // `extra` carries provider-specific routing fields the proxy needs to build
+    // the token URL — e.g. Zendesk's `subdomain`, whose token endpoint lives on
+    // the customer's own subdomain rather than a central host.
+    let mut payload = serde_json::json!({
+        "integration_id": integration_id,
+        "code":           code,
+        "redirect_uri":   redirect_uri,
+    });
+    if let (Some(extra), Some(obj)) = (extra, payload.as_object_mut()) {
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
     let resp = client
         .post(EXCHANGE_PROXY_URL)
-        .json(&serde_json::json!({
-            "integration_id": integration_id,
-            "code":           code,
-            "redirect_uri":   redirect_uri,
-        }))
+        .json(&payload)
         .send()
         .await?;
     let status = resp.status();

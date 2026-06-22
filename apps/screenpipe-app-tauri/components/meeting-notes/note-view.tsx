@@ -5,6 +5,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowLeft,
   AudioLines,
   Calendar,
@@ -60,6 +61,11 @@ import {
   formatDuration,
   type MeetingRecord,
 } from "@/lib/utils/meeting-format";
+import type {
+  LiveCaptureDevice,
+  LiveCaptureState,
+} from "@/lib/utils/live-capture-state";
+import { isLiveCaptureDegraded } from "@/lib/utils/live-capture-state";
 import {
   buildEnrichedSummarizePrompt,
   extractImageDataUrlsFromMarkdown,
@@ -78,6 +84,7 @@ import {
 import { cn } from "@/lib/utils";
 import { Receipts } from "./receipts";
 import { ReplayStrip } from "./replay-strip";
+import { ListeningSticks } from "./listening-sticks";
 import { NoteEditor, type NoteEditorHandle } from "./note-editor";
 import {
   imageBytesToDataUrl,
@@ -87,6 +94,13 @@ import {
 } from "./image-utils";
 import { TranscriptPanel } from "./transcript-panel";
 import { useSettings, type Settings } from "@/lib/hooks/use-settings";
+import {
+  MeetingNoteSaveQueue,
+  sameMeetingNoteDraft,
+  type MeetingNoteDraft,
+} from "./note-save-queue";
+import { listenTyped, TAURI_EVENTS } from "@/lib/events/tauri-events";
+import { writeBrowserLogNow } from "@/lib/logging/browser-log";
 
 const AUTOSAVE_DEBOUNCE_MS = 800;
 
@@ -100,6 +114,9 @@ interface NoteViewProps {
   onResume: () => void | Promise<void>;
   onSaved: (meeting: MeetingRecord) => void;
   onDeleted: (id: number) => void;
+  captureState?: LiveCaptureState;
+  captureDevices?: LiveCaptureDevice[];
+  onCaptureDevicesRefresh?: () => void | Promise<void>;
   calendarEvents?: CalendarEvent[];
   initialTranscriptOpen?: boolean;
   transcriptOpenRequestKey?: number;
@@ -111,8 +128,9 @@ type SaveState =
   | { kind: "saved"; at: number }
   | { kind: "error"; reason: string };
 
-interface AudioStatusDevice {
+interface AudioStatusDevice extends LiveCaptureDevice {
   name: string;
+  fullName?: string;
   kind: "input" | "output";
   active: boolean;
   level: number;
@@ -142,6 +160,9 @@ export function NoteView({
   onResume,
   onSaved,
   onDeleted,
+  captureState,
+  captureDevices = [],
+  onCaptureDevicesRefresh,
   calendarEvents = [],
   initialTranscriptOpen = false,
   transcriptOpenRequestKey,
@@ -156,6 +177,8 @@ export function NoteView({
   const [exporting, setExporting] = useState(false);
   const [copying, setCopying] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [resumingCapture, setResumingCapture] = useState(false);
+  const [savingBeforeStop, setSavingBeforeStop] = useState(false);
   const [meetingCtx, setMeetingCtx] = useState<MeetingContext | null>(null);
   const [transcriptOpen, setTranscriptOpenState] = useState(() =>
     initialTranscriptOpen || readTranscriptOpenPreference(meeting.id),
@@ -266,11 +289,65 @@ export function NoteView({
     };
   }, [meeting.id, toast]);
 
-  const lastSavedRef = useRef({
+  const lastSavedRef = useRef<MeetingNoteDraft>({
     title: meeting.title ?? "",
     attendees: meeting.attendees ?? "",
     note: meeting.note ?? "",
   });
+  const meetingRef = useRef(meeting);
+  const onSavedRef = useRef(onSaved);
+  useEffect(() => {
+    meetingRef.current = meeting;
+  }, [meeting]);
+  useEffect(() => {
+    onSavedRef.current = onSaved;
+  }, [onSaved]);
+  const saveQueueRef = useRef<MeetingNoteSaveQueue | null>(null);
+  if (!saveQueueRef.current) {
+    saveQueueRef.current = new MeetingNoteSaveQueue({
+      persist: async (next) => {
+        const currentMeeting = meetingRef.current;
+        const body: Record<string, string> = {
+          title: next.title,
+          meeting_start: currentMeeting.meeting_start,
+          attendees: next.attendees,
+          note: next.note,
+        };
+        if (currentMeeting.meeting_end) {
+          body.meeting_end = currentMeeting.meeting_end;
+        }
+
+        const res = await localFetch(`/meetings/${currentMeeting.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      },
+      onPersisted: (next, hasQueuedDraft) => {
+        lastSavedRef.current = { ...next };
+        if (hasQueuedDraft) {
+          setSaveState({ kind: "saving" });
+          return;
+        }
+        const currentMeeting = meetingRef.current;
+        setSaveState({ kind: "saved", at: Date.now() });
+        onSavedRef.current({
+          ...currentMeeting,
+          title: next.title || null,
+          attendees: next.attendees || null,
+          note: next.note || null,
+        });
+      },
+      onError: (err, _draft, hasQueuedDraft) => {
+        setSaveState(
+          hasQueuedDraft
+            ? { kind: "saving" }
+            : { kind: "error", reason: String(err) },
+        );
+      },
+    });
+  }
   const setTranscriptOpen = useCallback(
     (value: React.SetStateAction<boolean>) => {
       setTranscriptOpenState((current) => {
@@ -455,46 +532,24 @@ export function NoteView({
   }, [meeting.title, meeting.attendees, meeting.note]);
 
   const save = useCallback(
-    async (next: { title: string; attendees: string; note: string }) => {
+    async (
+      next: MeetingNoteDraft,
+      options: { throwOnError?: boolean } = {},
+    ) => {
       setSaveState({ kind: "saving" });
       try {
-        const body: Record<string, string> = {
-          title: next.title,
-          meeting_start: meeting.meeting_start,
-          attendees: next.attendees,
-          note: next.note,
-        };
-        if (meeting.meeting_end) body.meeting_end = meeting.meeting_end;
-
-        const res = await localFetch(`/meetings/${meeting.id}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        lastSavedRef.current = { ...next };
-        setSaveState({ kind: "saved", at: Date.now() });
-        onSaved({
-          ...meeting,
-          title: next.title || null,
-          attendees: next.attendees || null,
-          note: next.note || null,
-        });
+        await saveQueueRef.current!.enqueue(next);
       } catch (err) {
-        setSaveState({ kind: "error", reason: String(err) });
+        if (options.throwOnError) throw err;
       }
     },
-    [meeting, onSaved],
+    [],
   );
 
   // Debounced autosave
   useEffect(() => {
     const last = lastSavedRef.current;
-    if (
-      title === last.title &&
-      attendees === last.attendees &&
-      note === last.note
-    ) {
+    if (sameMeetingNoteDraft({ title, attendees, note }, last)) {
       return;
     }
     const handle = setTimeout(() => {
@@ -640,6 +695,27 @@ export function NoteView({
     }
   };
 
+  const handleStopClick = async () => {
+    if (savingBeforeStop) return;
+    setSavingBeforeStop(true);
+    try {
+      const current = { title, attendees, note };
+      if (!sameMeetingNoteDraft(current, lastSavedRef.current)) {
+        await save(current, { throwOnError: true });
+      }
+      await onStop();
+    } catch (err) {
+      console.error("failed to save meeting note before stop", err);
+      toast({
+        title: "couldn't save notes",
+        description: "try again before stopping the meeting.",
+        variant: "destructive",
+      });
+    } finally {
+      setSavingBeforeStop(false);
+    }
+  };
+
   const handleExport = async () => {
     if (exporting) return;
     if (!meeting.meeting_end) {
@@ -680,41 +756,77 @@ export function NoteView({
       title: "exporting mp4…",
       description: "stitching frames and audio — this can take a minute for long meetings.",
     });
+    let jobId: string | null = null;
+    let unlisten: (() => void) | null = null;
     try {
-      // Calls the engine export core in-process via Tauri (no HTTP, no daemon
-      // dependency) — the in-app twin of the `screenpipe export` CLI. Reuses
-      // the running server core's DB handle. Rejects with the engine's error
-      // string on failure.
-      const res = await commands.exportRecording(meeting.id, null, null, target);
-      if (res.status === "error") throw new Error(res.error);
-      const summary = res.data;
-
-      const sizeMb = summary?.file_size_bytes
-        ? (summary.file_size_bytes / (1024 * 1024)).toFixed(1)
-        : null;
-      toast({
-        title: "mp4 exported",
-        description: [
-          `${summary?.frame_count ?? 0} frames`,
-          `${summary?.audio_chunk_count ?? 0} audio chunks`,
-          sizeMb ? `${sizeMb} mb` : null,
-        ]
-          .filter(Boolean)
-          .join(" · "),
+      unlisten = await listenTyped(TAURI_EVENTS.export, async (event) => {
+        const isCurrentExport =
+          event.jobId === jobId ||
+          (!jobId &&
+            event.request.meetingId === meeting.id &&
+            event.request.outputPath === target);
+        if (!isCurrentExport) return;
+        jobId = event.jobId;
+        if (event.kind === "completed") {
+          const summary = event.summary;
+          writeBrowserLogNow("info", "meeting export completed", {
+            jobId: event.jobId,
+          });
+          const sizeMb = summary?.file_size_bytes
+            ? (summary.file_size_bytes / (1024 * 1024)).toFixed(1)
+            : null;
+          toast({
+            title: "mp4 exported",
+            description: [
+              `${summary?.frame_count ?? 0} frames`,
+              `${summary?.audio_chunk_count ?? 0} audio chunks`,
+              sizeMb ? `${sizeMb} mb` : null,
+            ]
+              .filter(Boolean)
+              .join(" · "),
+          });
+          setExporting(false);
+          unlisten?.();
+          try {
+            await openExternal(summary?.output_path ?? target);
+          } catch {
+            // opening the file is best-effort; the export itself succeeded.
+          }
+        }
+        if (event.kind === "failed") {
+          console.error("failed to export meeting", event.error);
+          writeBrowserLogNow("error", "meeting export failed", {
+            jobId: event.jobId,
+            stack: event.error,
+          });
+          toast({
+            title: "couldn't export mp4",
+            description: event.error,
+            variant: "destructive",
+          });
+          setExporting(false);
+          unlisten?.();
+        }
       });
-      try {
-        await openExternal(target);
-      } catch {
-        // opening the file is best-effort; the export itself succeeded.
-      }
+
+      // Starts the engine export core in-process via Tauri (no HTTP, no daemon
+      // dependency), then reports completion through export:event.
+      const res = await commands.startExportRecording(meeting.id, null, null, target);
+      if (res.status === "error") throw new Error(res.error);
+      jobId = res.data.jobId;
+      writeBrowserLogNow("info", "meeting export started", { jobId });
     } catch (err) {
       console.error("failed to export meeting", err);
+      writeBrowserLogNow("error", "meeting export start failed", {
+        jobId,
+        stack: err instanceof Error ? err.stack ?? err.message : String(err),
+      });
       toast({
         title: "couldn't export mp4",
         description: String(err),
         variant: "destructive",
       });
-    } finally {
+      unlisten?.();
       setExporting(false);
     }
   };
@@ -729,10 +841,10 @@ export function NoteView({
         attendees: attendees || null,
         note: note || null,
       };
-      // Always re-fetch context + transcript on copy so the clipboard reflects
-      // what the user sees right now (live meetings update; speaker rename can
+      // Re-fetch context + transcript so the clipboard reflects what the
+      // user sees right now (live meetings update; speaker rename can
       // happen without re-rendering ReplayStrip).
-      const [ctx, transcript] = await Promise.all([
+      const [ctx, allTranscript] = await Promise.all([
         fetchMeetingContext(fresh),
         fetchMeetingAudio(
           new Date(meeting.meeting_start).toISOString(),
@@ -746,12 +858,26 @@ export function NoteView({
       ]);
       setMeetingCtx(ctx);
 
+      // Prefer meeting-routed (live) transcript over background search noise.
+      // For manual meetings (no routed audio), fall back to input-device-only
+      // entries (the user's mic) to avoid including YouTube/podcast noise.
+      const liveChunks = allTranscript.filter((c) => c.source === "live");
+      const inputChunks = allTranscript.filter((c) => c.isInput);
+      const transcript = liveChunks.length > 0
+        ? liveChunks
+        : inputChunks.length > 0
+          ? inputChunks
+          : allTranscript;
+
       const md = buildMeetingMarkdown({
         meeting: fresh,
         context: ctx,
         transcript,
       });
-      await navigator.clipboard.writeText(md);
+      // Use Tauri's native clipboard API (arboard) instead of
+      // navigator.clipboard.writeText which fails after async operations
+      // due to WebKit's user-activation timeout.
+      await commands.copyTextToClipboard(md);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
       toast({ title: "copied to clipboard" });
@@ -840,6 +966,53 @@ export function NoteView({
   const handleResumeAfterInactivity = async () => {
     setInactivityPrompt(false);
     await onResume();
+  };
+
+  const pausedInputDevices = useMemo(
+    () =>
+      captureDevices.filter(
+        (device) => device.kind === "input" && !device.active,
+      ),
+    [captureDevices],
+  );
+
+  const handleResumeInputCapture = async () => {
+    if (pausedInputDevices.length === 0) return;
+    setResumingCapture(true);
+    try {
+      await Promise.all(
+        pausedInputDevices.map((device) =>
+          localFetch("/audio/device/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              device_name: device.fullName ?? `${device.name} (input)`,
+            }),
+          }).then((response) => {
+            if (!response.ok) {
+              throw new Error(`audio device start failed: ${response.status}`);
+            }
+          }),
+        ),
+      );
+      try {
+        await onCaptureDevicesRefresh?.();
+      } catch (refreshErr) {
+        console.warn("meeting notes: failed to refresh capture devices", refreshErr);
+      }
+      toast({
+        title: "microphone capture resumed",
+        description: "Transcript should start once speech is detected.",
+      });
+    } catch (err) {
+      toast({
+        title: "couldn't resume microphone",
+        description: String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setResumingCapture(false);
+    }
   };
 
   const handleJoinMeeting = async (link: CalendarMeetingLink) => {
@@ -997,7 +1170,7 @@ export function NoteView({
             key={meeting.id}
             value={note}
             onChange={setNote}
-            placeholder="Write notes"
+            placeholder={'write notes, or type "/" for blocks'}
             className="mt-10 [&_.ProseMirror]:min-h-[50vh] [&_.ProseMirror]:text-[15px] [&_.ProseMirror]:leading-7"
           />
 
@@ -1031,12 +1204,21 @@ export function NoteView({
               onDismiss={() => setDismissedJoinUrl(joinSuggestion.link.url)}
             />
           )}
+          {isLive && captureState && isLiveCaptureDegraded(captureState) && (
+            <LiveCaptureIssueBanner
+              state={captureState}
+              canResumeInput={pausedInputDevices.length > 0}
+              resuming={resumingCapture}
+              onResumeInput={() => void handleResumeInputCapture()}
+            />
+          )}
           <TranscriptPanel
             meeting={meeting}
             isOpen={transcriptOpen}
             onClose={() => setTranscriptOpen(false)}
             isLive={isLive}
             refreshKey={transcriptRefreshKey}
+            captureState={captureState}
             headerActions={
               <AudioHealthButton
                 devices={audioStatusDevices}
@@ -1052,19 +1234,32 @@ export function NoteView({
               <span
                 className={cn(
                   "flex h-8 w-8 shrink-0 items-center justify-center border border-border",
-                  isLive
+                  isLive && captureState?.severity === "warning"
+                    ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
+                    : isLive
                     ? "bg-foreground text-background"
                     : "bg-muted text-muted-foreground",
                 )}
               >
-                <Mic2 className="h-4 w-4" />
+                {isLive && captureState?.severity !== "warning" ? (
+                  // Live waveform driven by the polled device levels — motion
+                  // (not color) carries the "listening" state. A flat line
+                  // means armed but hearing nothing yet.
+                  <ListeningSticks
+                    active={captureState?.severity !== "waiting"}
+                    level={audioLevelToMeterValue(
+                      maxAudioDeviceLevel(audioStatusDevices),
+                    )}
+                  />
+                ) : (
+                  <Mic2 className="h-4 w-4" />
+                )}
               </span>
               <div className="min-w-0">
                 <div className="flex items-center gap-2 text-sm font-medium">
-                  <span>{isLive ? "Recording" : "Meeting saved"}</span>
-                  {isLive && (
-                    <span className="h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
-                  )}
+                  <span>
+                    {isLive ? (captureState?.label ?? "Recording") : "Meeting saved"}
+                  </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
                   <span>{dockDuration}</span>
@@ -1144,11 +1339,11 @@ export function NoteView({
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => void onStop()}
-                  disabled={stopping}
+                  onClick={() => void handleStopClick()}
+                  disabled={stopping || savingBeforeStop}
                   className="h-9 gap-2 rounded-none normal-case tracking-normal border-border bg-background text-foreground hover:bg-muted hover:text-foreground active:bg-muted disabled:opacity-100 disabled:bg-muted/40 disabled:text-muted-foreground disabled:border-border"
                 >
-                  {stopping ? (
+                  {stopping || savingBeforeStop ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   ) : (
                     <Square className="h-3.5 w-3.5" />
@@ -1427,6 +1622,51 @@ function InactivityResumeBanner({
   );
 }
 
+function LiveCaptureIssueBanner({
+  state,
+  canResumeInput,
+  resuming,
+  onResumeInput,
+}: {
+  state: LiveCaptureState;
+  canResumeInput: boolean;
+  resuming: boolean;
+  onResumeInput: () => void;
+}) {
+  return (
+    <div className="mb-3 flex items-center justify-between gap-3 border border-amber-500/30 bg-amber-500/10 px-3 py-2 shadow-sm">
+      <div className="flex min-w-0 items-start gap-3">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-300" />
+        <div className="min-w-0">
+          <div className="text-sm font-medium leading-snug text-foreground">
+            {state.label}
+          </div>
+          <div className="mt-0.5 text-xs leading-5 text-muted-foreground">
+            {state.description}
+            {state.recordingContinues ? " Recording continues." : ""}
+          </div>
+        </div>
+      </div>
+      {canResumeInput && (
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          className="h-8 shrink-0 rounded-none px-3"
+          onClick={onResumeInput}
+          disabled={resuming}
+        >
+          {resuming ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : (
+            "resume mic"
+          )}
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function AudioDeviceRow({
   icon,
   label,
@@ -1689,6 +1929,7 @@ function parseAudioStatusDevices(
     if (!name) continue;
     devices.push({
       name,
+      fullName: nameAndType,
       kind,
       active: status.toLowerCase().startsWith("active"),
       level: audioDeviceLevelFor(

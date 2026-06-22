@@ -206,6 +206,14 @@ impl VisionManager {
         *self.status.read().await
     }
 
+    /// Shared capture-pipeline metrics. The monitor watcher's silent-wedge
+    /// watchdog reads this to tell a real stall (attempts firing but nothing
+    /// persisted) apart from a healthy static screen (which still ticks
+    /// `last_db_write_ts` via dedup-skip). Mirrors what /health reports.
+    pub fn vision_metrics(&self) -> &Arc<PipelineMetrics> {
+        &self.config.vision_metrics
+    }
+
     /// Check whether a monitor is allowed by the user's monitor filter settings.
     /// Uses prefix matching (name + resolution) so that position changes after
     /// reconnect don't break the filter.
@@ -469,6 +477,10 @@ impl VisionManager {
         };
         // Mitsukeru fork: apply per-parameter CLI / settings overrides if any.
         // These force the value regardless of the active PowerProfile.
+        // Carry the user's explicit idle override as a *pin* as well as the
+        // live value, so a runtime PowerProfile transition can't relax the
+        // guaranteed capture floor back to the profile's (much larger) value.
+        capture_config.idle_capture_interval_override_ms = self.config.idle_capture_interval_ms;
         if let Some(v) = self.config.idle_capture_interval_ms {
             capture_config.idle_capture_interval_ms = v;
         }

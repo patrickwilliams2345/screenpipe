@@ -32,7 +32,15 @@ import { Menu } from "@tauri-apps/api/menu";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { platform as getPlatform } from "@tauri-apps/plugin-os";
-import { Cookie, ExternalLink, KeyRound, Loader2, RotateCw, PanelRightClose, PanelRightOpen } from "lucide-react";
+import {
+  Cookie,
+  ExternalLink,
+  KeyRound,
+  Loader2,
+  RotateCw,
+  PanelRightClose,
+  PanelRightOpen,
+} from "lucide-react";
 import {
   loadConversationFile,
   updateConversationFlags,
@@ -44,10 +52,12 @@ import {
   setCachedBrowserState,
 } from "@/lib/browser-state-cache";
 import { Button } from "@/components/ui/button";
+import { FilePreviewSidebar } from "@/components/file-preview-sidebar";
 import { localFetch } from "@/lib/api";
 import { useSettings } from "@/lib/hooks/use-settings";
 import {
   isForeignNavigation,
+  isMismatchedNavigation,
   parseNavigatePayload,
   type OwnedBrowserNavigatePayload,
 } from "@/lib/owned-browser-ownership";
@@ -64,6 +74,18 @@ const CHROME_WEBSTORE_URL =
 
 interface BrowserSidebarProps {
   conversationId: string | null;
+  /** Session id the on-screen chat's agent process runs under (the value the
+   *  agent's `x-screenpipe-session` header carries). Used alongside
+   *  `conversationId` to reveal the chat's own agent navigations even when the
+   *  `conversationId` state lags the id the agent was spawned with. */
+  agentSessionId?: string | null;
+  filePreview?: {
+    path: string;
+    visible: boolean;
+    previousMode: "browser" | "hidden";
+  } | null;
+  onCloseFilePreview?: () => void;
+  onReplaceFilePreviewPath?: (path: string) => void;
 }
 
 interface SessionAccessEvent {
@@ -73,8 +95,9 @@ interface SessionAccessEvent {
   host: string;
   already_granted?: boolean;
   alreadyGranted?: boolean;
+  navigationId?: string | null;
   /** Conversation that issued the navigation (see `owner` on the navigate
-   *  event). Null for the sidebar's own restore/reload. */
+   *  event). Ownerless payloads are treated as stale/legacy and ignored. */
   owner?: string | null;
 }
 
@@ -83,6 +106,8 @@ interface ActiveSessionAccessRequest {
   url: string;
   host: string;
   alreadyGranted: boolean;
+  navigationId: string;
+  owner: string | null;
 }
 
 interface V20CookieBlockEvent {
@@ -93,6 +118,7 @@ interface V20CookieBlockEvent {
   v20_count?: number;
   sources?: string[];
   reason?: string;
+  navigationId?: string | null;
   owner?: string | null;
 }
 
@@ -103,12 +129,15 @@ interface ActiveV20CookieBlock {
   v20Count: number;
   sources: string[];
   reason: string;
+  navigationId: string;
+  owner: string | null;
 }
 
 interface OwnedBrowserStateEvent {
   url?: string | null;
   title?: string | null;
   loading?: boolean | null;
+  navigationId?: string | null;
   owner?: string | null;
 }
 
@@ -123,11 +152,19 @@ function clampWidth(want: number, available: number): number {
   return Math.max(MIN_WIDTH, Math.min(want, max));
 }
 
-export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
+export function BrowserSidebar({
+  conversationId,
+  agentSessionId,
+  filePreview,
+  onCloseFilePreview,
+  onReplaceFilePreviewPath,
+}: BrowserSidebarProps) {
   const { settings, updateSettings } = useSettings();
   const [visible, setVisible] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const [currentUrl, setCurrentUrl] = useState<string | null>(null);
+  const [currentOwner, setCurrentOwner] = useState<string | null>(null);
+  const [currentNavigationId, setCurrentNavigationId] = useState<string | null>(null);
   const [currentTitle, setCurrentTitle] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [sessionAccessRequest, setSessionAccessRequest] =
@@ -154,12 +191,17 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
   const boundsRafRef = useRef<number | null>(null);
   /** True while the cookie-consent card is up — pushBounds must not re-show the native webview. */
   const sessionAccessActiveRef = useRef(false);
+  /** True while any Radix dialog/modal is open — pushBounds must not re-show the native webview. */
+  const dialogActiveRef = useRef(false);
   const dragStateRef = useRef<{ startX: number; startWidth: number } | null>(
     null,
   );
+  const previewActive = filePreview?.visible === true && !!filePreview.path;
+  const previewPath = previewActive ? filePreview.path : null;
 
   const effectiveWidth = clampWidth(requestedWidth, availableW);
-  const panelOpen = visible && !collapsed && effectiveWidth > 0;
+  const browserPanelOpen = visible && !collapsed && effectiveWidth > 0;
+  const panelOpen = previewActive || browserPanelOpen;
 
   useEffect(() => {
     try {
@@ -220,8 +262,9 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     const el = placeholderRef.current;
     if (!el) return;
     // Native child webviews sit above HTML — never position/show while the
-    // session-access card is visible (ResizeObserver races with hide()).
-    if (sessionAccessActiveRef.current) {
+    // session-access card or any dialog/modal is visible (the native webview
+    // would cover the HTML overlay otherwise).
+    if (sessionAccessActiveRef.current || dialogActiveRef.current) {
       await commands.ownedBrowserHide().catch(() => {});
       return;
     }
@@ -277,6 +320,37 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
   }, []);
 
   // ---------------------------------------------------------------------------
+  // Dialog/modal detection — hide the native webview when any Radix dialog is
+  // open, otherwise it covers the HTML overlay.
+  // ---------------------------------------------------------------------------
+
+  useEffect(() => {
+    // Only target full-page modal dialogs (with backdrop overlay), not small
+    // popovers or dropdown menus. Our DialogOverlay and AlertDialogOverlay
+    // components add data-modal-overlay; popovers/dropdowns don't have one.
+    const hasModalOverlay = () =>
+      document.querySelectorAll("[data-modal-overlay]").length > 0;
+
+    const sync = () => {
+      const open = hasModalOverlay();
+      if (open && !dialogActiveRef.current) {
+        dialogActiveRef.current = true;
+        commands.ownedBrowserHide().catch(() => {});
+      } else if (!open && dialogActiveRef.current) {
+        dialogActiveRef.current = false;
+        schedulePushBounds();
+      }
+    };
+
+    const observer = new MutationObserver(sync);
+    observer.observe(document.body, { childList: true, subtree: true });
+    // Check initial state in case a dialog is already open.
+    sync();
+
+    return () => observer.disconnect();
+  }, [schedulePushBounds]);
+
+  // ---------------------------------------------------------------------------
   // Viewport resize tracking — drives both the JS clamp and re-pushing bounds
   // ---------------------------------------------------------------------------
 
@@ -311,31 +385,91 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     const unlistenPromise = listen<OwnedBrowserNavigatePayload>(
       NAVIGATE_EVENT,
       (e) => {
-        const { url, owner } = parseNavigatePayload(e.payload);
+        const { url, owner, navigationId, reveal } = parseNavigatePayload(e.payload);
         if (!url) return;
         // The owned browser is a singleton shared across every chat and
         // background pipe. Ignore navigations owned by a *different*
         // conversation than the one on screen — otherwise a background pipe
         // (or another chat's agent) pops its page into whatever chat the user
         // is looking at, and `persistState` writes that URL into the wrong
-        // chat's file so it sticks on reopen. Untagged events (owner == null)
-        // are the sidebar's own restore/reload and are always honored.
-        if (isForeignNavigation(owner, conversationId)) return;
+        // chat's file so it sticks on reopen. Restore/reload paths now tag
+        // themselves with the foreground conversation id; ownerless events are
+        // treated as stale/legacy and ignored.
+        if (isForeignNavigation(owner, conversationId, agentSessionId)) {
+          if (typeof window !== "undefined") {
+            (window as any).__e2eOwnedBrowserLastNavigate = {
+              accepted: false,
+              conversationId,
+              agentSessionId,
+              owner,
+              navigationId,
+              reveal,
+              url,
+            };
+          }
+          // Diagnostic for the "agent navigated but the sidebar never opened"
+          // report: a *tagged* navigation we dropped because its owner matched
+          // neither the on-screen conversation nor its agent's session. Surfaces
+          // the exact id mismatch (or a missing owner header → owner null, which
+          // this skips since that's the expected stale/legacy case).
+          if (owner) {
+            console.debug(
+              "[browser-sidebar] dropped navigation not owned by this chat",
+              { owner, conversationId, agentSessionId, navigationId, url },
+            );
+          }
+          return;
+        }
+        if (!navigationId) return;
+        if (typeof window !== "undefined") {
+          (window as any).__e2eOwnedBrowserLastNavigate = {
+            accepted: true,
+            conversationId,
+            agentSessionId,
+            owner,
+            navigationId,
+            reveal,
+            url,
+          };
+        }
         setSessionAccessRequest(null);
         setSessionAccessAnswer(null);
         setV20CookieBlock(null);
-        setVisible(true);
-        setCollapsed(false);
         setCurrentUrl(url);
+        setCurrentOwner(owner);
+        setCurrentNavigationId(navigationId);
         setCurrentTitle(null);
         setLoading(true);
-        persistState({ url, collapsed: false });
+        if (reveal) {
+          setVisible(true);
+          setCollapsed(false);
+          persistState({ url, collapsed: false });
+        } else {
+          persistState({ url });
+        }
       },
     );
+    unlistenPromise.then(() => {
+      if (typeof window !== "undefined") {
+        (window as any).__e2eOwnedBrowserNavigateReady = {
+          conversationId,
+          agentSessionId,
+        };
+      }
+    }).catch(() => {});
     return () => {
+      if (typeof window !== "undefined") {
+        const ready = (window as any).__e2eOwnedBrowserNavigateReady;
+        if (
+          ready?.conversationId === conversationId &&
+          ready?.agentSessionId === agentSessionId
+        ) {
+          (window as any).__e2eOwnedBrowserNavigateReady = null;
+        }
+      }
       unlistenPromise.then((fn) => fn()).catch(() => {});
     };
-  }, [persistState, conversationId]);
+  }, [persistState, conversationId, agentSessionId]);
 
   useEffect(() => {
     const unlistenPromise = listen<SessionAccessEvent>(
@@ -346,13 +480,16 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
         if (!requestId || !payload?.url || !payload?.host) return;
         // Same ownership gate as the navigate event — a background pipe's
         // cookie-consent prompt must not surface in another chat.
-        if (isForeignNavigation(payload.owner, conversationId)) return;
+        if (isForeignNavigation(payload.owner, conversationId, agentSessionId)) return;
+        if (isMismatchedNavigation(payload.navigationId, currentNavigationId)) return;
         const request = {
           requestId,
           url: payload.url,
           host: payload.host,
           alreadyGranted:
             payload.alreadyGranted ?? payload.already_granted ?? false,
+          navigationId: payload.navigationId!,
+          owner: payload.owner ?? null,
         };
         setSessionAccessRequest(request);
         setSessionAccessAnswer(null);
@@ -360,6 +497,8 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
         setVisible(true);
         setCollapsed(false);
         setCurrentUrl(request.url);
+        setCurrentOwner(request.owner);
+        setCurrentNavigationId(request.navigationId);
         setCurrentTitle(null);
         setLoading(true);
         persistState({ url: request.url, collapsed: false });
@@ -369,7 +508,7 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     return () => {
       unlistenPromise.then((fn) => fn()).catch(() => {});
     };
-  }, [persistState, conversationId]);
+  }, [persistState, conversationId, currentNavigationId, agentSessionId]);
 
   useEffect(() => {
     const unlistenPromise = listen<V20CookieBlockEvent>(
@@ -377,7 +516,8 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
       (e) => {
         const payload = e.payload;
         if (!payload?.url || !payload?.host) return;
-        if (isForeignNavigation(payload.owner, conversationId)) return;
+        if (isForeignNavigation(payload.owner, conversationId, agentSessionId)) return;
+        if (isMismatchedNavigation(payload.navigationId, currentNavigationId)) return;
         const block = {
           url: payload.url,
           host: payload.host,
@@ -385,6 +525,8 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
           v20Count: payload.v20Count ?? payload.v20_count ?? 0,
           sources: payload.sources ?? [],
           reason: payload.reason ?? "v20",
+          navigationId: payload.navigationId!,
+          owner: payload.owner ?? null,
         };
         setSessionAccessRequest(null);
         setSessionAccessAnswer(null);
@@ -392,6 +534,8 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
         setVisible(true);
         setCollapsed(false);
         setCurrentUrl(block.url);
+        setCurrentOwner(block.owner);
+        setCurrentNavigationId(block.navigationId);
         setCurrentTitle(null);
         setLoading(false);
         persistState({ url: block.url, collapsed: false });
@@ -401,7 +545,7 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     return () => {
       unlistenPromise.then((fn) => fn()).catch(() => {});
     };
-  }, [persistState, conversationId]);
+  }, [persistState, conversationId, currentNavigationId, agentSessionId]);
 
   useEffect(() => {
     sessionAccessActiveRef.current =
@@ -434,7 +578,13 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
             // Extension is now connected — retry the navigation, which will
             // go through the extension cookie path.
             setV20CookieBlock(null);
-            commands.ownedBrowserNavigate(retryUrl).catch(() => {});
+            commands
+              .ownedBrowserNavigate(
+                retryUrl,
+                v20CookieBlock.owner ?? currentOwner ?? conversationId ?? null,
+                true,
+              )
+              .catch(() => {});
           }
         } else {
           setExtensionConnected(false);
@@ -461,13 +611,16 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
       // them so the foreign URL/title isn't persisted into this chat (the
       // sticky half of the leak: without this the URL is restored on reopen
       // even though the panel never visibly popped).
-      if (isForeignNavigation(payload.owner, conversationId)) return;
+      if (isForeignNavigation(payload.owner, conversationId, agentSessionId)) return;
+      if (isMismatchedNavigation(payload.navigationId, currentNavigationId)) return;
 
       if (typeof payload.url === "string" && payload.url.length > 0) {
         if (payload.url !== currentUrl) {
           setCurrentTitle(null);
         }
         setCurrentUrl(payload.url);
+        setCurrentOwner(payload.owner ?? conversationId ?? null);
+        setCurrentNavigationId(payload.navigationId!);
         persistState({ url: payload.url });
       }
       if (typeof payload.title === "string") {
@@ -481,7 +634,7 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     return () => {
       unlistenPromise.then((fn) => fn()).catch(() => {});
     };
-  }, [currentUrl, persistState, conversationId]);
+  }, [currentNavigationId, currentUrl, persistState, conversationId, agentSessionId]);
 
   // ---------------------------------------------------------------------------
   // Per-conversation restore
@@ -493,6 +646,8 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
       setVisible(false);
       setCollapsed(false);
       setCurrentUrl(null);
+      setCurrentOwner(null);
+      setCurrentNavigationId(null);
       setCurrentTitle(null);
       setLoading(false);
       setSessionAccessRequest(null);
@@ -520,6 +675,8 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
         setVisible(true);
         setCollapsed(wasCollapsed);
         setCurrentUrl(url);
+        setCurrentOwner(conversationId);
+        setCurrentNavigationId(null);
         setCurrentTitle(null);
         setLoading(!wasCollapsed);
         // The webview install runs on a background task that retries
@@ -530,7 +687,7 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
         // browser silently fails to restore. Retry once when Rust emits
         // `owned-browser:ready` so the saved state survives app quit.
         const tryNavigate = () =>
-          commands.ownedBrowserNavigate(url).catch((e) => {
+          commands.ownedBrowserNavigate(url, conversationId, false).catch((e) => {
             const msg = typeof e === "string" ? e : String(e);
             return msg.includes("not initialized") ? "retry" : null;
           });
@@ -547,6 +704,8 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
         setVisible(false);
         setCollapsed(false);
         setCurrentUrl(null);
+        setCurrentOwner(null);
+        setCurrentNavigationId(null);
         setCurrentTitle(null);
         setLoading(false);
         setV20CookieBlock(null);
@@ -559,6 +718,12 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     };
   }, [conversationId]);
 
+  useEffect(() => {
+    if (previewActive) {
+      commands.ownedBrowserHide().catch(() => {});
+    }
+  }, [previewActive]);
+
   // ---------------------------------------------------------------------------
   // Bounds tracking — covers slide-in, window resize, drag-resize, and
   // chat/app sidebar layout changes. The native browser is now a child
@@ -568,6 +733,10 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
 
   useEffect(() => {
     if (!panelOpen) {
+      commands.ownedBrowserHide().catch(() => {});
+      return;
+    }
+    if (previewActive) {
       commands.ownedBrowserHide().catch(() => {});
       return;
     }
@@ -587,7 +756,7 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     return () => {
       ro.disconnect();
     };
-  }, [panelOpen, effectiveWidth, availableW, schedulePushBounds]);
+  }, [panelOpen, effectiveWidth, availableW, schedulePushBounds, previewActive]);
 
   // ---------------------------------------------------------------------------
   // Drag-resize
@@ -642,11 +811,15 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     if (!currentUrl) return;
     try {
       setLoading(true);
-      await commands.ownedBrowserNavigate(currentUrl);
+      await commands.ownedBrowserNavigate(
+        currentUrl,
+        currentOwner ?? conversationId ?? null,
+        true,
+      );
     } catch (e) {
       console.error("reload failed", e);
     }
-  }, [currentUrl]);
+  }, [conversationId, currentOwner, currentUrl]);
 
   const setCookieAccessGranted = useCallback(
     async (granted: boolean) => {
@@ -660,10 +833,16 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
     if (!currentUrl) return;
     await commands.confirmBrowserCookieAccessForSession();
     setLoading(true);
-    await commands.ownedBrowserNavigate(currentUrl).catch((e) => {
-      console.error("retry cookie navigation failed", e);
-    });
-  }, [currentUrl]);
+    await commands
+      .ownedBrowserNavigate(
+        currentUrl,
+        currentOwner ?? conversationId ?? null,
+        true,
+      )
+      .catch((e) => {
+        console.error("retry cookie navigation failed", e);
+      });
+  }, [conversationId, currentOwner, currentUrl]);
 
   const clearBrowserData = useCallback(async () => {
     try {
@@ -673,12 +852,16 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
       await commands.ownedBrowserClearBrowsingData();
       if (currentUrl) {
         setLoading(true);
-        await commands.ownedBrowserNavigate(currentUrl);
+        await commands.ownedBrowserNavigate(
+          currentUrl,
+          currentOwner ?? conversationId ?? null,
+          true,
+        );
       }
     } catch (e) {
       console.error("clear owned-browser browsing data failed", e);
     }
-  }, [currentUrl, setCookieAccessGranted]);
+  }, [conversationId, currentOwner, currentUrl, setCookieAccessGranted]);
 
   const enableAndRetryWithCookies = useCallback(async () => {
     await setCookieAccessGranted(true);
@@ -816,60 +999,70 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-10 w-1 rounded-full bg-border group-hover/resize:bg-foreground/60 group-hover/resize:w-1.5 transition-all" />
           </div>
 
-          <div className="relative flex items-center gap-2 px-3 h-10 border-b border-border/50 bg-background/60 pl-4">
-            <div
-              className="flex-1 min-w-0 text-muted-foreground"
-              title={currentUrl ?? headerTitle}
-            >
-              <div className="text-xs truncate">{headerTitle}</div>
-              {currentTitle && currentUrl && (
-                <div className="text-[10px] leading-3 truncate opacity-70">
-                  {currentUrl}
+          {previewActive ? (
+            previewPath ? (
+              <FilePreviewSidebar
+                path={previewPath}
+                onClose={onCloseFilePreview}
+                onReplacePath={onReplaceFilePreviewPath}
+              />
+            ) : null
+          ) : (
+            <>
+              <div className="relative flex items-center gap-2 px-3 h-10 border-b border-border/50 bg-background/60 pl-4">
+                <div
+                  className="flex-1 min-w-0 text-muted-foreground"
+                  title={currentUrl ?? headerTitle}
+                >
+                  <div className="text-xs truncate">{headerTitle}</div>
+                  {currentTitle && currentUrl && (
+                    <div className="text-[10px] leading-3 truncate opacity-70">
+                      {currentUrl}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
-            {isMac && (
-              <button
-                onClick={openCookieMenu}
-                title="Browser session cookies"
-                className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-              >
-                <Cookie className="h-3.5 w-3.5" />
-              </button>
-            )}
-            <button
-              onClick={reload}
-              title="Reload"
-              className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-            >
-              <RotateCw className="h-3.5 w-3.5" />
-            </button>
-            <button
-              onClick={collapse}
-              title="Hide panel"
-              className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-            >
-              <PanelRightClose className="h-3.5 w-3.5" />
-            </button>
-            {loading && (
-              <div
-                className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-0.5 overflow-hidden bg-border/25"
-                role="progressbar"
-                aria-label="Page loading"
-              >
-                <div className="h-full w-1/3 min-w-20 bg-foreground/70 animate-owned-browser-load" />
+                {isMac && (
+                  <button
+                    onClick={openCookieMenu}
+                    title="Browser session cookies"
+                    className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+                  >
+                    <Cookie className="h-3.5 w-3.5" />
+                  </button>
+                )}
+                <button
+                  onClick={reload}
+                  title="Reload"
+                  className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+                >
+                  <RotateCw className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  onClick={collapse}
+                  title="Hide panel"
+                  className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+                >
+                  <PanelRightClose className="h-3.5 w-3.5" />
+                </button>
+                {loading && (
+                  <div
+                    className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-0.5 overflow-hidden bg-border/25"
+                    role="progressbar"
+                    aria-label="Page loading"
+                  >
+                    <div className="h-full w-1/3 min-w-20 bg-foreground/70 animate-owned-browser-load" />
+                  </div>
+                )}
               </div>
-            )}
-          </div>
-          {/* Placeholder — native child webview is positioned over this rect only. */}
-          <div
-            ref={placeholderRef}
-            className="flex-1 bg-background relative"
-            aria-hidden={
-              sessionAccessRequest || v20CookieBlock ? true : undefined
-            }
-          />
-          {sessionAccessRequest && (
+              {/* Placeholder — native child webview is positioned over this rect only. */}
+              <div
+                ref={placeholderRef}
+                className="flex-1 bg-background relative"
+                aria-hidden={
+                  sessionAccessRequest || v20CookieBlock ? true : undefined
+                }
+              />
+              {sessionAccessRequest && (
             <div className="absolute inset-0 z-40 flex items-center justify-center bg-background p-4">
                 <div className="w-full max-w-sm border border-border bg-card p-4 shadow-sm">
                   <div className="mb-3 flex items-start gap-3">
@@ -924,7 +1117,7 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
                 </div>
             </div>
           )}
-          {v20CookieBlock && (
+              {v20CookieBlock && (
             <div className="absolute inset-0 z-40 flex items-center justify-center bg-background p-4">
                 <div className="w-full max-w-sm border border-border bg-card p-4 shadow-sm">
                   <div className="mb-3 flex items-start gap-3">
@@ -1006,6 +1199,8 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
                   </div>
                 </div>
             </div>
+              )}
+            </>
           )}
         </div>
       )}
@@ -1013,7 +1208,7 @@ export function BrowserSidebar({ conversationId }: BrowserSidebarProps) {
       {/* Floating re-open affordance: shown when a URL is saved but the
           panel is collapsed. Pinned to the viewport's top-right corner so
           it's discoverable regardless of the chat layout state. */}
-      {visible && collapsed && currentUrl && (
+      {!previewActive && visible && collapsed && currentUrl && (
         <button
           onClick={expand}
           title={`Show browser (${currentUrl})`}

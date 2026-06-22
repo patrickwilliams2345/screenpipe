@@ -7,10 +7,12 @@ import React from "react";
 import { useSettings, Settings } from "@/lib/hooks/use-settings";
 import { Switch } from "@/components/ui/switch";
 import type { SettingsField } from "./settings-search";
+import { NotificationSamplePreview } from "./setting-previews";
 
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
   { label: "Capture stalls" },
+  { label: "Power mode changes" },
   { label: "App updates" },
   { label: "Pipe suggestions" },
   { label: "Pipe notifications" },
@@ -30,6 +32,7 @@ import { commands } from "@/lib/utils/tauri";
 
 const defaultPrefs = {
   captureStalls: true,
+  powerModeChanges: true,
   appUpdates: true,
   pipeSuggestions: true,
   pipeNotifications: true,
@@ -61,6 +64,8 @@ export function NotificationsSettings() {
         </p>
       </div>
 
+      <NotificationSamplePreview />
+
       <div className="space-y-1">
         {/* Capture stalls */}
         <div className="flex items-center justify-between py-3 border-b border-border">
@@ -79,6 +84,21 @@ export function NotificationsSettings() {
                 showRestartNotifications: v,
               } as Partial<Settings>);
             }}
+          />
+        </div>
+
+        {/* Power mode changes */}
+        <div className="flex items-center justify-between py-3 border-b border-border">
+          <div>
+            <p className="text-sm font-medium">Power mode changes</p>
+            <p className="text-xs text-muted-foreground">
+              Tells you when battery saver turns on (Balanced or Saver). You&apos;ll still get critical alerts if recording pauses on low battery.
+            </p>
+          </div>
+          <Switch
+            data-testid="notification-pref-power-mode-changes"
+            checked={prefs.powerModeChanges ?? true}
+            onCheckedChange={(v) => updatePref("powerModeChanges", v)}
           />
         </div>
 
@@ -173,7 +193,7 @@ export function NotificationsSettings() {
           <div>
             <p className="text-sm font-medium">Display changes</p>
             <p className="text-xs text-muted-foreground">
-              Toast when a monitor is plugged, unplugged, or switched (clamshell, dock)
+              Tells you when a monitor is plugged in, unplugged, or switched (laptop lid closed, docking)
             </p>
           </div>
           <Switch

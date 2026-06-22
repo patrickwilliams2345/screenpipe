@@ -5,7 +5,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-import { ChevronLeft, ChevronRight, RefreshCw, CalendarIcon, Search, Play, Pause, Loader2, Mic, Volume2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, ChevronDown, RefreshCw, CalendarIcon, Search, Play, Pause, Loader2, Mic, Volume2 } from "lucide-react";
 import {
 	format,
 	isAfter,
@@ -34,6 +34,10 @@ interface TimeRange {
 interface TimelineControlsProps {
 	startAndEndDates: TimeRange;
 	currentDate: Date;
+	// Timestamp of the frame currently under the playhead. Drives the time
+	// shown in the date pill so the label tracks the cursor minute-to-minute
+	// (currentDate only changes when the day changes). Null until frames load.
+	currentTime?: Date | null;
 	onDateChange: (date: Date) => Promise<any>;
 	onJumpToday: () => void;
 	onSearchClick?: () => void;
@@ -54,6 +58,7 @@ interface TimelineControlsProps {
 export function TimelineControls({
 	startAndEndDates,
 	currentDate,
+	currentTime,
 	onDateChange,
 	onJumpToday,
 	onSearchClick,
@@ -170,7 +175,12 @@ export function TimelineControls({
 								) : (
 									<CalendarIcon className="h-3 w-3" />
 								)}
-								<span>{format(currentDate, "d MMM yyyy")}</span>
+								{/* Show just the date, e.g. "Jun 19" — the exact time is already
+								    shown by the playhead chip on the timeline, so repeating it here
+								    is redundant. Prefer the date of the frame under the playhead;
+								    fall back to currentDate during the brief load window. */}
+								<span>{format(currentTime ?? currentDate, "MMM d")}</span>
+								<ChevronDown className="h-3 w-3 opacity-60" />
 							</button>
 						</PopoverTrigger>
 						<PopoverContent
@@ -181,7 +191,7 @@ export function TimelineControls({
 						<Calendar
 							mode="single"
 							selected={currentDate}
-							onSelect={(date) => {
+							fromMonth={startOfDay(startAndEndDates.start)} toMonth={new Date()} onSelect={(date) => {
 								console.log("[Calendar] onSelect called with:", date?.toISOString(), "currentDate:", currentDate.toISOString());
 								if (date) {
 									onDateChange(date);

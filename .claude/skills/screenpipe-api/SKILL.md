@@ -21,6 +21,8 @@ The `$SCREENPIPE_LOCAL_API_KEY` env var is already set in your environment. With
 
 API responses can be large. Always write curl output to a file first (`curl ... -o /tmp/sp_result.json`), check size (`wc -c /tmp/sp_result.json`), and if over 5KB read only the first 50-100 lines. Extract what you need with `jq`. NEVER dump full large responses into context.
 
+For the list endpoints (`/search`, `/elements`, `/frames/{id}/elements`) you can also cut tokens at the source: add `&format=csv` (or `tsv`) to get a columnar table that writes each column name once instead of repeating keys per row, and `&fields=a,b,c` to return only the columns you need (dotted paths like `content.text`). On a list of UI elements that is roughly a 70% token cut versus JSON. For the element endpoints specifically, `&format=outline` (alias `tree`) goes further still — a deduped, indented tree of just the text-bearing nodes (~91% fewer tokens, measured) — and is the best default for reading UI structure. Text-heavy `ocr`/`audio` barely benefit from any reshaping (the text blob dominates), so reach for `fields` + `max_content_length` there. With no `format`/`fields` the response is unchanged JSON.
+
 ---
 
 ## 1. Search — `GET /search`
@@ -44,7 +46,10 @@ curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030
 | `speaker_name` | string | No | Filter audio by speaker (case-insensitive partial) |
 | `focused` | boolean | No | Only focused windows |
 | `tags` | string | No | Comma-separated; return only items carrying ALL of them (e.g. `person:ada,project:atlas`). Works for screen/audio and, with `content_type=memory`, memories. See Tags below. |
+| `include_related` | boolean | No | With `tags`, also return a `related` map of co-occurring tags (people/projects/workflows seen alongside yours), most-frequent first. One call for the surrounding context instead of several. See Tags below. |
 | `max_content_length` | integer | No | Truncate each result's text (middle-truncation) |
+| `format` | string | No | `json` (default), `csv`, `tsv`/`table`, or `outline`/`tree` (element endpoints only). CSV/TSV return a columnar table (column names written once) instead of one JSON object per row. `outline` returns a deduped indented text tree of the text-bearing UI nodes — the cheapest read for "what's on screen?" (~91% fewer tokens). CSV is lossless; TSV collapses newlines (worse for long `ocr` text). |
+| `fields` | string | No | Comma-separated column allowlist of dotted paths, e.g. `type,content.app_name,content.text`. Returns only those columns (handy for dropping the repeated absolute `content.file_path`). Works for `json` too (sparse objects). |
 
 ### Progressive Disclosure
 
@@ -74,7 +79,15 @@ Tags are a shared label layer across screen, audio, and memories under one strin
 - Add to a memory: include `tags` in `POST /memories` (or `PUT /memories/{id}`).
 - Retrieve by tag: `GET /search?tags=person:ada&start_time=30d%20ago` (screen+audio), or add `content_type=memory` for memories. Multiple tags AND together; matching is exact, not substring.
 
-Frames are pruned by retention, so for a durable link tag a memory (memories also carry `created_at` and a `frame_id` back to the moment). To pull everything about a person across time: one call for captures (`content_type=all&tags=person:ada`) plus one for facts (`content_type=memory&tags=person:ada`).
+Frames are pruned by retention, so for a durable link tag a memory (memories also carry `created_at` and a `frame_id` back to the moment — jump there with `GET /frames/{frame_id}`). To pull everything about a person across time: one call for captures (`content_type=all&tags=person:ada`) plus one for facts (`content_type=memory&tags=person:ada`).
+
+Add `include_related=true` to a tag query to get the surrounding context in the same response — the tags that co-occur with yours, grouped by namespace (prefix pluralized: `person:`→`people`, `project:`→`projects`) and ranked by frequency. Replaces the 2-3 follow-up "who/what else" calls with one:
+
+```bash
+curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" \
+  "http://localhost:3030/search?tags=person:ada&include_related=true&limit=5"
+# data: [...], related: { "people": ["connor","drew"], "projects": ["atlas"], "workflows": ["planning"] }
+```
 
 ### Critical Rules
 
@@ -129,7 +142,23 @@ Lightweight FTS search across UI elements (~100-500 bytes each vs 5-20KB from `/
 curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/elements?q=Submit&start_time=1h%20ago&limit=10"
 ```
 
-Parameters: `q`, `frame_id`, `source` (`accessibility`|`ocr`), `role`, `start_time`, `end_time`, `app_name`, `limit`, `offset`.
+Parameters: `q`, `frame_id`, `source` (`accessibility`|`ocr`), `role`, `start_time`, `end_time`, `app_name`, `limit`, `offset`, plus `format` (`json`/`csv`/`tsv`/`outline`) and `fields` (dotted paths). Elements are uniform rows, so this is where compact formats pay off most.
+
+**`format=outline` (alias `tree`) is the cheapest read for "what's on screen?"** — a deduped, indented text tree of just the text-bearing nodes (drops empty structural nodes + bounds, collapses repeats into `×N`, `#id` is the ref, inlines `(disabled)`/`(selected)`/`(focused)`/`(expanded)`/`(off-screen)` state, body capped). Best on `source=accessibility` (the common UI case — structural noise, repeated rows, hierarchy, state): 85–99% fewer tokens than JSON (o200k_base). Flat OCR text blocks are the floor (~67%, nothing to dedup) — for pure OCR `format=csv&fields=text` is about as good.
+
+```bash
+# compact outline — best default for an LLM reading the UI
+curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/elements?q=Submit&format=outline&limit=30"
+#   frame 12345 · accessibility · 8 text elements
+#     AXButton "Submit Order" #4012
+#     AXButton "Cancel" #4013 (disabled)
+#     AXCell "Shipped" #4020 ×6
+
+# columnar table when you need specific columns (e.g. bounds) instead
+curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/elements?frame_id=12345&format=csv&fields=role,text,bounds.left,bounds.top"
+```
+
+`GET /frames/{id}/elements?format=outline` gives the whole frame's tree the same way (and is capped, unlike the raw JSON dump).
 
 ### Frame Context — `GET /frames/{id}/context`
 
@@ -277,14 +306,14 @@ Common patterns: `GROUP BY date(timestamp)` (daily), `GROUP BY strftime('%H:00',
 ## 8. Connections — `GET /connections`
 
 ```bash
-# List all integrations (Telegram, Slack, Discord, Email, Todoist, Teams)
+# List all integrations (Telegram, Slack, Discord, Email, Todoist, Teams, 40+)
 curl http://localhost:3030/connections
 
-# Get credentials for a connected service
+# Get saved credentials for a webhook/token integration
 curl http://localhost:3030/connections/telegram
 ```
 
-Returns credentials to use with service APIs directly:
+**Credential integrations** — `GET /connections/<id>` returns saved fields to use with the service API directly:
 - **Telegram**: `bot_token` + `chat_id` → `POST https://api.telegram.org/bot{token}/sendMessage`
 - **Slack**: `webhook_url` → `POST {webhook_url}` with `{"text": "..."}`
 - **Discord**: `webhook_url` → `POST {webhook_url}` with `{"content": "..."}`
@@ -292,19 +321,48 @@ Returns credentials to use with service APIs directly:
 - **Teams**: `webhook_url` → `POST {webhook_url}` with `{"text": "..."}`
 - **Email**: `smtp_host`, `smtp_port`, `smtp_user`, `smtp_pass`, `from_address`
 
+**OAuth/proxy integrations** — tokens are stored in SecretStore and are never exposed via `GET /connections/<id>`. Call the local proxy instead; it injects auth and forwards to the upstream API:
+
+```bash
+# GitHub — create an issue (repo owner/name from pipe settings)
+curl -X POST http://localhost:3030/connections/github/proxy/repos/OWNER/REPO/issues \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Found a bug","body":"Steps to reproduce..."}'
+
+# GitHub — comment on an issue
+curl -X POST http://localhost:3030/connections/github/proxy/repos/OWNER/REPO/issues/42/comments \
+  -H "Content-Type: application/json" \
+  -d '{"body":"Thanks for the report!"}'
+
+# Generic OAuth proxy pattern (Zoom, Vercel, Google Docs, Microsoft 365, etc.)
+curl -X POST http://localhost:3030/connections/<id>/proxy/<upstream-api-path> \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+```
+
+Do **not** call `https://api.github.com/...` directly from a pipe — use `/connections/github/proxy/...` instead. There is no `/connections/<id>/token` endpoint.
+
 If not connected, tell user to set up in Settings > Connections.
 
 ---
 
-## 9. Meetings — `GET /meetings`
+## 9. Meetings — `GET /meetings`, `PUT /meetings/:id`
 
 ```bash
 curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/meetings?start_time=1d%20ago&end_time=now&limit=10&offset=0"
 curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/meetings?q=alice%40acme.com"
 curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/meetings/42"
+
+# Update mutable fields. This is a partial update body: omitted fields stay as-is.
+curl -X PUT http://localhost:3030/meetings/42 \
+  -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Q3 planning", "note":"<existing note>\n\n## Summary\n<summary>"}'
 ```
 
 Returns detected meetings (from calendar, app detection, window titles, UI elements, multi-speaker audio). `q` is a case-insensitive substring filter against title, attendees, and notes.
+
+Meeting updates use `PUT /meetings/:id`, not PATCH. Before appending an AI-generated summary, read the current meeting first and include the existing `note` text in the new note body so user-written notes are preserved.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -314,6 +372,7 @@ Returns detected meetings (from calendar, app detection, window titles, UI eleme
 | `meeting_app` | string | App (zoom, teams, meet, etc.) |
 | `title` | string? | Meeting title |
 | `attendees` | string? | Attendees |
+| `note` | string? | User notes / appended AI summaries |
 | `detection_source` | string | How detected (`app`, `calendar`, `ui`, etc.) |
 
 Also available via raw SQL: `SELECT * FROM meetings WHERE meeting_start > datetime('now', '-24 hours') LIMIT 20`

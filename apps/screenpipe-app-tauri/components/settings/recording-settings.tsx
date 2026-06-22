@@ -8,6 +8,7 @@ const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
 
 import React, { useEffect, useState, useMemo, useCallback } from "react";
 import { useSettingsIndexDriftCheck, type SettingsField } from "./settings-search";
+import { CaptureFrequencyPreview, AudioCaptureModePreview } from "./setting-previews";
 
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
@@ -28,13 +29,14 @@ export const searchIndex: SettingsField[] = [
   { label: "Screen recording", keywords: ["screen", "video"] },
   { label: "Use all monitors", keywords: ["monitor", "display"] },
   { label: "Recording quality", keywords: ["fps", "quality"] },
+  // conditional: hidden when screen recording is off (same gate as Recording quality).
+  { label: "Capture frequency", keywords: ["screenshot", "interval", "idle", "cadence", "every", "minimum"], conditional: true },
   // conditional: monitor picker only renders when "Use all monitors" is off.
   { label: "Monitors", conditional: true },
   { label: "HD recording for meetings", keywords: ["hd", "meeting"] },
   { label: "Chinese mirror", keywords: ["china", "mirror"] },
 ];
 import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -81,7 +83,7 @@ import {
   CheckCircle2,
   XCircle,
   Circle,
-  Upload,
+  Download,
   Trash2,
   Search,
   ListTodo,
@@ -105,6 +107,7 @@ import {
   useSettings,
   Settings,
 } from "@/lib/hooks/use-settings";
+import { hasAppEntitlement } from "@/lib/app-entitlement";
 import { useToast } from "@/components/ui/use-toast";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { localFetch } from "@/lib/api";
@@ -117,7 +120,16 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { platform } from "@tauri-apps/plugin-os";
 import posthog from "posthog-js";
-import { Language } from "@/lib/language";
+import {
+  Language,
+  areLanguageSelectionsEqual,
+  filterLanguagesForTranscriptionEngine,
+  getLanguageOptionsForTranscriptionEngine,
+  getTranscriptionEngineLanguageSupportKey,
+  hasLimitedLanguageSupport,
+  resolveLanguageSelectionForTranscriptionEngine,
+  transcriptionEngineUsesLanguageHints,
+} from "@/lib/language";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ToastAction } from "@/components/ui/toast";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
@@ -134,6 +146,7 @@ import * as Sentry from "@sentry/react";
 import { defaultOptions } from "tauri-plugin-sentry-api";
 import { useLoginDialog } from "../login-dialog";
 import { BatterySaverSection } from "./battery-saver-section";
+import { ApplyRestartBar } from "./apply-restart-bar";
 // ScheduleSettings moved to privacy-section
 import { ValidatedInput } from "../ui/validated-input";
 import {
@@ -178,6 +191,7 @@ const TRANSCRIPTION_ENGINE_LABELS: Record<string, string> = {
   "openai-compatible": "OpenAI Compatible",
   "qwen3-asr": "Qwen3-ASR",
   parakeet: "Parakeet",
+  "parakeet-mlx": "Parakeet MLX",
   disabled: "Disabled (capture only)",
 };
 
@@ -192,10 +206,17 @@ type AudioEngineResolution = {
   fallbackReason: AudioEngineFallbackReason | null;
 };
 
+type AudioEngineResolutionSettings = Pick<
+  Settings,
+  "audioTranscriptionEngine" | "deepgramApiKey" | "user"
+>;
+
 const getTranscriptionEngineLabel = (engine: string) =>
   TRANSCRIPTION_ENGINE_LABELS[engine] ?? engine;
 
-const getAudioEngineResolution = (settings: Settings): AudioEngineResolution => {
+const getAudioEngineResolution = (
+  settings: AudioEngineResolutionSettings
+): AudioEngineResolution => {
   const requested = settings.audioTranscriptionEngine;
   const fallback = FALLBACK_TRANSCRIPTION_ENGINE;
   const hasCloudAuth = Boolean(settings.user?.token || settings.user?.id);
@@ -211,7 +232,7 @@ const getAudioEngineResolution = (settings: Settings): AudioEngineResolution => 
     };
   }
 
-  if (requested === "screenpipe-cloud" && !settings.user?.cloud_subscribed) {
+  if (requested === "screenpipe-cloud" && !hasAppEntitlement(settings.user as any)) {
     return {
       requested,
       active: fallback,
@@ -1277,7 +1298,7 @@ function TranscriptionDictionary({
               className="h-7 text-xs px-2 gap-1"
               onClick={() => setShowBulk(!showBulk)}
             >
-              <Upload className="h-3 w-3" />
+              <Download className="h-3 w-3" />
               bulk import
             </Button>
             {vocabularyWords.length > 0 && (
@@ -1631,7 +1652,7 @@ function HighFpsCard({
             <div className="flex flex-col gap-1">
               {(
                 [
-                  { v: "ask" as const, label: "Ask me", hint: "Adds a “+ HD” action to the meeting-start notification (recommended)" },
+                  { v: "ask" as const, label: "Ask me", hint: "Adds an “open note + HD” action to the meeting-start notification — one click opens the note and starts HD (recommended)" },
                   { v: "always" as const, label: "Always record at HD", hint: "Auto-start every detected meeting — more disk + CPU per call" },
                   { v: "never" as const, label: "Never", hint: "No prompt; only the tray timer can start a session" },
                 ] satisfies Array<{ v: HdDefaultMode; label: string; hint: string }>
@@ -1874,10 +1895,53 @@ export function RecordingSettings() {
       settings.audioTranscriptionEngine,
       settings.deepgramApiKey,
       settings.user?.cloud_subscribed,
+      settings.user?.app_entitled,
+      settings.user?.entitlement,
       settings.user?.id,
       settings.user?.token,
     ]
   );
+  const hasCloudTranscriptionAccess = hasAppEntitlement(settings.user as any);
+  const languageSupportEngine = audioEngineResolution.active;
+  const languageSupportKey =
+    getTranscriptionEngineLanguageSupportKey(languageSupportEngine);
+  const languageSelectionsBySupportKeyRef = React.useRef<Record<string, string[]>>(
+    {}
+  );
+  const languageSelectionSnapshotRef = React.useRef<{
+    supportKey: string;
+    languages: string[];
+  }>({
+    supportKey: languageSupportKey,
+    languages: [...settings.languages],
+  });
+  const supportedLanguageOptions = useMemo(
+    () => getLanguageOptionsForTranscriptionEngine(languageSupportEngine),
+    [languageSupportEngine]
+  );
+  const languageSupportIsLimited = hasLimitedLanguageSupport(languageSupportEngine);
+  const languageSupportLabel = getTranscriptionEngineLabel(languageSupportEngine);
+  const languageSelectionUsesHints =
+    transcriptionEngineUsesLanguageHints(languageSupportEngine);
+  const languageSupportDescription =
+    settings.languages.length === 0
+      ? languageSupportIsLimited
+        ? `Auto-detects among ${supportedLanguageOptions.length} languages supported by ${languageSupportLabel}`
+        : "Automatically detects spoken language"
+      : !languageSelectionUsesHints
+        ? `${settings.languages.length} supported selected for ${languageSupportLabel}`
+        : languageSupportIsLimited
+          ? `Restricts transcription to selected languages supported by ${languageSupportLabel}`
+          : "Restricts transcription to selected";
+  const selectedLanguageNames = settings.languages
+    .map((code) => supportedLanguageOptions.find((language) => language.code === code)?.name ?? code)
+    .join(", ");
+  const languageTriggerLabel =
+    settings.languages.length === 0
+      ? "Auto-detect"
+      : settings.languages.length <= 2
+        ? selectedLanguageNames
+        : `${settings.languages.length} selected`;
 
   // Add new state to track if settings have changed
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
@@ -1950,6 +2014,54 @@ export function RecordingSettings() {
     };
     checkPlatform();
   }, []);
+
+  useEffect(() => {
+    const previousSnapshot = languageSelectionSnapshotRef.current;
+    const supportKeyChanged = previousSnapshot.supportKey !== languageSupportKey;
+    if (supportKeyChanged) {
+      languageSelectionsBySupportKeyRef.current[previousSnapshot.supportKey] = [
+        ...previousSnapshot.languages,
+      ];
+    }
+
+    const preferredLanguages = supportKeyChanged
+      ? languageSelectionsBySupportKeyRef.current[languageSupportKey]
+      : undefined;
+    const resolvedLanguages = resolveLanguageSelectionForTranscriptionEngine(
+      settings.languages,
+      languageSupportEngine,
+      preferredLanguages
+    );
+
+    if (!areLanguageSelectionsEqual(settings.languages, resolvedLanguages)) {
+      languageSelectionSnapshotRef.current = {
+        supportKey: languageSupportKey,
+        languages: resolvedLanguages,
+      };
+      handleSettingsChange({ languages: resolvedLanguages }, false);
+      return;
+    }
+
+    const supportedLanguages = filterLanguagesForTranscriptionEngine(
+      settings.languages,
+      languageSupportEngine
+    );
+    if (areLanguageSelectionsEqual(settings.languages, supportedLanguages)) {
+      languageSelectionsBySupportKeyRef.current[languageSupportKey] = [
+        ...settings.languages,
+      ];
+    }
+
+    languageSelectionSnapshotRef.current = {
+      supportKey: languageSupportKey,
+      languages: [...settings.languages],
+    };
+  }, [
+    settings.languages,
+    languageSupportEngine,
+    languageSupportKey,
+    handleSettingsChange,
+  ]);
 
   // Listen for data-dir-fallback event (custom dir unavailable, fell back to default)
   useEffect(() => {
@@ -2196,9 +2308,9 @@ export function RecordingSettings() {
     }
 
     // If trying to use cloud but not subscribed
-    if (value === "screenpipe-cloud" && !settings.user?.cloud_subscribed) {
+    if (value === "screenpipe-cloud" && !hasCloudTranscriptionAccess) {
       try {
-        const response = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
+        const response = await fetch("https://screenpipe.com/api/cloud-sync/checkout", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -2220,15 +2332,48 @@ export function RecordingSettings() {
       return;
     }
 
-    // Only proceed with the change if all checks pass
-    const newSettings = realtime
-      ? { realtimeAudioTranscriptionEngine: value }
-      : { audioTranscriptionEngine: value };
+    let newSettings: Partial<Settings>;
+    if (realtime) {
+      newSettings = { realtimeAudioTranscriptionEngine: value };
+    } else {
+      languageSelectionsBySupportKeyRef.current[languageSupportKey] = [
+        ...settings.languages,
+      ];
+      languageSelectionSnapshotRef.current = {
+        supportKey: languageSupportKey,
+        languages: [...settings.languages],
+      };
+
+      const nextAudioEngineResolution = getAudioEngineResolution({
+        ...settings,
+        audioTranscriptionEngine: value,
+      });
+      const nextLanguageSupportEngine = nextAudioEngineResolution.active;
+      const nextLanguageSupportKey =
+        getTranscriptionEngineLanguageSupportKey(nextLanguageSupportEngine);
+      const preferredLanguages =
+        languageSelectionsBySupportKeyRef.current[nextLanguageSupportKey];
+
+      newSettings = {
+        audioTranscriptionEngine: value,
+        languages: resolveLanguageSelectionForTranscriptionEngine(
+          settings.languages,
+          nextLanguageSupportEngine,
+          preferredLanguages
+        ),
+      };
+    }
+
     handleSettingsChange(newSettings, true);
   };
 
 
-  const handleLanguageChange = (currentValue: Language) => {
+  const handleLanguageChange = (currentValue: Language | null) => {
+    if (!currentValue) {
+      handleSettingsChange({ languages: [] });
+      return;
+    }
+
     const updatedLanguages = settings.languages.includes(currentValue)
       ? settings.languages.filter((id) => id !== currentValue)
       : [...settings.languages, currentValue];
@@ -2469,60 +2614,41 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </CardContent>
         </Card>
 
-        {/* Your Name + Train Voice — hidden when transcription is disabled */}
-        {!settings.disableAudio && settings.audioTranscriptionEngine !== "disabled" && (
+        {/* Audio capture mode — continuous vs meetings-only */}
+        {!settings.disableAudio && (
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2.5">
-                <User className="h-4 w-4 text-muted-foreground shrink-0" />
+                <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
                 <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                  Your name
-                  <HelpTooltip text="Your name in transcripts. Click 'train' and speak for 30 seconds to teach screenpipe your voice — it will recognize you across all devices using voice matching." />
+                  Capture audio
+                  <HelpTooltip text="“During meetings only” records and transcribes audio just while a meeting is detected — saving battery, disk, and cloud transcription cost. “Always” captures continuously, 24/7. Requires meeting detection to be on." />
                 </h3>
               </div>
-              <div className="flex items-center gap-1.5">
-                <div className="relative">
-                  <Input
-                    placeholder="e.g. Louis"
-                    value={settings.userName || ""}
-                    onChange={(e) => handleSettingsChange({ userName: e.target.value }, false)}
-                    onFocus={() => setSpeakerInputFocused(true)}
-                    onBlur={() => setTimeout(() => setSpeakerInputFocused(false), 150)}
-                    className="w-32 h-7 text-xs"
-                  />
-                  {speakerInputFocused && speakerSuggestions.length > 0 && (
-                    <div className="absolute top-full left-0 w-44 mt-0.5 z-50 bg-popover border border-border shadow-md max-h-[120px] overflow-y-auto">
-                      {speakerSuggestions.map((s) => (
-                        <button
-                          key={s.id}
-                          type="button"
-                          className="w-full px-2 py-1 text-left text-xs hover:bg-accent truncate"
-                          onMouseDown={(e) => {
-                            e.preventDefault();
-                            handleSettingsChange({ userName: s.name }, false);
-                            setSpeakerInputFocused(false);
-                          }}
-                        >
-                          {s.name}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 text-xs"
-                  onClick={handleStartTraining}
-                  disabled={voiceTraining.active || !settings.userName?.trim()}
-                >
-                  train
-                </Button>
-              </div>
+              <Select
+                value={settings.audioCaptureMode ?? "always"}
+                onValueChange={(value) => handleSettingsChange({ audioCaptureMode: value as "always" | "meetings-only" | "disabled" }, true)}
+              >
+                <SelectTrigger className="w-[200px] h-7 text-xs">
+                  <SelectValue placeholder="Select mode" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="always">Always (continuous)</SelectItem>
+                  <SelectItem value="meetings-only">During meetings only</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
+            <AudioCaptureModePreview mode={settings.audioCaptureMode ?? "always"} />
           </CardContent>
         </Card>
+        )}
+
+        {!settings.disableAudio && (
+          <div className="flex items-center gap-2 px-1 pt-1.5">
+            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">transcription</span>
+            <div className="h-px flex-1 bg-border/60" />
+          </div>
         )}
 
         {/* Transcription Engine */}
@@ -2551,8 +2677,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <SelectContent>
                     <SelectGroup>
                       <SelectLabel className="text-[10px] text-muted-foreground/70 uppercase tracking-wider">cloud</SelectLabel>
-                      <SelectItem value="screenpipe-cloud" disabled={!settings.user?.cloud_subscribed}>
-                        Screenpipe Cloud {!settings.user?.cloud_subscribed && "(pro)"}{hwCapability?.recommendedEngine === "screenpipe-cloud" && " ★"}
+                      <SelectItem value="screenpipe-cloud" disabled={!hasCloudTranscriptionAccess}>
+                        Screenpipe Cloud {!hasCloudTranscriptionAccess && "(pro)"}{hwCapability?.recommendedEngine === "screenpipe-cloud" && " ★"}
                       </SelectItem>
                       <SelectItem value="deepgram">Deepgram</SelectItem>
                     </SelectGroup>
@@ -2901,88 +3027,46 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </Card>
         )}
 
-        {/* Meeting Live Notes */}
+        {/* Languages */}
         {!settings.disableAudio && (
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2.5">
-                <Headphones className="h-4 w-4 text-muted-foreground shrink-0" />
+                <Languages className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                    Live meeting notes
-                    <HelpTooltip text="Streams only the active meeting into the live note. This is separate from background 24/7 recording and can use your selected transcription engine, screenpipe cloud, or a direct provider." />
-                  </h3>
-                  <p className="text-xs text-muted-foreground">Meeting-only live captions, separate from background transcription</p>
+                  <h3 className="text-sm font-medium text-foreground">Languages</h3>
+                  <p className="text-xs text-muted-foreground">{languageSupportDescription}</p>
                 </div>
               </div>
-              <Switch
-                id="meetingLiveTranscriptionEnabled"
-                checked={settings.meetingLiveTranscriptionEnabled ?? true}
-                onCheckedChange={(checked) =>
-                  handleSettingsChange({
-                    meetingLiveTranscriptionEnabled: checked,
-                    meetingLiveTranscriptionProvider: checked
-                      ? ((settings.meetingLiveTranscriptionProvider && settings.meetingLiveTranscriptionProvider !== "disabled")
-                        ? settings.meetingLiveTranscriptionProvider
-                        : "selected-engine")
-                      : "disabled",
-                  }, true)
-                }
-              />
-            </div>
-            {(settings.meetingLiveTranscriptionEnabled ?? true) && (
-              <div className="mt-2.5 ml-[26px] flex flex-col gap-2">
-                <div className="flex items-center justify-between gap-3">
-                  <Label className="text-xs text-muted-foreground">Live engine</Label>
-                  <Select
-                    value={settings.meetingLiveTranscriptionProvider ?? "selected-engine"}
-                    onValueChange={(value) =>
-                      handleSettingsChange({
-                        meetingLiveTranscriptionProvider: value as Settings["meetingLiveTranscriptionProvider"],
-                      }, true)
-                    }
-                  >
-                    <SelectTrigger className="h-8 w-[260px] text-xs">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="selected-engine">Current transcription engine</SelectItem>
-                      <SelectItem value="screenpipe-cloud">screenpipe cloud live</SelectItem>
-                      <SelectItem value="deepgram-live">Direct Deepgram live</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                {(settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "screenpipe-cloud" &&
-                  !settings.user?.token &&
-                  !settings.user?.id && (
-                  <p className="text-xs text-muted-foreground">
-                    Log in to screenpipe cloud to use the cloud live provider.
-                  </p>
-                )}
-                {(settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "selected-engine" &&
-                  settings.audioTranscriptionEngine === "disabled" && (
-                  <p className="text-xs text-muted-foreground">
-                    Pick an audio transcription engine above, or choose a cloud/direct live provider.
-                  </p>
-                )}
-              </div>
-            )}
-            <div className="mt-2.5 pt-2.5 border-t border-border/50 flex items-center justify-between">
-              <div>
-                <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                  Append typed text to note
-                  <HelpTooltip text="When the meeting stops, screenpipe appends what you typed (and the files you edited) during the meeting to the meeting note. Turn off to keep notes clean." />
-                </h3>
-                <p className="text-xs text-muted-foreground">Auto-add your typed text + edited files at the end of the note</p>
-              </div>
-              <Switch
-                id="appendTypedTextToMeetingNote"
-                checked={settings.appendTypedTextToMeetingNote ?? true}
-                onCheckedChange={(checked) =>
-                  handleSettingsChange({ appendTypedTextToMeetingNote: checked }, true)
-                }
-              />
+              <Popover open={openLanguages} onOpenChange={setOpenLanguages}>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" size="sm" className="h-7 text-xs">
+                    {languageTriggerLabel}
+                    <ChevronsUpDown className="ml-1 h-3 w-3 opacity-50" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-[250px] p-0">
+                  <Command>
+                    <CommandInput placeholder="Search languages..." />
+                    <CommandList>
+                      <CommandEmpty>No languages found.</CommandEmpty>
+                      <CommandGroup>
+                        <CommandItem value="auto-detect" onSelect={() => handleLanguageChange(null)}>
+                          <Check className={cn("mr-2 h-3 w-3", settings.languages.length === 0 ? "opacity-100" : "opacity-0")} />
+                          <span className="text-xs">Auto-detect</span>
+                        </CommandItem>
+                        {supportedLanguageOptions.map((language) => (
+                          <CommandItem key={language.code} value={language.code} onSelect={() => handleLanguageChange(language.code)}>
+                            <Check className={cn("mr-2 h-3 w-3", settings.languages.includes(language.code) ? "opacity-100" : "opacity-0")} />
+                            <span className="text-xs">{language.name}</span>
+                          </CommandItem>
+                        ))}
+                      </CommandGroup>
+                    </CommandList>
+                  </Command>
+                </PopoverContent>
+              </Popover>
             </div>
           </CardContent>
         </Card>
@@ -2998,9 +3082,9 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <div>
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                       Batch Transcription
-                      <HelpTooltip text="Accumulates longer audio chunks (30s-5min) using silence-gap detection before sending to Whisper. Gives the model more context for better transcription quality and speaker diarization." />
+                      <HelpTooltip text="Groups audio into longer stretches (30s–5min) before transcribing. More context means more accurate transcripts and a better job telling speakers apart." />
                     </h3>
-                    <p className="text-xs text-muted-foreground">Longer audio chunks for better transcription quality</p>
+                    <p className="text-xs text-muted-foreground">Group audio into longer stretches for more accurate transcripts</p>
                   </div>
                 </div>
                 <Switch
@@ -3017,7 +3101,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <div className="flex items-center justify-between mb-1.5">
                     <span className="text-xs text-muted-foreground flex items-center gap-1.5">
                       Max batch duration
-                      <HelpTooltip text="Maximum audio to batch before transcribing. Depends on your endpoint's file size limit. 0 = auto (~50min). Audio is compressed to MP3 before upload." />
+                      <HelpTooltip text="The most audio to group together before transcribing. Set 0 for automatic (~50min). Going higher needs a provider that accepts bigger uploads." />
                     </span>
                     <span className="text-xs font-mono text-foreground">
                       {(settings.batchMaxDurationSecs ?? 0) === 0
@@ -3055,7 +3139,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <div>
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                       Filter Music
-                      <HelpTooltip text="Detect and filter out music-dominant audio (e.g. Spotify, YouTube) before transcription using spectral analysis. Reduces garbage transcriptions from background music." />
+                      <HelpTooltip text="Skips audio that's mostly music (e.g. Spotify, YouTube) so it isn't transcribed. Cuts the gibberish background music tends to produce." />
                     </h3>
                     <p className="text-xs text-muted-foreground">Remove background music from transcriptions</p>
                   </div>
@@ -3070,6 +3154,162 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               </div>
             </CardContent>
           </Card>
+        )}
+
+        {!settings.disableAudio && (
+          <div className="flex items-center gap-2 px-1 pt-1.5">
+            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">meetings</span>
+            <div className="h-px flex-1 bg-border/60" />
+          </div>
+        )}
+
+        {/* Meeting Live Notes */}
+        {!settings.disableAudio && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center space-x-2.5 min-w-0">
+                <Headphones className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div className="min-w-0">
+                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                    Live meeting notes
+                    <HelpTooltip text="Streams only the active meeting into the live note. This is separate from background 24/7 recording and can use your selected transcription engine, screenpipe cloud, or a direct provider." />
+                  </h3>
+                  <p className="text-xs text-muted-foreground">Meeting-only live captions, separate from background transcription</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {(settings.meetingLiveTranscriptionEnabled ?? true) && (
+                  <Select
+                    value={settings.meetingLiveTranscriptionProvider ?? "selected-engine"}
+                    onValueChange={(value) =>
+                      handleSettingsChange({
+                        meetingLiveTranscriptionProvider: value as Settings["meetingLiveTranscriptionProvider"],
+                      }, true)
+                    }
+                  >
+                    <SelectTrigger className="h-7 w-[190px] text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="selected-engine">Current transcription engine</SelectItem>
+                      <SelectItem value="screenpipe-cloud">screenpipe cloud live</SelectItem>
+                      <SelectItem value="deepgram-live">Direct Deepgram live</SelectItem>
+                    </SelectContent>
+                  </Select>
+                )}
+                <Switch
+                  id="meetingLiveTranscriptionEnabled"
+                  checked={settings.meetingLiveTranscriptionEnabled ?? true}
+                  onCheckedChange={(checked) =>
+                    handleSettingsChange({
+                      meetingLiveTranscriptionEnabled: checked,
+                      meetingLiveTranscriptionProvider: checked
+                        ? ((settings.meetingLiveTranscriptionProvider && settings.meetingLiveTranscriptionProvider !== "disabled")
+                          ? settings.meetingLiveTranscriptionProvider
+                          : "selected-engine")
+                        : "disabled",
+                    }, true)
+                  }
+                />
+              </div>
+            </div>
+            {(settings.meetingLiveTranscriptionEnabled ?? true) &&
+              (settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "screenpipe-cloud" &&
+              !settings.user?.token &&
+              !settings.user?.id && (
+              <p className="mt-2 ml-[26px] text-xs text-muted-foreground">
+                Log in to screenpipe cloud to use the cloud live provider.
+              </p>
+            )}
+            {(settings.meetingLiveTranscriptionEnabled ?? true) &&
+              (settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "selected-engine" &&
+              settings.audioTranscriptionEngine === "disabled" && (
+              <p className="mt-2 ml-[26px] text-xs text-muted-foreground">
+                Pick an audio transcription engine above, or choose a cloud/direct live provider.
+              </p>
+            )}
+            <div className="mt-2.5 pt-2.5 border-t border-border/50 flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  Append typed text to note
+                  <HelpTooltip text="When the meeting stops, screenpipe appends what you typed (and the files you edited) during the meeting to the meeting note. Turn off to keep notes clean." />
+                </h3>
+                <p className="text-xs text-muted-foreground">Auto-add your typed text + edited files at the end of the note</p>
+              </div>
+              <Switch
+                id="appendTypedTextToMeetingNote"
+                checked={settings.appendTypedTextToMeetingNote ?? true}
+                onCheckedChange={(checked) =>
+                  handleSettingsChange({ appendTypedTextToMeetingNote: checked }, true)
+                }
+              />
+            </div>
+          </CardContent>
+        </Card>
+        )}
+
+        {/* Automatic meeting detection */}
+        {!settings.disableAudio && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Users className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                    Automatic meeting detection
+                    <HelpTooltip text="Detects meeting apps (Zoom, Teams, Meet, Discord calls, etc.) to start and stop meetings and live notes automatically. Turn off if it starts meetings when it shouldn't, and start them yourself instead." />
+                  </h3>
+                  <p className="text-xs text-muted-foreground">Auto-start meetings when a call app is detected</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {!settings.disableMeetingDetector && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-[11px] gap-1.5"
+                    onClick={() => setMeetingAppsPickerOpen(true)}
+                    title="Choose apps that should never auto-start a meeting"
+                    data-testid="settings-ignore-meeting-apps-button"
+                  >
+                    <UserX className="h-3.5 w-3.5" />
+                    ignore apps
+                    {(settings.ignoredMeetingApps?.length ?? 0) > 0 && (
+                      <span
+                        className="rounded bg-muted px-1.5 py-0.5 text-[10px] tabular-nums"
+                        data-testid="settings-ignore-meeting-apps-count"
+                      >
+                        {settings.ignoredMeetingApps!.length}
+                      </span>
+                    )}
+                  </Button>
+                )}
+                <ManagedSwitch
+                  settingKey="disableMeetingDetector"
+                  id="disableMeetingDetector"
+                  checked={!settings.disableMeetingDetector}
+                  onCheckedChange={(checked) => handleSettingsChange({ disableMeetingDetector: !checked }, true)}
+                />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+        )}
+
+        <MeetingAppsPicker
+          open={meetingAppsPickerOpen}
+          onOpenChange={setMeetingAppsPickerOpen}
+          selected={settings.ignoredMeetingApps ?? []}
+          onToggle={handleToggleIgnoredMeetingApp}
+        />
+
+        {!settings.disableAudio && (
+          <div className="flex items-center gap-2 px-1 pt-1.5">
+            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">devices & capture</span>
+            <div className="h-px flex-1 bg-border/60" />
+          </div>
         )}
 
         {/* System Default Audio */}
@@ -3172,94 +3412,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           );
         })()}
 
-        {/* Languages */}
-        {!settings.disableAudio && (
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Languages className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">Languages</h3>
-                  <p className="text-xs text-muted-foreground">{settings.languages.length === 0 ? "Automatically detects spoken language" : "Restricts transcription to selected"}</p>
-                </div>
-              </div>
-              <Popover open={openLanguages} onOpenChange={setOpenLanguages}>
-                <PopoverTrigger asChild>
-                  <Button variant="outline" size="sm" className="h-7 text-xs">
-                    {settings.languages.length > 0 ? `${settings.languages.length} selected` : "Auto-detect"}
-                    <ChevronsUpDown className="ml-1 h-3 w-3 opacity-50" />
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent className="w-[250px] p-0">
-                  <Command>
-                    <CommandInput placeholder="Search languages..." />
-                    <CommandList>
-                      <CommandEmpty>No languages found.</CommandEmpty>
-                      <CommandGroup>
-                        {[
-                          { code: "english", name: "English" }, { code: "spanish", name: "Spanish" },
-                          { code: "french", name: "French" }, { code: "german", name: "German" },
-                          { code: "italian", name: "Italian" }, { code: "portuguese", name: "Portuguese" },
-                          { code: "russian", name: "Russian" }, { code: "japanese", name: "Japanese" },
-                          { code: "korean", name: "Korean" }, { code: "chinese", name: "Chinese" },
-                          { code: "arabic", name: "Arabic" }, { code: "hindi", name: "Hindi" },
-                          { code: "dutch", name: "Dutch" }, { code: "swedish", name: "Swedish" },
-                          { code: "indonesian", name: "Indonesian" }, { code: "finnish", name: "Finnish" },
-                          { code: "hebrew", name: "Hebrew" }, { code: "ukrainian", name: "Ukrainian" },
-                          { code: "greek", name: "Greek" }, { code: "malay", name: "Malay" },
-                          { code: "czech", name: "Czech" }, { code: "romanian", name: "Romanian" },
-                          { code: "danish", name: "Danish" }, { code: "hungarian", name: "Hungarian" },
-                          { code: "norwegian", name: "Norwegian" }, { code: "thai", name: "Thai" },
-                          { code: "urdu", name: "Urdu" }, { code: "croatian", name: "Croatian" },
-                          { code: "bulgarian", name: "Bulgarian" }, { code: "lithuanian", name: "Lithuanian" },
-                          { code: "latin", name: "Latin" }, { code: "welsh", name: "Welsh" },
-                          { code: "slovak", name: "Slovak" }, { code: "persian", name: "Persian" },
-                          { code: "latvian", name: "Latvian" }, { code: "bengali", name: "Bengali" },
-                          { code: "serbian", name: "Serbian" }, { code: "azerbaijani", name: "Azerbaijani" },
-                          { code: "slovenian", name: "Slovenian" }, { code: "estonian", name: "Estonian" },
-                          { code: "macedonian", name: "Macedonian" }, { code: "nepali", name: "Nepali" },
-                          { code: "mongolian", name: "Mongolian" }, { code: "bosnian", name: "Bosnian" },
-                          { code: "kazakh", name: "Kazakh" }, { code: "albanian", name: "Albanian" },
-                          { code: "swahili", name: "Swahili" }, { code: "galician", name: "Galician" },
-                          { code: "marathi", name: "Marathi" }, { code: "punjabi", name: "Punjabi" },
-                          { code: "sinhala", name: "Sinhala" }, { code: "khmer", name: "Khmer" },
-                          { code: "afrikaans", name: "Afrikaans" }, { code: "belarusian", name: "Belarusian" },
-                          { code: "gujarati", name: "Gujarati" }, { code: "amharic", name: "Amharic" },
-                          { code: "yiddish", name: "Yiddish" }, { code: "lao", name: "Lao" },
-                          { code: "uzbek", name: "Uzbek" }, { code: "faroese", name: "Faroese" },
-                          { code: "pashto", name: "Pashto" }, { code: "maltese", name: "Maltese" },
-                          { code: "sanskrit", name: "Sanskrit" }, { code: "luxembourgish", name: "Luxembourgish" },
-                          { code: "myanmar", name: "Myanmar" }, { code: "tibetan", name: "Tibetan" },
-                          { code: "tagalog", name: "Tagalog" }, { code: "assamese", name: "Assamese" },
-                          { code: "tatar", name: "Tatar" }, { code: "hausa", name: "Hausa" },
-                          { code: "javanese", name: "Javanese" }, { code: "turkish", name: "Turkish" },
-                          { code: "polish", name: "Polish" }, { code: "catalan", name: "Catalan" },
-                          { code: "malayalam", name: "Malayalam" },
-                        ].map((language) => (
-                          <CommandItem key={language.code} value={language.code} onSelect={() => handleLanguageChange(language.code as Language)}>
-                            <Check className={cn("mr-2 h-3 w-3", settings.languages.includes(language.code as Language) ? "opacity-100" : "opacity-0")} />
-                            <span className="text-xs">{language.name}</span>
-                          </CommandItem>
-                        ))}
-                      </CommandGroup>
-                    </CommandList>
-                  </Command>
-                </PopoverContent>
-              </Popover>
-            </div>
-          </CardContent>
-        </Card>
-        )}
-
-        {/* Transcription Dictionary */}
-        {!settings.disableAudio && (
-        <TranscriptionDictionary
-          vocabularyWords={settings.vocabularyWords ?? []}
-          onChange={(words) => handleSettingsChange({ vocabularyWords: words }, true)}
-        />
-        )}
-
         {/* Windows microphone AEC */}
         {!settings.disableAudio && isWindows && (
         <Card className="border-border bg-card">
@@ -3339,62 +3491,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </CardContent>
         </Card>
         )}
-
-        {/* Automatic meeting detection */}
-        {!settings.disableAudio && (
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Users className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                    Automatic meeting detection
-                    <HelpTooltip text="Detects meeting apps (Zoom, Teams, Meet, Discord calls, etc.) to start/stop meetings and live notes. Turn off if it triggers spuriously and split meetings manually. CLI equivalent: --disable-meeting-detector." />
-                  </h3>
-                  <p className="text-xs text-muted-foreground">Auto-start meetings when a call app is detected</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                {!settings.disableMeetingDetector && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-[11px] gap-1.5"
-                    onClick={() => setMeetingAppsPickerOpen(true)}
-                    title="Choose apps that should never auto-start a meeting"
-                    data-testid="settings-ignore-meeting-apps-button"
-                  >
-                    <UserX className="h-3.5 w-3.5" />
-                    ignore apps
-                    {(settings.ignoredMeetingApps?.length ?? 0) > 0 && (
-                      <span
-                        className="rounded bg-muted px-1.5 py-0.5 text-[10px] tabular-nums"
-                        data-testid="settings-ignore-meeting-apps-count"
-                      >
-                        {settings.ignoredMeetingApps!.length}
-                      </span>
-                    )}
-                  </Button>
-                )}
-                <ManagedSwitch
-                  settingKey="disableMeetingDetector"
-                  id="disableMeetingDetector"
-                  checked={!settings.disableMeetingDetector}
-                  onCheckedChange={(checked) => handleSettingsChange({ disableMeetingDetector: !checked }, true)}
-                />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-        )}
-
-        <MeetingAppsPicker
-          open={meetingAppsPickerOpen}
-          onOpenChange={setMeetingAppsPickerOpen}
-          selected={settings.ignoredMeetingApps ?? []}
-          onToggle={handleToggleIgnoredMeetingApp}
-        />
 
         {/* Per-app exclusion list for the CoreAudio Process Tap. Only
             meaningful when the tap is the active backend. */}
@@ -3478,6 +3574,77 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </Card>
         )}
 
+        {!settings.disableAudio && (
+          <div className="flex items-center gap-2 px-1 pt-1.5">
+            <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">voice & vocabulary</span>
+            <div className="h-px flex-1 bg-border/60" />
+          </div>
+        )}
+
+        {/* Your Name + Train Voice — hidden when transcription is disabled */}
+        {!settings.disableAudio && settings.audioTranscriptionEngine !== "disabled" && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <User className="h-4 w-4 text-muted-foreground shrink-0" />
+                <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  Your name
+                  <HelpTooltip text="Your name in transcripts. Click 'train' and speak for 30 seconds to teach screenpipe your voice — it will recognize you across all devices using voice matching." />
+                </h3>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <div className="relative">
+                  <Input
+                    placeholder="e.g. Louis"
+                    value={settings.userName || ""}
+                    onChange={(e) => handleSettingsChange({ userName: e.target.value }, false)}
+                    onFocus={() => setSpeakerInputFocused(true)}
+                    onBlur={() => setTimeout(() => setSpeakerInputFocused(false), 150)}
+                    className="w-32 h-7 text-xs"
+                  />
+                  {speakerInputFocused && speakerSuggestions.length > 0 && (
+                    <div className="absolute top-full left-0 w-44 mt-0.5 z-50 bg-popover border border-border shadow-md max-h-[120px] overflow-y-auto">
+                      {speakerSuggestions.map((s) => (
+                        <button
+                          key={s.id}
+                          type="button"
+                          className="w-full px-2 py-1 text-left text-xs hover:bg-accent truncate"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            handleSettingsChange({ userName: s.name }, false);
+                            setSpeakerInputFocused(false);
+                          }}
+                        >
+                          {s.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={handleStartTraining}
+                  disabled={voiceTraining.active || !settings.userName?.trim()}
+                >
+                  train
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+        )}
+
+        {/* Transcription Dictionary */}
+        {!settings.disableAudio && (
+        <TranscriptionDictionary
+          vocabularyWords={settings.vocabularyWords ?? []}
+          onChange={(words) => handleSettingsChange({ vocabularyWords: words }, true)}
+        />
+        )}
+
       </div>
       </LockedSetting>
 
@@ -3552,6 +3719,62 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             </CardContent>
           </Card>
         )}
+
+        {/* Capture frequency — guaranteed screenshot cadence. Capture is
+            event-driven (clicks, typing, app/window switches, visual change),
+            so a screen that sits still can go uncaptured for the power
+            profile's idle floor (30s on AC, longer on battery). This pins a
+            hard "always capture at least every N seconds" floor for users who
+            feel capture is too sparse. Backed by `idleCaptureIntervalMs`
+            (null = follow the power profile). Needs a recording restart to
+            take effect, hence handleSettingsChange(..., true). */}
+        {!settings.disableVision && (() => {
+          const idleMs = settings.idleCaptureIntervalMs ?? null;
+          const seconds = idleMs == null ? 0 : Math.round(idleMs / 1000);
+          return (
+            <Card className="border-border bg-card">
+              <CardContent className="px-3 py-2.5">
+                <div className="flex items-center space-x-2.5 mb-2">
+                  <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-medium text-foreground">Capture frequency</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Always take a screenshot at least this often, even when the screen
+                      isn&apos;t changing. Lower = fewer missed moments + more disk used.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-xs text-muted-foreground">Minimum interval</span>
+                  <span className="text-xs font-mono text-foreground">
+                    {seconds === 0 ? "auto (power profile)" : `every ${seconds}s`}
+                  </span>
+                </div>
+                <Slider
+                  value={[seconds]}
+                  onValueChange={([value]) =>
+                    handleSettingsChange(
+                      {
+                        idleCaptureIntervalMs:
+                          (value ?? 0) === 0 ? null : (value as number) * 1000,
+                      },
+                      true,
+                    )
+                  }
+                  min={0}
+                  max={10}
+                  step={1}
+                  className="w-full"
+                />
+                <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
+                  <span>auto</span>
+                  <span>every 10s</span>
+                </div>
+                <CaptureFrequencyPreview seconds={seconds} />
+              </CardContent>
+            </Card>
+          );
+        })()}
 
         {/* HD recording — bound sessions only (meeting or timer; no
             indefinite mode). The controller lives in the engine and is
@@ -3700,24 +3923,14 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </DialogContent>
       </Dialog>
 
-      {/* Floating apply & restart button — always visible when changes pending */}
-      {hasUnsavedChanges && (
-        <div className="sticky bottom-4 flex justify-end pointer-events-none z-50">
-          <Button
-            onClick={handleUpdate}
-            disabled={isUpdating || Object.keys(validationErrors).length > 0}
-            size="sm"
-            className="pointer-events-auto flex items-center gap-1.5 h-9 px-4 text-sm bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150 shadow-lg"
-          >
-            {isUpdating ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            Apply & Restart
-          </Button>
-        </div>
-      )}
+      {/* Floating apply & restart bar — always visible when changes pending */}
+      <ApplyRestartBar
+        visible={hasUnsavedChanges}
+        onApply={handleUpdate}
+        isUpdating={isUpdating}
+        disabled={Object.keys(validationErrors).length > 0}
+        message="unsaved recording changes. restart to apply."
+      />
     </div>
   );
 }

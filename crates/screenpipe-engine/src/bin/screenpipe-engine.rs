@@ -29,6 +29,7 @@ use screenpipe_engine::{
         audio::handle_audio_command,
         mcp::handle_mcp_command,
         pipe::handle_pipe_command,
+        profile::handle_profile_command,
         search::handle_search_command,
         status::handle_status_command,
         sync::{handle_sync_command, start_sync_service},
@@ -63,62 +64,6 @@ use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, Layer};
 
 #[cfg(target_os = "macos")]
 use tracing_oslog::OsLogger;
-
-/// Set the file descriptor limit for the process.
-/// This helps prevent "Too many open files" errors during heavy WebSocket/video usage.
-#[cfg(unix)]
-fn set_fd_limit() {
-    use nix::libc;
-    use std::env;
-
-    // Check if a custom limit was set via environment variable
-    let desired_limit: u64 = env::var("SCREENPIPE_FD_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8192); // Default to 8192 if not set
-
-    // Get current limits
-    let mut rlim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-            let current_soft = rlim.rlim_cur;
-            let current_hard = rlim.rlim_max;
-
-            // Only increase if current limit is lower than desired
-            if current_soft < desired_limit {
-                // Set new soft limit (capped by hard limit)
-                let new_soft = std::cmp::min(desired_limit, current_hard);
-                rlim.rlim_cur = new_soft;
-
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
-                    eprintln!(
-                        "increased file descriptor limit from {} to {} (hard limit: {})",
-                        current_soft, new_soft, current_hard
-                    );
-                } else {
-                    eprintln!(
-                        "warning: failed to increase file descriptor limit (current: {}, requested: {})",
-                        current_soft, new_soft
-                    );
-                }
-            } else {
-                // already sufficient — no need to log
-            }
-        } else {
-            eprintln!("warning: failed to get current file descriptor limits");
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn set_fd_limit() {
-    // On Windows, file handle limits work differently and are generally not an issue
-    // No action needed
-}
 
 #[cfg(target_os = "macos")]
 async fn doctor_check_system_audio_capture() -> bool {
@@ -299,8 +244,9 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "heap-prof")]
     let _profiler = dhat::Profiler::new_heap();
 
-    // Set file descriptor limit early, before any resources are allocated
-    set_fd_limit();
+    // Set file descriptor limit early, before any resources are allocated.
+    // Single source of truth shared with the desktop app (see fd_limit module).
+    screenpipe_engine::fd_limit::set_fd_limit();
 
     debug!("starting screenpipe server");
     let matches = Cli::command().get_matches();
@@ -317,6 +263,10 @@ async fn main() -> anyhow::Result<()> {
             let local_data_dir = get_base_dir(data_dir)?;
             let _log_guard = Some(setup_logging(&local_data_dir, false, true)?);
             handle_status_command(json, data_dir, port).await?;
+            return Ok(());
+        }
+        Command::Profile { json, port } => {
+            handle_profile_command(json, port).await?;
             return Ok(());
         }
         Command::Search(ref args) => {
@@ -461,6 +411,10 @@ async fn main() -> anyhow::Result<()> {
         record_args.debug,
         !config.analytics_enabled,
     )?);
+
+    if let Err(e) = screenpipe_engine::power::set_keep_awake(config.keep_computer_awake) {
+        warn!("failed to apply keep-awake setting: {}", e);
+    }
 
     // Non-blocking update check — runs in background, prints banner if outdated
     tokio::spawn(async {
@@ -1186,10 +1140,21 @@ async fn main() -> anyhow::Result<()> {
         let h = runtime.spawn(async move {
             let mut shutdown_rx = shutdown_tx_clone2.subscribe();
 
-            // Start VisionManager
+            // Start VisionManager. A failure here must NOT abort this task.
+            // `VisionManager::start()` returns Err when zero monitors are
+            // enumerated at boot — lid closed at login, screen locked, or a
+            // transient TCC/ScreenCaptureKit race (list_monitors swallows
+            // those to an empty set). Returning here used to leave vision
+            // permanently dead for the whole process lifetime, because every
+            // retry/recovery path lives inside the monitor watcher spawned
+            // below (it re-calls VisionManager::start() whenever status !=
+            // Running — see monitor_watcher.rs). Log and fall through so the
+            // watcher gets a chance to recover once a display appears.
             if let Err(e) = vm_clone.start().await {
-                error!("Failed to start VisionManager: {:?}", e);
-                return;
+                error!(
+                    "Failed to start VisionManager (monitor watcher will retry): {:?}",
+                    e
+                );
             }
 
             // Start MonitorWatcher for dynamic detection (with audio DRM pause support)
@@ -1400,6 +1365,8 @@ async fn main() -> anyhow::Result<()> {
         pipe_store,
         config.port,
     );
+    let mcp_session_access = screenpipe_core::pipes::mcp_access::McpSessionAccessRegistry::new();
+    pipe_manager.set_mcp_session_access(mcp_session_access.clone());
     // Wire pipe permission token registry (bridges PipeManager ↔ server middleware)
     pipe_manager.set_token_registry(std::sync::Arc::new(
         screenpipe_engine::pipe_permissions_middleware::DashMapTokenRegistry::new(
@@ -1407,7 +1374,7 @@ async fn main() -> anyhow::Result<()> {
         ),
     ));
     pipe_manager.set_on_run_complete(std::sync::Arc::new(
-        |pipe_name, success, duration_secs, error_type| {
+        |pipe_name, _execution_id, success, duration_secs, error_type| {
             let mut props = serde_json::json!({
                 "pipe": pipe_name,
                 "success": success,
@@ -1429,21 +1396,7 @@ async fn main() -> anyhow::Result<()> {
             let ss = secret_store_for_check.clone();
             let dir = screenpipe_dir_for_check.clone();
             Box::pin(async move {
-                let mut missing = Vec::new();
-                for conn_id in required {
-                    let configured = screenpipe_connect::connections::load_connection(
-                        ss.as_deref(),
-                        &dir,
-                        &conn_id,
-                    )
-                    .await
-                    .map(|c| c.enabled && !c.credentials.is_empty())
-                    .unwrap_or(false);
-                    if !configured {
-                        missing.push(conn_id);
-                    }
-                }
-                missing
+                screenpipe_connect::missing_pipe_connections(ss.as_deref(), &dir, &required).await
             })
         }));
     }
@@ -1463,6 +1416,7 @@ async fn main() -> anyhow::Result<()> {
     let shared_pipe_manager = std::sync::Arc::new(tokio::sync::Mutex::new(pipe_manager));
     let server = server
         .with_pipe_manager(shared_pipe_manager.clone())
+        .with_mcp_session_access(mcp_session_access)
         .with_high_fps_controller(high_fps_controller.clone());
 
     // Install pi agent in background
@@ -1588,6 +1542,9 @@ async fn main() -> anyhow::Result<()> {
             match record_args.retention_mode {
                 screenpipe_engine::retention::RetentionMode::Media => {
                     "media-only (keep transcripts)".to_string()
+                }
+                screenpipe_engine::retention::RetentionMode::Lean => {
+                    "lean (keep text+memories)".to_string()
                 }
                 screenpipe_engine::retention::RetentionMode::All => "all (full delete)".to_string(),
             }
@@ -1792,8 +1749,8 @@ async fn main() -> anyhow::Result<()> {
     // Start calendar-assisted speaker identification
     let _speaker_id_handle = start_speaker_identification(db.clone(), config.user_name.clone());
 
-    // Periodic WAL checkpoint to prevent unbounded WAL growth
-    db.start_wal_maintenance();
+    // WAL checkpoint maintenance now starts inside DatabaseManager::new(), so
+    // every caller (CLI + in-process desktop app) gets it — no explicit call here.
 
     let server_future = server.start();
     pin_mut!(server_future);
@@ -1859,8 +1816,8 @@ async fn main() -> anyhow::Result<()> {
                 tinfoil::{TinfoilConfig, TinfoilRedactor},
             },
             pipeline::{Pipeline, PipelineConfig},
-            worker::{Worker, WorkerConfig, ALL_TARGET_TABLES},
-            Redactor, TextRedactionPolicy,
+            worker::{RedactColumns, Worker, WorkerConfig, ALL_TARGET_TABLES},
+            Pseudonymizer, Redactor, TextRedactionPolicy,
         };
         use std::sync::Arc;
 
@@ -1885,6 +1842,26 @@ async fn main() -> anyhow::Result<()> {
         //      regex-redacted text into the source columns).
         let pool = db.pool.clone();
         let labels = config.pii_redaction_labels.clone();
+        // Consistent-pseudonym tokens (issue #4206), opt-in. Loads (or
+        // creates on first run) the per-install key under the data dir;
+        // on any IO error we log and fall back to static `[LABEL]` tags
+        // rather than block the worker.
+        let pseudonymizer = if config.pii_redaction_pseudonyms {
+            match Pseudonymizer::load_or_create(&config.data_dir) {
+                Ok(p) => {
+                    info!("text-PII redaction: consistent pseudonyms ON (issue #4206)");
+                    Some(Arc::new(p))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "couldn't load pseudonym key ({e}); rendering static [LABEL] tags instead"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         tokio::spawn(async move {
             // Per-label allow-list from the `piiRedactionLabels` setting
             // (default ["secret"]). Local adapters filter client-side via
@@ -1971,10 +1948,19 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             };
+            // Opt-in pseudonym tokens (no-op when `pseudonymizer` is None
+            // or the adapter is span-less, i.e. tinfoil).
+            let pipeline = pipeline.with_pseudonyms(pseudonymizer);
             let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
 
+            // WHICH columns to scrub, from the `piiRedactionColumns` setting
+            // (browser_url / ui element name+description / a11y url-field are
+            // off by default — opt-in). Orthogonal to the category policy above.
+            let columns = RedactColumns::from_keys(&config.pii_redaction_columns);
+            info!(?columns, "redaction column allow-list");
             let worker_cfg = WorkerConfig {
                 tables: ALL_TARGET_TABLES.to_vec(),
+                columns,
                 ..Default::default()
             };
             let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg).spawn();

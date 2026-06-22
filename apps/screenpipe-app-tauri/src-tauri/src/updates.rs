@@ -34,7 +34,7 @@ use tokio::time::interval;
 pub async fn install_specific_version(app: &tauri::AppHandle, version: &str) -> Result<(), String> {
     let target_arch = get_target_arch();
     let rollback_url = format!(
-        "https://screenpi.pe/api/app-update/rollback/{}/{}",
+        "https://screenpipe.com/api/app-update/rollback/{}/{}",
         target_arch, version
     );
 
@@ -50,7 +50,13 @@ pub async fn install_specific_version(app: &tauri::AppHandle, version: &str) -> 
 
     // Add auth header so R2 download works for paid users
     if let Ok(Some(settings)) = SettingsStore::get(app) {
-        if let Some(ref token) = settings.user.token {
+        if let Some(token) = settings
+            .user
+            .token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or_else(crate::auth_token::cached_cloud_token)
+        {
             builder = builder
                 .header("Authorization", format!("Bearer {}", token))
                 .map_err(|e| format!("failed to set auth header: {}", e))?;
@@ -260,6 +266,43 @@ pub async fn await_safe_restart(timeout_secs: Option<u64>) -> String {
         .to_string()
 }
 
+/// Banner-click restart. plugin-process `relaunch()` fires
+/// `ExitRequested` which `main.rs` blocks unless `QUIT_REQUESTED` is set —
+/// banner never set it, so the exit was silently cancelled and the button
+/// hung on "restarting…". Mirror the auto-update path: gate, stop server,
+/// set `QUIT_REQUESTED`, then `app.restart()`. See 2026-06-10 report.
+#[tauri::command]
+#[specta::specta]
+pub async fn restart_for_update(
+    app: tauri::AppHandle,
+    timeout_secs: Option<u64>,
+) -> Result<String, String> {
+    let cap = Duration::from_secs(timeout_secs.unwrap_or(BANNER_GATE_TIMEOUT_SECS));
+    let gate = await_restart_gate(cap, "banner-triggered restart").await;
+    if !gate.proceed() {
+        return Ok(gate.as_str().to_string());
+    }
+
+    info!("banner restart: gate passed, shutting down for update");
+
+    // Non-fatal: server.rs retries port bind if the next boot races teardown.
+    if let Err(err) = stop_screenpipe(app.state::<RecordingState>(), app.clone()).await {
+        warn!("banner restart: stop_screenpipe failed (continuing): {}", err);
+    }
+
+    QUIT_REQUESTED.store(true, Ordering::SeqCst);
+
+    // Off-thread so the IPC reply flushes before runtime teardown; also
+    // `app.restart()` from a non-main thread blocks forever once it succeeds.
+    let app_clone = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        app_clone.restart();
+    });
+
+    Ok("proceed".to_string())
+}
+
 fn auto_update_enabled_from_settings(settings: Result<Option<SettingsStore>, String>) -> bool {
     settings
         .ok()
@@ -395,7 +438,13 @@ impl UpdatesManager {
                 builder = builder.header("X-License-Key", license_key)?;
             }
         } else if let Ok(Some(settings)) = SettingsStore::get(&self.app) {
-            if let Some(ref token) = settings.user.token {
+            if let Some(token) = settings
+                .user
+                .token
+                .clone()
+                .filter(|t| !t.is_empty())
+                .or_else(crate::auth_token::cached_cloud_token)
+            {
                 builder = builder.header("Authorization", format!("Bearer {}", token))?;
             }
         }
@@ -824,7 +873,7 @@ impl UpdatesManager {
             let _ = self
                 .app
                 .opener()
-                .open_url("https://screenpi.pe/download", None::<&str>);
+                .open_url("https://screenpipe.com/download", None::<&str>);
         } else {
             // Open GitHub releases
             let _ = self.app.opener().open_url(
@@ -917,7 +966,7 @@ fn check_whats_new(app: &tauri::AppHandle) {
 
         let body = if release_notes.is_empty() {
             format!(
-                "screenpipe updated to **v{}**! check the [changelog](https://screenpi.pe/changelog) for details.",
+                "screenpipe updated to **v{}**! check the [changelog](https://screenpipe.com/changelog) for details.",
                 current_version
             )
         } else {
@@ -929,7 +978,7 @@ fn check_whats_new(app: &tauri::AppHandle) {
                 release_notes
             };
             format!(
-                "screenpipe updated to **v{}**!\n\n{}\n\n[full changelog](https://screenpi.pe/changelog)",
+                "screenpipe updated to **v{}**!\n\n{}\n\n[full changelog](https://screenpipe.com/changelog)",
                 current_version, truncated
             )
         };
@@ -1055,5 +1104,57 @@ mod tests {
         assert!(!auto_update_enabled_from_settings(Err(
             "store unavailable".to_string()
         )));
+    }
+
+    // Banner-restart gate contract (2026-06-10 report). Full end-to-end isn't
+    // unit-testable (`app.restart()` needs a real AppHandle); we lock down the
+    // gate's return values so the frontend string-match path can't drift.
+    use crate::health::{set_boot_error, set_boot_phase};
+
+    #[tokio::test]
+    async fn await_safe_restart_returns_proceed_when_boot_ready() {
+        set_boot_phase("ready", None);
+        let result = await_safe_restart(Some(1)).await;
+        set_boot_phase("idle", None);
+        assert_eq!(
+            result, "proceed",
+            "banner gate must return proceed when boot phase is ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_safe_restart_returns_errored_on_boot_error() {
+        set_boot_error("simulated boot failure for banner-gate test");
+        let result = await_safe_restart(Some(1)).await;
+        set_boot_phase("idle", None);
+        assert_eq!(
+            result, "errored",
+            "banner gate must surface errored so frontend toasts instead of restarting"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_safe_restart_returns_pending_on_timeout() {
+        set_boot_phase("starting", None);
+        let result = await_safe_restart(Some(1)).await;
+        set_boot_phase("idle", None);
+        assert_eq!(result, "pending");
+    }
+
+    #[test]
+    fn restart_gate_proceed_is_the_only_truthy_variant() {
+        // Guards against a new variant accidentally mapping to true and
+        // shipping a process::exit race.
+        assert!(RestartGate::Proceed.proceed());
+        assert!(!RestartGate::Errored.proceed());
+        assert!(!RestartGate::DeferPending.proceed());
+    }
+
+    #[test]
+    fn restart_gate_as_str_matches_frontend_contract() {
+        // update-banner.tsx string-matches these exact values.
+        assert_eq!(RestartGate::Proceed.as_str(), "proceed");
+        assert_eq!(RestartGate::Errored.as_str(), "errored");
+        assert_eq!(RestartGate::DeferPending.as_str(), "pending");
     }
 }

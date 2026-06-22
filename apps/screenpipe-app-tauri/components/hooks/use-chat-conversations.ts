@@ -26,7 +26,7 @@ import {
   getCachedBrowserStateEntry,
   resolveNewestBrowserState,
 } from "@/lib/browser-state-cache";
-import { commands, type AIPreset } from "@/lib/utils/tauri";
+import { type AIPreset } from "@/lib/utils/tauri";
 import {
   saveConversationFile,
   loadConversationFile,
@@ -38,41 +38,10 @@ import {
   migrateFromStoreBin,
   CHAT_HISTORY_INITIAL_LIMIT,
   conversationDedupKey,
+  updateConversationFlags,
   type ConversationMeta,
 } from "@/lib/chat-storage";
-
-
-// --- Types (mirrored from standalone-chat.tsx) ---
-
-export interface ToolCall {
-  id: string;
-  toolName: string;
-  args: Record<string, any>;
-  result?: string;
-  isError?: boolean;
-  isRunning: boolean;
-}
-
-export type ContentBlock =
-  | { type: "text"; text: string }
-  | { type: "tool"; toolCall: ToolCall }
-  | { type: "thinking"; text: string; isThinking: boolean; durationMs?: number };
-
-export interface Message {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  intent?: "steer";
-  turnIntentId?: string;
-  displayContent?: string;
-  images?: string[];
-  timestamp: number;
-  contentBlocks?: ContentBlock[];
-  model?: string;
-  provider?: string;
-  interruptedBySteer?: boolean;
-  steeredResponse?: boolean;
-}
+import type { ContentBlock, Message } from "@/lib/chat/types";
 
 // --- Hook options ---
 
@@ -85,7 +54,6 @@ interface UseChatConversationsOpts {
   inputRef: RefObject<HTMLTextAreaElement | null>;
   isLoading: boolean;
   isStreaming: boolean;
-  piInfo: { running: boolean; projectDir: string | null; pid: number | null } | null;
   piStreamingTextRef: MutableRefObject<string>;
   piMessageIdRef: MutableRefObject<string | null>;
   piContentBlocksRef: MutableRefObject<ContentBlock[]>;
@@ -124,6 +92,15 @@ interface SaveConversationOptions {
   syncActiveConversation?: boolean;
 }
 
+function newestUserMessageTimestamp(messages: Message[]): number | undefined {
+  let latest: number | undefined;
+  for (const message of messages) {
+    if (message.role !== "user" || typeof message.timestamp !== "number") continue;
+    if (latest == null || message.timestamp > latest) latest = message.timestamp;
+  }
+  return latest;
+}
+
 /** Module-scope guard for AI title generation — survives component remounts
  *  and is shared across all hook instances so two StandaloneChat mounts
  *  (chat window + home page) never both fire for the same conversation.
@@ -140,7 +117,6 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     inputRef,
     isLoading,
     isStreaming,
-    piInfo,
     piStreamingTextRef,
     piMessageIdRef,
     piContentBlocksRef,
@@ -200,16 +176,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     if (historySearch.trim()) return;
 
     const msgs = Array.isArray(conversation.messages) ? conversation.messages : [];
-    let lastUserMessageAt = conversation.lastUserMessageAt;
-    if (lastUserMessageAt == null) {
-      for (const m of msgs) {
-        if (m?.role === "user" && typeof m.timestamp === "number") {
-          if (lastUserMessageAt == null || m.timestamp > lastUserMessageAt) {
-            lastUserMessageAt = m.timestamp;
-          }
-        }
-      }
-    }
+    const computedLastUserMessageAt = newestUserMessageTimestamp(msgs);
+    const lastUserMessageAt =
+      computedLastUserMessageAt == null
+        ? conversation.lastUserMessageAt
+        : Math.max(conversation.lastUserMessageAt ?? 0, computedLastUserMessageAt);
 
     const meta: ConversationMeta = {
       id: conversation.id,
@@ -220,6 +191,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       pinned: conversation.pinned === true,
       hidden: conversation.hidden === true,
       lastUserMessageAt,
+      lastContentAt: conversation.lastContentAt,
+      lastViewedAt: conversation.lastViewedAt,
       kind: conversation.kind ?? "chat",
       pipeContext: conversation.pipeContext,
       titleSource: conversation.titleSource,
@@ -512,6 +485,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     ));
     const fallbackTitle = deriveFallbackConversationTitle(firstUserMsg);
     const existingTitle = existing?.title?.trim() || null;
+    const computedLastUserMessageAt = newestUserMessageTimestamp(msgs);
 
     const hasValidPreset =
       selectedPreset &&
@@ -715,17 +689,34 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       ...(browserState ? { browserState } : {}),
       ...(existing?.pinned ? { pinned: existing.pinned } : {}),
       ...(existing?.hidden ? { hidden: existing.hidden } : {}),
-      // Preserve sort key across reloads. Source of truth: the in-memory
-      // chat-store, which is bumped exactly once per user-send.
+      // Preserve sort key across reloads. Source of truth: the transcript
+      // being saved, then the in-memory chat-store, then older disk state.
+      // This prevents a stale persisted/store value from keeping an old
+      // sidebar age after a fresh user message is already in `msgs`.
       ...(await (async () => {
         const { useChatStore } = await import("@/lib/stores/chat-store");
         const sid = piSessionIdRef.current;
-        const fromStore = sid
-          ? useChatStore.getState().sessions[sid]?.lastUserMessageAt
+        const storeSession = sid
+          ? useChatStore.getState().sessions[sid]
           : undefined;
-        const lastUserMessageAt = fromStore ?? existing?.lastUserMessageAt;
-        return lastUserMessageAt ? { lastUserMessageAt } : {};
+        const lastUserMessageAt =
+          computedLastUserMessageAt ??
+          storeSession?.lastUserMessageAt ??
+          existing?.lastUserMessageAt;
+        const lastContentAt = storeSession?.lastContentAt ?? existing?.lastContentAt;
+        const lastViewedAt =
+          storeSession?.lastViewedAt ??
+          existing?.lastViewedAt ??
+          (lastContentAt ? 0 : undefined);
+        return {
+          ...(lastUserMessageAt ? { lastUserMessageAt } : {}),
+          ...(lastContentAt ? { lastContentAt } : {}),
+          ...(typeof lastViewedAt === "number" ? { lastViewedAt } : {}),
+        };
       })()),
+      // Persist the preset ID so the model selection survives app restart
+      // and is restored when switching between chats.
+      ...(selectedPreset?.id ? { presetId: selectedPreset.id } : existing?.presetId ? { presetId: existing.presetId } : {}),
     };
 
     // Mirror the final messages into the in-memory chat-store BEFORE
@@ -990,6 +981,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const { useChatStore } = await import("@/lib/stores/chat-store");
     const store = useChatStore.getState();
     const outgoingSid = piSessionIdRef.current;
+    const viewedAt = Date.now();
 
     // (1) Snapshot OUTGOING session — atomic so router writes that
     //     race against this update can't land between the messages
@@ -1096,6 +1088,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             ...(persisted.hidden === true ? { hidden: true } : {}),
             ...(persisted.kind ? { kind: persisted.kind } : {}),
             ...(persisted.pipeContext ? { pipeContext: persisted.pipeContext } : {}),
+            ...(persisted.lastContentAt ? { lastContentAt: persisted.lastContentAt } : {}),
+            ...(typeof persisted.lastViewedAt === "number"
+              ? { lastViewedAt: persisted.lastViewedAt }
+              : {}),
           });
         } else {
           store.actions.patch(conv.id, {
@@ -1106,6 +1102,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             updatedAt: Math.max(existing?.updatedAt ?? 0, persisted.updatedAt ?? 0),
             ...(persisted.kind ? { kind: persisted.kind } : {}),
             ...(persisted.pipeContext ? { pipeContext: persisted.pipeContext } : {}),
+            ...(typeof persisted.lastViewedAt === "number"
+              ? { lastViewedAt: persisted.lastViewedAt }
+              : {}),
           });
         }
       }
@@ -1159,6 +1158,9 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         timestamp: m.timestamp,
         ...(m.displayContent ? { displayContent: m.displayContent } : {}),
         ...(m.contentBlocks?.length ? { contentBlocks: m.contentBlocks } : {}),
+        ...((m as any).sourceCitations?.length
+          ? { sourceCitations: (m as any).sourceCitations }
+          : {}),
         ...((m as any).images?.length
           ? { images: (m as any).images }
           : (m as any).image
@@ -1188,6 +1190,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           // foreground/background swaps.
           ...(conv.kind ? { kind: conv.kind } : full.kind ? { kind: full.kind } : {}),
           ...(conv.pipeContext ? { pipeContext: conv.pipeContext } : full.pipeContext ? { pipeContext: full.pipeContext } : {}),
+          ...(full.lastContentAt ? { lastContentAt: full.lastContentAt } : {}),
+          ...(typeof full.lastViewedAt === "number"
+            ? { lastViewedAt: full.lastViewedAt }
+            : {}),
         });
       } else if (conv.kind || conv.pipeContext) {
         store.actions.patch(conv.id, {
@@ -1202,6 +1208,13 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       }
       store.actions.setMessages(conv.id, messagesForPanel as any);
       store.actions.markHydrated(conv.id);
+    }
+    store.actions.patch(conv.id, { lastViewedAt: viewedAt });
+    try {
+      await updateConversationFlags(conv.id, { lastViewedAt: viewedAt });
+    } catch {
+      // Best-effort: unread clears live immediately; the next full save can
+      // still persist the watermark if this patch fails.
     }
 
     setMessages(messagesForPanel);
@@ -1248,6 +1261,17 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       }
     } catch (e) {
       console.warn("Failed to update active conversation:", e);
+    }
+
+    // Emit the preset ID so the chat panel can restore the model selection.
+    // This ensures the model selector reflects the preset used in this chat.
+    const presetId = persisted?.presetId ?? (conv as ChatConversation).presetId;
+    if (presetId) {
+      try {
+        await emit("chat-preset-restore", { presetId });
+      } catch {
+        // ignore broadcast failures
+      }
     }
   };
 

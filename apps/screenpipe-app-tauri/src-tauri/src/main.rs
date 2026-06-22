@@ -5,6 +5,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(deprecated)] // cocoa/objc crate deprecations — will migrate to objc2 later
 #![allow(unused_imports)]
+// analytics.rs builds a ~70-field json! health blob; the default recursion limit
+// (128) overflows while expanding the macro. Raise it for the whole crate.
+#![recursion_limit = "256"]
 
 use analytics::AnalyticsManager;
 use commands::show_main_window;
@@ -30,11 +33,13 @@ use updates::start_update_check;
 use window::ShowRewindWindow;
 
 mod analytics;
+mod auth_session;
 #[allow(deprecated)]
 mod icons;
 use crate::analytics::start_analytics;
 mod agent_event_emitter;
 mod audio_exclusions;
+mod auth_token;
 mod calendar;
 mod capture_session;
 mod chatgpt_oauth;
@@ -45,6 +50,7 @@ mod embedded_server;
 mod enterprise_install_metadata;
 mod enterprise_policy;
 mod enterprise_sync;
+mod events;
 mod google_calendar;
 mod hardware;
 mod ics_calendar;
@@ -56,6 +62,7 @@ mod meeting_live_notes;
 mod meeting_stall_notifications;
 mod oauth;
 mod owned_browser;
+mod owned_browser_transport;
 // Cross-platform shape: macOS reads Arc/Chrome/Brave/Edge cookies and
 // injects via WKHTTPCookieStore; other platforms compile to a stub
 // `cookies_for_host` that returns empty until Windows (DPAPI + AES-256-
@@ -67,6 +74,7 @@ mod permissions;
 mod pi;
 mod pi_command_queue;
 mod pipe_suggestions_scheduler;
+mod power_awake;
 mod recording;
 mod remote_sync_commands;
 mod secrets;
@@ -169,14 +177,15 @@ use tokio::time::{sleep, Duration};
 #[tauri::command]
 #[specta::specta]
 async fn get_media_file(file_path: &str) -> Result<serde_json::Value, String> {
-    use std::path::Path;
-
     const MAX_RETRIES: u32 = 3;
     const INITIAL_DELAY_MS: u64 = 100;
 
     debug!("Reading media file: {}", file_path);
 
-    let path = Path::new(file_path);
+    // Media paths can arrive home-relative (e.g. `~/Downloads/clip.mp4`) when the
+    // agent prints a friendly path in chat. `Path::new` does not expand `~`, so
+    // resolve it the same way the in-app file viewer does before touching disk.
+    let path = viewer::expand_tilde(file_path);
 
     // Retry loop to handle files that may be in the process of being written
     let mut last_error = String::new();
@@ -191,7 +200,7 @@ async fn get_media_file(file_path: &str) -> Result<serde_json::Value, String> {
         }
 
         if !path.exists() {
-            last_error = format!("File does not exist: {}", file_path);
+            last_error = format!("File does not exist: {}", path.display());
             if attempt < MAX_RETRIES {
                 continue;
             }
@@ -199,7 +208,7 @@ async fn get_media_file(file_path: &str) -> Result<serde_json::Value, String> {
         }
 
         // Read file contents
-        match tokio::fs::read(path).await {
+        match tokio::fs::read(&path).await {
             Ok(contents) => {
                 // Check for empty or suspiciously small files (might still be writing)
                 if contents.is_empty() {
@@ -361,11 +370,27 @@ macro_rules! define_specta_builder {
             .typ::<enterprise_install_metadata::EnterpriseInstallMetadata>()
             .typ::<chatgpt_oauth::ChatGptOAuthStatus>()
             .typ::<oauth::OAuthStatus>()
+            .typ::<events::JobEvent>()
+            .typ::<events::ExportEvent>()
+            .typ::<events::ExportRequestInfo>()
+            .typ::<events::EngineEvent>()
+            .typ::<events::NotificationActionEvent>()
+            .typ::<meeting_export::MeetingExportSummary>()
+            .typ::<meeting_export::StartExportRecordingResponse>()
     }};
 }
 
 #[tokio::main]
 async fn main() {
+    // Raise the file-descriptor soft limit BEFORE any DB/socket work. The app
+    // embeds the engine in-process, so it never ran the engine binary's main()
+    // and kept macOS's default soft RLIMIT_NOFILE of 256 — too low for the
+    // high-tier SQLite pool (up to ~37 connections × 3 fds) plus video/audio/
+    // sockets. Exhausting it makes SQLite hit SQLITE_IOERR (522) mid-write and
+    // desync the WAL-index into "database disk image is malformed" (code 11).
+    // Shared single source of truth with the CLI; see engine `fd_limit` module.
+    screenpipe_engine::fd_limit::set_fd_limit();
+
     let _ = fix_path_env::fix();
 
     #[cfg(target_os = "windows")]
@@ -752,6 +777,19 @@ async fn main() {
         }
     }
 
+    // #3943: migrate the cloud auth token out of the plaintext store.bin /
+    // auth.json (and the .last-good snapshot) into the encrypted secret store,
+    // seed the in-process cache, and scrub the plaintext copies. Runs here in
+    // `async main` — BEFORE the store plugin loads store.bin and before the
+    // engine spawn / `to_recording_settings` read the token. Must NOT run
+    // inside `.setup()`: a `block_on` there nests runtimes under
+    // #[tokio::main] and panics ("Cannot start a runtime from within a
+    // runtime"), killing the app at launch.
+    let _ = crate::auth_token::migrate_plaintext_token(
+        &screenpipe_core::paths::default_screenpipe_data_dir(),
+    )
+    .await;
+
     let recording_state = RecordingState {
         server: Arc::new(tokio::sync::Mutex::new(None)),
         capture: Arc::new(tokio::sync::Mutex::new(None)),
@@ -760,6 +798,7 @@ async fn main() {
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
         cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        db_wedge_breaker: recording::new_db_wedge_breaker(),
     };
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
     let suggestions_state = suggestions::SuggestionsState::new();
@@ -1155,6 +1194,22 @@ async fn main() {
             // Resolve data directory from user setting (custom dir or ~/.screenpipe)
             let (data_dir, data_dir_fell_back) = config::resolve_data_dir(&store.data_dir);
             info!("Recording data directory: {}", data_dir.display());
+
+            // Pin SCREENPIPE_DATA_DIR to the *resolved* dir so every consumer of
+            // `default_screenpipe_data_dir()` agrees with the engine on where the
+            // data lives. Without this, a user with a custom/relocated data dir
+            // hit a split: the engine (server_core) reads its SecretStore from
+            // `config.data_dir` (the custom path) while OAuth token writes
+            // (`open_secret_store`, chatgpt_oauth, …) went to the default
+            // `~/.screenpipe`. Tokens landed in one db.sqlite and were read from
+            // another → "no credentials found … cannot authenticate" 401s on
+            // every Microsoft 365 / Google / ChatGPT call, reconnecting forever
+            // never helping. Setting the env var here (before any OAuth callback
+            // can fire) makes `default_screenpipe_data_dir()` self-consistent and
+            // also propagates the correct dir to child processes (the CLI
+            // sidecar inherits this env).
+            std::env::set_var("SCREENPIPE_DATA_DIR", &data_dir);
+
             if data_dir_fell_back {
                 let app_handle_fb = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -1440,6 +1495,10 @@ async fn main() {
                 let capture_arc = recording_state.capture.clone();
                 let is_starting_clone = recording_state.is_starting.clone();
                 let cloud_token_arc = recording_state.cloud_token.clone();
+                // DB-wedge auto-recovery hook wiring — captured into the server
+                // thread so the freshly-built `ServerCore`'s DB gets the hook.
+                let app_for_db_wedge = app_handle.clone();
+                let db_wedge_breaker = recording_state.db_wedge_breaker.clone();
 
                 // Pipe output callback. Stage 5: legacy `pipe_event`
                 // topic dropped — every pipe stdout line goes out on
@@ -1585,6 +1644,16 @@ async fn main() {
                                     return;
                                 }
                             };
+
+                            // Wire the persistent-failure hook so a wedged DB
+                            // auto-restarts recording (rebuilding every pool +
+                            // the shared WAL-index).
+                            server.db.set_persistent_failure_hook(
+                                crate::recording::make_db_wedge_recovery_hook(
+                                    app_for_db_wedge.clone(),
+                                    db_wedge_breaker.clone(),
+                                ),
+                            );
 
                             // Phase 2: Start capture session
                             let capture = match capture_session::CaptureSession::start(&server, &config, true).await {
@@ -1752,7 +1821,15 @@ async fn main() {
             {
                 if let Ok(Some(store)) = crate::store::SettingsStore::get(&app_handle) {
                     if store.enhanced_ai {
-                        let token = store.user.token.clone().unwrap_or_default();
+                        // #3943: the token no longer persists in store.bin —
+                        // fall back to the secret-store-backed cache.
+                        let token = store
+                            .user
+                            .token
+                            .clone()
+                            .filter(|t| !t.is_empty())
+                            .or_else(crate::auth_token::cached_cloud_token)
+                            .unwrap_or_default();
                         if !token.is_empty() {
                             // Use try_lock — blocking_lock panics inside a tokio runtime context
                             if let Ok(mut guard) = suggestions_state.enhanced_ai.try_lock() {

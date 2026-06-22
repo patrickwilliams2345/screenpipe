@@ -275,11 +275,15 @@ fn get_effective_recording_status() -> RecordingStatus {
     if let Some((status, expiry)) = opt.as_ref() {
         if std::time::Instant::now() < *expiry {
             // Don't mask a failed start — optimistic "Starting" is only useful
-            // while capture is genuinely booting, not after a terminal error.
+            // while capture is genuinely booting, not after a terminal error or
+            // when the work-hours schedule has parked capture (ScheduledPause).
             if *status == RecordingStatus::Starting
                 && matches!(
                     real,
-                    RecordingStatus::Error | RecordingStatus::Paused | RecordingStatus::Stopped
+                    RecordingStatus::Error
+                        | RecordingStatus::Paused
+                        | RecordingStatus::ScheduledPause
+                        | RecordingStatus::Stopped
                 )
             {
                 *opt = None;
@@ -637,6 +641,7 @@ fn create_dynamic_menu(
         RecordingStatus::Starting => "○ Starting…",
         RecordingStatus::Recording => "● Recording",
         RecordingStatus::Paused => "◐ Paused",
+        RecordingStatus::ScheduledPause => "○ Outside work hours",
         RecordingStatus::Stopped => "○ Stopped",
         RecordingStatus::Error => "○ Error",
     };
@@ -767,6 +772,7 @@ fn create_dynamic_menu(
         let label = match effective_status {
             RecordingStatus::Recording => "Recording",
             RecordingStatus::Paused => "Paused — click to resume",
+            RecordingStatus::ScheduledPause => "Outside work hours — paused by schedule",
             RecordingStatus::Starting => "Starting…",
             RecordingStatus::Error => "Error — click to retry",
             _ => "Stopped — click to record",
@@ -1241,7 +1247,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
             let _ = app_handle.run_on_main_thread(move || {
                 let _ = app
                     .opener()
-                    .open_url("https://screenpi.pe/changelog", None::<&str>);
+                    .open_url("https://screenpipe.com/changelog", None::<&str>);
             });
         }
         "update_now" => {
@@ -1270,7 +1276,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                             if clicked_download {
                                 let _ = app
                                     .opener()
-                                    .open_url("https://screenpi.pe/download", None::<&str>);
+                                    .open_url("https://screenpipe.com/download", None::<&str>);
                             } else {
                                 let _ = app.opener().open_url(
                                     "https://github.com/screenpipe/screenpipe/releases",
@@ -1450,6 +1456,8 @@ async fn update_menu_if_needed(
             Some(d) => format!("screenpipe — paused, resumes in {}", format_remaining(d)),
             None => "screenpipe — paused".to_string(),
         }
+    } else if effective_status == RecordingStatus::ScheduledPause {
+        "screenpipe — outside work hours (paused by schedule)".to_string()
     } else {
         "screenpipe".to_string()
     };
