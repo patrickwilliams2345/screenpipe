@@ -11,6 +11,8 @@ name: Release Enterprise
 
 on:
   workflow_dispatch:
+  push:
+    tags: ['v*']
 
 env:
   GIT_LFS_SKIP_SMUDGE: 1
