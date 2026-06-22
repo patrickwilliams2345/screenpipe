@@ -55,7 +55,7 @@ jobs:
           cd /tmp/upstream
           git fetch --tags origin
           existing=$(git ls-remote --tags "https://x-access-token:${GH_TOKEN}@github.com/${FORK}.git" | awk '{print $2}' | sed 's|refs/tags/||' || true)
-          new_tags=$(git for-each-ref --format='%(refname:short)' refs/tags | while read t; do
+          new_tags=$(git for-each-ref --format='%(refname:short)' refs/tags | while read -r t; do
             if ! printf '%s\n' "${existing}" | grep -qx "${t}"; then echo "${t}"; fi
           done)
           if [ -z "${new_tags}" ]; then
@@ -66,4 +66,4 @@ jobs:
             git push "https://x-access-token:${GH_TOKEN}@github.com/${FORK}.git" ${new_tags}
           fi
           echo "Tags on fork (newest 5):"
-          git tag --sort=-version:refname | head -5
+          git tag --sort=-version:refname | head -5 || true
