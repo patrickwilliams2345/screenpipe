@@ -2132,7 +2132,7 @@ fn browser_window_matches_meeting(
         return ids
             .browser_url_patterns
             .iter()
-            .any(|p| contains_case_insensitive(doc, p));
+            .any(|p| browser_url_pattern_matches(doc, p));
     }
     if let Some(t) = title {
         let t_lower = t.to_lowercase();
@@ -2158,6 +2158,64 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     }
 
     haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// Match a `browser_url_patterns` entry against a URL or window-title string at
+/// host-name boundaries.
+///
+/// A bare substring match leaks: `daily.co` is a substring of `thedaily.com`,
+/// so an unrelated news site became a phantom meeting candidate (the latent
+/// vector behind #4246, follow-up here). This matches a dotted host pattern
+/// only as a whole hostname or a subdomain of it, and a path-qualified pattern
+/// (`cal.com/video`, `zoom.us/j`) only when both the host segment and the path
+/// component are bounded:
+///   * `daily.co`      → matches `daily.co`, `app.daily.co/room`; NOT
+///                       `thedaily.com`, `daily.com`, `daily.co.uk`.
+///   * `cal.com/video` → matches `app.cal.com/video/uid`; NOT `cal.com/videos`,
+///                       `cal.com/pricing`.
+///
+/// Non-domain patterns (containing a space, or with no `.`) keep the previous
+/// case-insensitive substring behavior — they are free-text markers
+/// (e.g. "zoom meeting"), not hostnames.
+fn browser_url_pattern_matches(haystack: &str, pattern: &str) -> bool {
+    if pattern.contains(' ') || !pattern.contains('.') {
+        return contains_case_insensitive(haystack, pattern);
+    }
+    contains_at_domain_boundary(haystack, pattern)
+}
+
+/// True when the dotted `pattern` appears in `haystack` bounded so its leading
+/// host label is whole (or a subdomain boundary, i.e. preceded by `.`) and its
+/// trailing character does not extend the matched host/path component. ASCII
+/// case-insensitive; `pattern` is expected lowercase-or-mixed (compared
+/// case-folded).
+fn contains_at_domain_boundary(haystack: &str, pattern: &str) -> bool {
+    let hay = haystack.to_ascii_lowercase();
+    let pat = pattern.to_ascii_lowercase();
+    let (hb, pb) = (hay.as_bytes(), pat.as_bytes());
+    if pb.is_empty() || pb.len() > hb.len() {
+        return false;
+    }
+    // A char that, on the LEFT of the match, would make the host label longer
+    // (so the pattern is a tail of a bigger label, e.g. `daily` in `thedaily`).
+    // `.` is intentionally NOT in this set: it marks a subdomain boundary.
+    let extends_left = |c: u8| c.is_ascii_alphanumeric() || c == b'-';
+    // On the RIGHT, anything that continues the host or path component: alnum,
+    // `-`, or `.` (which would make `daily.co` part of `daily.com`/`daily.co.uk`).
+    let extends_right = |c: u8| c.is_ascii_alphanumeric() || c == b'-' || c == b'.';
+    let mut i = 0;
+    while i + pb.len() <= hb.len() {
+        if &hb[i..i + pb.len()] == pb {
+            let left_ok = i == 0 || !extends_left(hb[i - 1]);
+            let after = i + pb.len();
+            let right_ok = after == hb.len() || !extends_right(hb[after]);
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn ends_with_ascii_case_insensitive(haystack: &str, suffix: &str) -> bool {
@@ -2339,7 +2397,7 @@ fn has_browser_meeting_url(pid: i32, url_patterns: &[&str]) -> bool {
                 let doc_for_match = url_without_query_or_fragment(&doc);
                 if url_patterns
                     .iter()
-                    .any(|p| contains_case_insensitive(doc_for_match, p))
+                    .any(|p| browser_url_pattern_matches(doc_for_match, p))
                 {
                     return true;
                 }
@@ -2352,7 +2410,7 @@ fn has_browser_meeting_url(pid: i32, url_patterns: &[&str]) -> bool {
                 if url_patterns
                     .iter()
                     .filter(|p| p.contains('.'))
-                    .any(|p| contains_case_insensitive(&title, p))
+                    .any(|p| browser_url_pattern_matches(&title, p))
                 {
                     return true;
                 }
@@ -2536,11 +2594,15 @@ pub fn find_running_meeting_apps(
                 continue;
             }
 
+            // url_patterns are matched against the window TITLE on Windows (no
+            // per-tab URL available). Boundary matching still applies — it keeps
+            // a real meeting host in a title matching while closing the
+            // `daily.co` ⊂ `thedaily.com` substring leak.
             let url_match = profile
                 .app_identifiers
                 .browser_url_patterns
                 .iter()
-                .any(|p| contains_case_insensitive(title, p));
+                .any(|p| browser_url_pattern_matches(title, p));
             // See `browser_title_matches_pattern` for the matching rules.
             let title_match = !profile.app_identifiers.browser_title_patterns.is_empty() && {
                 let title_lower = title.to_lowercase();
@@ -4229,13 +4291,105 @@ mod tests {
             .expect("generic fallback profile present")
     }
 
-    /// Mirrors the lowercase substring match used by `has_browser_meeting_url`
-    /// and `db_find_browser_meetings`.
+    /// Exercises the production matcher used by `browser_window_matches_meeting`
+    /// / `has_browser_meeting_url` / `db_find_browser_meetings` so these tests
+    /// validate the real host-boundary logic, not a stand-in.
     fn url_matches_any_pattern(url: &str, patterns: &[&str]) -> bool {
-        let url_lower = url.to_lowercase();
-        patterns
-            .iter()
-            .any(|p| url_lower.contains(&p.to_lowercase()))
+        patterns.iter().any(|p| browser_url_pattern_matches(url, p))
+    }
+
+    #[test]
+    fn test_url_boundary_matcher_host_patterns() {
+        // A bare host pattern matches the host and its subdomains, but never a
+        // longer label that merely ends with the same letters.
+        for hit in [
+            "daily.co",
+            "https://daily.co",
+            "https://daily.co/room/abc",
+            "https://app.daily.co/room",
+            "https://my.team.daily.co/x",
+        ] {
+            assert!(
+                browser_url_pattern_matches(hit, "daily.co"),
+                "{hit:?} should match host pattern daily.co"
+            );
+        }
+        for miss in [
+            "https://www.thedaily.com",
+            "https://thedaily.com/news",
+            "https://dailywire.com",
+            "https://daily.com",   // different TLD
+            "https://daily.co.uk", // different (longer) domain
+            "https://notdaily.co.uk",
+        ] {
+            assert!(
+                !browser_url_pattern_matches(miss, "daily.co"),
+                "{miss:?} must NOT match host pattern daily.co (substring leak)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_url_boundary_matcher_path_qualified() {
+        for hit in [
+            "https://app.cal.com/video/uid",
+            "https://cal.com/video/8f3e",
+            "https://cal.com/video", // exact, no trailing segment
+        ] {
+            assert!(
+                browser_url_pattern_matches(hit, "cal.com/video"),
+                "{hit:?} should match cal.com/video"
+            );
+        }
+        for miss in [
+            "https://cal.com/videos", // /video is not a prefix component
+            "https://cal.com/pricing",
+            "https://app.cal.com/event-types",
+            "https://thecal.com/video", // host label extended on the left
+        ] {
+            assert!(
+                !browser_url_pattern_matches(miss, "cal.com/video"),
+                "{miss:?} must NOT match cal.com/video"
+            );
+        }
+    }
+
+    #[test]
+    fn test_url_boundary_matcher_keeps_freetext_markers() {
+        // Non-host patterns (space / no dot) keep substring behavior so existing
+        // free-text markers aren't silently disabled.
+        assert!(browser_url_pattern_matches(
+            "some Zoom Meeting in progress",
+            "zoom meeting"
+        ));
+    }
+
+    #[test]
+    fn test_generic_profile_rejects_daily_co_lookalike() {
+        // The concrete vector this PR closes: daily.co (a bare host pattern) must
+        // not match thedaily.com / dailywire.com, while real daily.co calls do.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+        assert!(
+            patterns.contains(&"daily.co"),
+            "fixture: daily.co host pattern present"
+        );
+        for miss in [
+            "https://www.thedaily.com",
+            "https://thedaily.com/podcast",
+            "https://dailywire.com/news",
+        ] {
+            assert!(
+                !url_matches_any_pattern(miss, patterns),
+                "{miss:?} should NOT match a meeting profile (daily.co substring leak)"
+            );
+        }
+        for hit in ["https://daily.co/standup", "https://app.daily.co/room/x"] {
+            assert!(
+                url_matches_any_pattern(hit, patterns),
+                "real Daily call {hit:?} should still match"
+            );
+        }
     }
 
     #[test]
