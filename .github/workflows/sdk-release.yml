@@ -27,6 +27,8 @@ on:
         description: "Required when publishing: publish-sdk-VERSION"
         required: true
         default: "dry-run"
+  push:
+    tags: ['sdk-v*']
 
 permissions:
   contents: read
