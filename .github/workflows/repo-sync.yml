@@ -1,17 +1,76 @@
 name: Sync Fork
-
 on:
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
-
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: tgymnich/fork-sync@v2.0
+      - name: Configure git
+        run: |
+          git config --global user.name "fork-sync-bot"
+          git config --global user.email "fork-sync-bot@users.noreply.github.com"
+          git config --global advice.detachedHead false
+      - name: Detect upstream state
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          UPSTREAM: screenpipe/screenpipe
+        run: |
+          set -euo pipefail
+          latest_tag=$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name // empty' 2>/dev/null || echo "")
+          latest_sha=$(gh api "repos/${UPSTREAM}/commits/main" --jq '.sha' 2>/dev/null || echo "")
+          echo "upstream_tag=${latest_tag}"
+          echo "upstream_sha=${latest_sha}"
+          last_sha=""
+          [ -f .github/.last-synced-sha ] && last_sha=$(cat .github/.last-synced-sha | tr -d '[:space:]')
+          echo "fork_sha=${last_sha}"
+          if [ -z "${latest_sha}" ]; then
+            echo "should_sync=false" >> "${GITHUB_OUTPUT}"
+            echo "reason=upstream_unreachable" >> "${GITHUB_OUTPUT}"
+          elif [ "${latest_sha}" != "${last_sha}" ] || [ "${github.event_name}" = "workflow_dispatch" ]; then
+            echo "should_sync=true" >> "${GITHUB_OUTPUT}"
+            echo "reason=new_commits_or_release" >> "${GITHUB_OUTPUT}"
+            echo "new_tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
+            echo "new_sha=${latest_sha}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_sync=false" >> "${GITHUB_OUTPUT}"
+            echo "reason=up_to_date" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Sync commits (branches)
+        if: steps.detect.outputs.should_sync == 'true'
+        uses: tgymnich/fork-sync@v2.0
         with:
           token: ${{ secrets.PAT }}
           owner: screenpipe
           base: main
           head: main
+      - name: Sync tags from upstream
+        if: steps.detect.outputs.should_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          UPSTREAM: screenpipe/screenpipe
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-tags --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${UPSTREAM}.git" /tmp/upstream
+          cd /tmp/upstream
+          git fetch --tags --depth 1 origin
+          git push --tags "https://x-access-token:${GH_TOKEN}@github.com/patrickwilliams2345/screenpipe.git"
+          echo "Tags pushed:"
+          git tag --sort=-version:refname | head -5
+      - name: Record synced state
+        if: steps.detect.outputs.should_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
+          mkdir -p .github
+          echo "${{ steps.detect.outputs.new_sha }}" > .github/.last-synced-sha
+          git checkout main
+          git pull --ff-only "https://x-access-token:${GH_TOKEN}@github.com/patrickwilliams2345/screenpipe.git" main
+          git add .github/.last-synced-sha
+          git commit -m "chore: record synced upstream HEAD ${{ steps.detect.outputs.new_sha }}" || true
+          git push "https://x-access-token:${GH_TOKEN}@github.com/patrickwilliams2345/screenpipe.git"
