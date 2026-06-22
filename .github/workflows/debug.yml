@@ -1,0 +1,13 @@
+name: Debug Secret
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: token-length
+        run: |
+          echo "len=${#TOKEN}"
+          echo "starts=${TOKEN:0:4}"
+        env:
+          TOKEN: ${{ secrets.PAT }}
