@@ -50,10 +50,10 @@ jobs:
           FORK: patrickwilliams2345/screenpipe
         run: |
           set -euo pipefail
-          git clone --filter=blob:none --no-tags --depth 1 \
+          git clone --bare --no-tags --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/${UPSTREAM}.git" /tmp/upstream
           cd /tmp/upstream
-          git fetch --tags --depth 1 origin
+          git fetch --tags origin
           git push --tags "https://x-access-token:${GH_TOKEN}@github.com/${FORK}.git"
-          echo "Tags pushed:"
+          echo "Tags pushed (newest 5):"
           git tag --sort=-version:refname | head -5
