@@ -92,6 +92,13 @@ describe('isModelAllowed', () => {
     expect(isModelAllowed('any-random-model', 'subscribed')).toBe(true);
   });
 
+  it('should deny DeepSeek models for every tier due to Google user-data policy', () => {
+    expect(isModelAllowed('deepseek/deepseek-chat', 'anonymous')).toBe(false);
+    expect(isModelAllowed('deepseek-v3.2', 'logged_in')).toBe(false);
+    expect(isModelAllowed('deepseek-r1', 'subscribed')).toBe(false);
+    expect(isModelAllowed('deepseek-r1', 'subscribed', { MODEL_GATING_ENABLED: 'false' } as any)).toBe(false);
+  });
+
   it('should handle partial model name matches', () => {
     expect(isModelAllowed('claude-haiku', 'anonymous')).toBe(true);
     expect(isModelAllowed('haiku', 'anonymous')).toBe(true);

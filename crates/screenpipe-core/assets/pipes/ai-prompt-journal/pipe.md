@@ -30,7 +30,6 @@ AND (
   OR f.window_name LIKE '%gemini.google.com%'
   OR f.window_name LIKE '%perplexity%'
   OR f.window_name LIKE '%grok%'
-  OR f.window_name LIKE '%deepseek%'
   OR f.window_name LIKE '%copilot.microsoft%'
   OR f.window_name LIKE '%huggingface.co/chat%'
   OR f.window_name LIKE '%chat.mistral%'
@@ -129,7 +128,7 @@ This is the critical step. Separate the user's prompts from AI-generated respons
 ## Step 4: Classify each prompt
 
 For each extracted prompt:
-- **Tool**: ChatGPT, Claude, Gemini, Perplexity, Grok, DeepSeek, Copilot, etc.
+- **Tool**: ChatGPT, Claude, Gemini, Perplexity, Grok, Copilot, etc.
 - **Category**: `coding` | `writing` | `research` | `brainstorming` | `analysis` | `conversation` | `image-gen` | `other`
 - **Topic**: 2-5 word summary
 - **Length**: short (<50 words), medium (50-200), long (200+)

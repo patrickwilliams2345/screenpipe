@@ -122,13 +122,62 @@ pub fn local_api_context_from_app(app: &tauri::AppHandle) -> LocalApiContext {
 const RESTART_COOLDOWN_SECS: u64 = 30;
 const CAPTURE_RESTART_MEETING_REATTACH_WINDOW: Duration = Duration::from_secs(120);
 
-/// Shared state for the DB-wedge auto-recovery circuit breaker. Tracks recent
-/// auto-restart timestamps so a DB that stays broken after a restart (genuine
-/// on-disk corruption, which a restart can't repair) cannot restart-storm.
-pub type DbWedgeBreaker = Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>>;
+/// Shared state for the DB-wedge auto-recovery circuit breaker.
+#[derive(Default)]
+pub struct DbWedgeState {
+    /// Timestamps of recent auto-restarts, so a DB that stays broken after a
+    /// restart (genuine on-disk corruption, which a restart can't repair)
+    /// cannot restart-storm.
+    restarts: std::collections::VecDeque<std::time::Instant>,
+    /// Whether the user has already been told auto-recovery gave up this
+    /// episode. The persistent-failure hook can keep firing while the breaker
+    /// is tripped, so this dedupes the "needs recovery" notification.
+    gave_up_notified: bool,
+}
+
+pub type DbWedgeBreaker = Arc<std::sync::Mutex<DbWedgeState>>;
 
 pub fn new_db_wedge_breaker() -> DbWedgeBreaker {
-    Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+    Arc::new(std::sync::Mutex::new(DbWedgeState::default()))
+}
+
+/// What the circuit breaker decided to do about one persistent-failure signal.
+#[derive(Debug, PartialEq, Eq)]
+enum WedgeAction {
+    /// Attempt a stop→spawn restart (the timestamp was recorded).
+    Restart,
+    /// Too many restarts in the window — don't restart. `notify` is true only
+    /// the first time we give up this episode, so a hook that keeps firing
+    /// while the breaker is tripped doesn't spam the notification panel.
+    GiveUp { notify: bool },
+}
+
+impl DbWedgeState {
+    /// Age out restart timestamps older than `window`, then decide whether to
+    /// restart again. On `Restart` the new attempt is recorded and the give-up
+    /// notice is re-armed for this episode.
+    fn decide(
+        &mut self,
+        now: std::time::Instant,
+        window: Duration,
+        max_restarts: usize,
+    ) -> WedgeAction {
+        while self
+            .restarts
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > window)
+        {
+            self.restarts.pop_front();
+        }
+        if self.restarts.len() >= max_restarts {
+            let notify = !self.gave_up_notified;
+            self.gave_up_notified = true;
+            return WedgeAction::GiveUp { notify };
+        }
+        self.restarts.push_back(now);
+        self.gave_up_notified = false;
+        WedgeAction::Restart
+    }
 }
 
 /// Max auto-restarts allowed inside `DB_WEDGE_BREAKER_WINDOW` before giving up.
@@ -158,27 +207,32 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
     // Debounce: let a burst of signals coalesce and any in-flight work settle.
     tokio::time::sleep(DB_WEDGE_DEBOUNCE).await;
 
-    // Circuit breaker: drop timestamps outside the window, then decide.
-    {
-        let now = std::time::Instant::now();
-        let mut recent = breaker.lock().unwrap();
-        while recent
-            .front()
-            .is_some_and(|t| now.duration_since(*t) > DB_WEDGE_BREAKER_WINDOW)
-        {
-            recent.pop_front();
+    // Circuit breaker: a DB that stays broken after a restart is on-disk
+    // corruption a restart can't repair, so cap auto-restarts per window.
+    let action = {
+        let mut state = breaker.lock().unwrap();
+        state.decide(
+            std::time::Instant::now(),
+            DB_WEDGE_BREAKER_WINDOW,
+            DB_WEDGE_MAX_RESTARTS,
+        )
+    };
+    if let WedgeAction::GiveUp { notify } = action {
+        error!(
+            "db wedge auto-recovery: {} restarts within {:?} did not clear the write wedge — \
+             this looks like on-disk corruption a restart can't repair. Auto-restart suspended; \
+             quit screenpipe and run `screenpipe db recover`.",
+            DB_WEDGE_MAX_RESTARTS, DB_WEDGE_BREAKER_WINDOW
+        );
+        if notify {
+            // Publish on the event bus; the in-process `db_recovery_notifications`
+            // subscriber turns it into a notification (NOT the `/ws/events`
+            // bridge — the engine is down exactly when this fires). Deduped to
+            // once per episode by the breaker.
+            let evt = screenpipe_events::DbRecoveryEvent::needs_recovery();
+            let _ = screenpipe_events::send_event(evt.event_name(), evt);
         }
-        if recent.len() >= DB_WEDGE_MAX_RESTARTS {
-            error!(
-                "db wedge auto-recovery: {} restarts within {:?} did not clear the write wedge — \
-                 this looks like on-disk corruption a restart can't repair. Auto-restart suspended; \
-                 quit screenpipe and run `screenpipe db recover`.",
-                recent.len(),
-                DB_WEDGE_BREAKER_WINDOW
-            );
-            return;
-        }
-        recent.push_back(now);
+        return;
     }
 
     warn!(
@@ -202,7 +256,14 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
     screenpipe_secrets::close_all_secret_pools().await;
 
     if let Err(e) = spawn_screenpipe(app.state::<RecordingState>(), app.clone(), None).await {
+        // The restart failed to bring the engine back up (e.g. the port never
+        // rebound). Nothing else will retry until the DB layer fires the hook
+        // again — and if the server is fully down it never will — so recording
+        // would otherwise sit silently stopped. Publish on the event bus so the
+        // in-process `db_recovery_notifications` subscriber surfaces it.
         error!("db wedge auto-recovery: spawn_screenpipe failed: {}", e);
+        let evt = screenpipe_events::DbRecoveryEvent::restart_failed();
+        let _ = screenpipe_events::send_event(evt.event_name(), evt);
     }
 }
 
@@ -1201,6 +1262,75 @@ async fn kill_process_on_port(port: u16) {
                 info!("Killed orphaned process(es) on port {}", port);
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod db_wedge_tests {
+    use super::{DbWedgeState, WedgeAction};
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = Duration::from_secs(600);
+    const MAX: usize = 3;
+
+    // First MAX signals restart; the next one gives up and notifies exactly
+    // once even though the breaker keeps being consulted.
+    #[test]
+    fn gives_up_after_cap_and_notifies_once() {
+        let mut s = DbWedgeState::default();
+        let t = Instant::now();
+        for _ in 0..MAX {
+            assert_eq!(s.decide(t, WINDOW, MAX), WedgeAction::Restart);
+        }
+        assert_eq!(
+            s.decide(t, WINDOW, MAX),
+            WedgeAction::GiveUp { notify: true }
+        );
+        // Hook keeps firing while tripped — no more notifications.
+        assert_eq!(
+            s.decide(t, WINDOW, MAX),
+            WedgeAction::GiveUp { notify: false }
+        );
+        assert_eq!(
+            s.decide(t, WINDOW, MAX),
+            WedgeAction::GiveUp { notify: false }
+        );
+    }
+
+    // Once the old restarts age out of the window, recovery re-arms: it restarts
+    // again and a fresh give-up re-notifies (it's a new corruption episode).
+    #[test]
+    fn restarts_age_out_and_re_arm_notification() {
+        let mut s = DbWedgeState::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX {
+            assert_eq!(s.decide(t0, WINDOW, MAX), WedgeAction::Restart);
+        }
+        assert_eq!(
+            s.decide(t0, WINDOW, MAX),
+            WedgeAction::GiveUp { notify: true }
+        );
+
+        let later = t0 + WINDOW + Duration::from_secs(1);
+        for _ in 0..MAX {
+            assert_eq!(s.decide(later, WINDOW, MAX), WedgeAction::Restart);
+        }
+        assert_eq!(
+            s.decide(later, WINDOW, MAX),
+            WedgeAction::GiveUp { notify: true }
+        );
+    }
+
+    // A successful restart cadence (signals spaced beyond the window) never
+    // trips the breaker — every attempt restarts and nothing is suppressed.
+    #[test]
+    fn spaced_out_failures_never_trip() {
+        let mut s = DbWedgeState::default();
+        let mut t = Instant::now();
+        for _ in 0..10 {
+            assert_eq!(s.decide(t, WINDOW, MAX), WedgeAction::Restart);
+            t += WINDOW + Duration::from_secs(1);
         }
     }
 }

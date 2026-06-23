@@ -89,6 +89,16 @@ this FAQ is organized around the questions people ask support most often: what t
   you can self-host the CLI, audit the capture and storage code, and run screenpipe fully offline. enterprise customers can request source access for compliance review.
 </Expandable>
 
+<Expandable title="can I use screenpipe for free?">
+  yes, three ways:
+
+  1. **CLI (free, open source)**: `npx screenpipe@latest record` — full recording, search, and API. runs in your terminal. completely free and open source.
+  2. **Tauri desktop app (free, open source)**: clone [github.com/screenpipe/screenpipe](https://github.com/screenpipe/screenpipe) and build the app from source (`pnpm build` in `apps/screenpipe-app-tauri`). adds a visual timeline and UI on top of the CLI.
+  3. **Paid desktop app (commercial)**: download from [screenpi.pe/onboarding](https://screenpi.pe/onboarding). includes support, auto-updates, and pre-built distribution ($60-300/year depending on features).
+
+  most users start with the CLI and upgrade to the paid app later for the visual timeline and features. the codebase is shared across all three, so open-source security audits apply to all versions.
+</Expandable>
+
 <Expandable title="does screenpipe work offline?">
   yes. screen capture, audio capture, OCR fallback, accessibility text extraction, local transcription, search, and the local API at `localhost:3030` all work without internet.
 
@@ -396,7 +406,7 @@ this FAQ is organized around the questions people ask support most often: what t
 <Expandable title="can I use Ollama or local LLMs with screenpipe?">
   yes. screenpipe works with any OpenAI-compatible local server, including [Ollama](/ollama), llama.cpp, LM Studio, and vLLM.
 
-  configure it in **settings → AI models → custom endpoint**. point to `http://localhost:11434/v1` for Ollama. you can then run chat, pipes, and MCP queries fully offline with models like Llama, Qwen, Mistral, or DeepSeek.
+  configure it in **settings → AI models → custom endpoint**. point to `http://localhost:11434/v1` for Ollama. you can then run chat, pipes, and MCP queries fully offline with models like Llama, Qwen, or Mistral.
 </Expandable>
 
 <Expandable title='Anthropic API key error: "credit balance is too low" or "insufficient credits".'>

@@ -56,6 +56,7 @@ mod ics_calendar;
 mod livetext;
 #[cfg(target_os = "macos")]
 mod livetext_ffi;
+mod db_recovery_notifications;
 mod meeting_export;
 mod meeting_live_notes;
 mod meeting_stall_notifications;
@@ -1796,6 +1797,7 @@ async fn main() {
             crate::monitor_events::start(app_handle.clone());
             crate::meeting_live_notes::start(app_handle.clone());
             crate::meeting_stall_notifications::start(app_handle.clone());
+            crate::db_recovery_notifications::start(app_handle.clone());
 
             #[cfg(target_os = "macos")]
             crate::window::reset_to_regular_and_refresh_tray(&app_handle);

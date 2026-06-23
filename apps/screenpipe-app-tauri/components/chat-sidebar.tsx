@@ -82,11 +82,23 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuShortcut,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
   Dialog,
   DialogContent,
@@ -1929,6 +1941,223 @@ interface ChatRowProps {
 }
 
 /**
+ * Single-letter shortcuts shown on the right of each menu row (anthropic-style).
+ * Each maps to an item carrying `data-shortcut={key}`; pressing the key while a
+ * row menu is open selects that item. Keep in sync with `RowMenuItems`.
+ */
+const ROW_MENU_SHORTCUT_KEYS = ["p", "r", "a", "d"] as const;
+
+/**
+ * Press a shortcut letter while a chat-row menu (right-click or kebab) is open
+ * to fire the matching action. We forward an Enter keydown to the item so radix
+ * runs its own onSelect + close — no second code path to keep in sync.
+ */
+function handleRowMenuShortcut(e: React.KeyboardEvent<HTMLElement>) {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+  if (e.key.length !== 1) return;
+  const key = e.key.toLowerCase();
+  if (!ROW_MENU_SHORTCUT_KEYS.includes(key as (typeof ROW_MENU_SHORTCUT_KEYS)[number])) {
+    return;
+  }
+  const target = e.currentTarget.querySelector<HTMLElement>(`[data-shortcut="${key}"]`);
+  if (!target) return;
+  e.preventDefault();
+  e.stopPropagation();
+  target.focus();
+  target.dispatchEvent(
+    new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })
+  );
+}
+
+/**
+ * The actions inside a chat row's menu, shared by the kebab dropdown and the
+ * right-click context menu so both stay identical. `variant` swaps the radix
+ * primitive set; the item list, shortcuts and handlers are written once.
+ */
+interface RowMenuParts {
+  Item: React.ComponentType<any>;
+  Sub: React.ComponentType<any>;
+  SubTrigger: React.ComponentType<any>;
+  SubContent: React.ComponentType<any>;
+  Separator: React.ComponentType<any>;
+  Shortcut: React.ComponentType<any>;
+}
+
+const ROW_MENU_PARTS: Record<"dropdown" | "context", RowMenuParts> = {
+  dropdown: {
+    Item: DropdownMenuItem,
+    Sub: DropdownMenuSub,
+    SubTrigger: DropdownMenuSubTrigger,
+    SubContent: DropdownMenuSubContent,
+    Separator: DropdownMenuSeparator,
+    Shortcut: DropdownMenuShortcut,
+  },
+  context: {
+    Item: ContextMenuItem,
+    Sub: ContextMenuSub,
+    SubTrigger: ContextMenuSubTrigger,
+    SubContent: ContextMenuSubContent,
+    Separator: ContextMenuSeparator,
+    Shortcut: ContextMenuShortcut,
+  },
+};
+
+function RowMenuItems({
+  variant,
+  session,
+  availableMoveGroups,
+  onArchive,
+  onUnarchive,
+  onDeleteRequest,
+  onTogglePin,
+  onRenameRequest,
+  onMoveToGroup,
+  onNewGroupRequest,
+  existingGroups,
+}: {
+  variant: "dropdown" | "context";
+  session: SessionRecord;
+  availableMoveGroups: string[];
+  onArchive: (id: string) => Promise<void> | void;
+  onUnarchive: (id: string) => Promise<void> | void;
+  onDeleteRequest: (id: string | null) => void;
+  onTogglePin: (id: string) => Promise<void> | void;
+  onRenameRequest: (id: string) => void;
+  onMoveToGroup?: (id: string, group: string | undefined) => void;
+  onNewGroupRequest?: (id: string) => void;
+  existingGroups?: string[];
+}) {
+  const P = ROW_MENU_PARTS[variant];
+  const itemCls = "text-[11px] h-[30px] px-2 gap-2 rounded-none focus:bg-muted/30";
+  const groupItemCls = "text-[11px] h-[30px] px-2 rounded-none focus:bg-muted/30";
+  const shortcutCls = "text-[10px] tracking-normal text-muted-foreground/55";
+  return (
+    <>
+      <P.Item
+        data-shortcut="p"
+        className={itemCls}
+        onSelect={(e: Event) => {
+          e.stopPropagation();
+          void onTogglePin(session.id);
+        }}
+      >
+        <Pin className="h-3 w-3 text-muted-foreground" />
+        {session.pinned ? "Unpin" : "Pin"}
+        <P.Shortcut className={shortcutCls}>P</P.Shortcut>
+      </P.Item>
+      <P.Item
+        data-shortcut="r"
+        className={itemCls}
+        onSelect={(e: Event) => {
+          e.stopPropagation();
+          onRenameRequest(session.id);
+        }}
+      >
+        <Pencil className="h-3 w-3 text-muted-foreground" />
+        Rename
+        <P.Shortcut className={shortcutCls}>R</P.Shortcut>
+      </P.Item>
+      {onMoveToGroup && existingGroups && (
+        <P.Sub>
+          <P.SubTrigger
+            className={itemCls}
+            data-testid={`chat-row-move-to-group-${session.id}`}
+          >
+            <FolderOpen className="h-3 w-3 text-muted-foreground" />
+            Move to group
+          </P.SubTrigger>
+          <P.SubContent
+            className="w-[156px] p-1 rounded-none border border-border bg-background shadow-none"
+            data-testid={`chat-row-move-to-group-menu-${session.id}`}
+          >
+            {availableMoveGroups.map((g) => (
+              <P.Item
+                key={g}
+                className={groupItemCls}
+                onSelect={(e: Event) => {
+                  e.stopPropagation();
+                  onMoveToGroup(session.id, g);
+                }}
+              >
+                {g}
+              </P.Item>
+            ))}
+            {session.sidebarGroup && (
+              <>
+                {availableMoveGroups.length > 0 && (
+                  <P.Separator className="my-1 bg-border/70" />
+                )}
+                <P.Item
+                  className={groupItemCls}
+                  onSelect={(e: Event) => {
+                    e.stopPropagation();
+                    onMoveToGroup(session.id, undefined);
+                  }}
+                >
+                  Remove from group
+                </P.Item>
+              </>
+            )}
+            {(availableMoveGroups.length > 0 || session.sidebarGroup) && (
+              <P.Separator className="my-1 bg-border/70" />
+            )}
+            <P.Item
+              className={groupItemCls}
+              onSelect={(e: Event) => {
+                e.stopPropagation();
+                onNewGroupRequest?.(session.id);
+              }}
+            >
+              New group...
+            </P.Item>
+          </P.SubContent>
+        </P.Sub>
+      )}
+      {!session.hidden ? (
+        <P.Item
+          data-shortcut="a"
+          className={itemCls}
+          onSelect={(e: Event) => {
+            e.stopPropagation();
+            void onArchive(session.id);
+          }}
+        >
+          <Archive className="h-3 w-3 text-muted-foreground" />
+          Archive
+          <P.Shortcut className={shortcutCls}>A</P.Shortcut>
+        </P.Item>
+      ) : (
+        <P.Item
+          data-shortcut="a"
+          className={itemCls}
+          onSelect={(e: Event) => {
+            e.stopPropagation();
+            void onUnarchive(session.id);
+          }}
+        >
+          <Undo2 className="h-3 w-3 text-muted-foreground" />
+          Unarchive
+          <P.Shortcut className={shortcutCls}>A</P.Shortcut>
+        </P.Item>
+      )}
+      <P.Separator className="my-1 bg-border/70" />
+      <P.Item
+        data-shortcut="d"
+        className="text-[11px] h-[30px] px-2 gap-2 rounded-none text-destructive focus:text-destructive focus:bg-destructive/10"
+        onSelect={(e: Event) => {
+          e.stopPropagation();
+          onDeleteRequest(session.id);
+        }}
+      >
+        <Trash2 className="h-3 w-3 text-destructive" />
+        Delete
+        <P.Shortcut className={cn(shortcutCls, "text-destructive/60")}>D</P.Shortcut>
+      </P.Item>
+    </>
+  );
+}
+
+/**
  * One chat row.
  *
  * Outer element is a div role=button (NOT a real <button>) so the inline
@@ -1979,7 +2208,27 @@ export function SidebarChatRow({
   const menuOpen = openConversationMenuId === session.id;
   const availableMoveGroups =
     existingGroups?.filter((group) => group !== session.sidebarGroup) ?? [];
+  const rowMenuActions = {
+    onArchive,
+    onUnarchive,
+    onDeleteRequest,
+    onTogglePin,
+    onRenameRequest,
+    onMoveToGroup,
+    onNewGroupRequest,
+    existingGroups,
+    availableMoveGroups,
+  };
+  // The row is both the click target and the right-click (context menu)
+  // anchor. The kebab below stays as a discoverable, mouse-only entry point;
+  // both menus render the same `RowMenuItems`.
   return (
+    <ContextMenu
+      onOpenChange={(open) => {
+        if (open) setOpenConversationMenuId?.(null);
+      }}
+    >
+      <ContextMenuTrigger asChild disabled={!canShowActions}>
     <div
       className={cn(
         "group relative flex items-center gap-2 px-2.5 py-1 rounded-md select-none",
@@ -2076,122 +2325,24 @@ export function SidebarChatRow({
               className="w-[156px] p-1 rounded-none border border-border bg-background shadow-none"
               onClick={(e) => e.stopPropagation()}
               onPointerDown={(e) => e.stopPropagation()}
+              onKeyDown={handleRowMenuShortcut}
             >
-              <DropdownMenuItem
-                className="text-[11px] h-[30px] px-2 gap-2 rounded-none focus:bg-muted/30"
-                onSelect={(e) => {
-                  e.stopPropagation();
-                  void onTogglePin(session.id);
-                }}
-              >
-                <Pin className="h-3 w-3 text-muted-foreground" />
-                {session.pinned ? "Unpin" : "Pin"}
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                className="text-[11px] h-[30px] px-2 gap-2 rounded-none focus:bg-muted/30"
-                onSelect={(e) => {
-                  e.stopPropagation();
-                  onRenameRequest(session.id);
-                }}
-              >
-                <Pencil className="h-3 w-3 text-muted-foreground" />
-                Rename
-              </DropdownMenuItem>
-              {onMoveToGroup && existingGroups && (
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger
-                    className="text-[11px] h-[30px] px-2 gap-2 rounded-none focus:bg-muted/30"
-                    data-testid={`chat-row-move-to-group-${session.id}`}
-                  >
-                    <FolderOpen className="h-3 w-3 text-muted-foreground" />
-                    Move to group
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent
-                    className="w-[156px] p-1 rounded-none border border-border bg-background shadow-none"
-                    data-testid={`chat-row-move-to-group-menu-${session.id}`}
-                  >
-                    {availableMoveGroups.map((g) => (
-                        <DropdownMenuItem
-                          key={g}
-                          className="text-[11px] h-[30px] px-2 rounded-none focus:bg-muted/30"
-                          onSelect={(e) => {
-                            e.stopPropagation();
-                            onMoveToGroup(session.id, g);
-                          }}
-                        >
-                          {g}
-                        </DropdownMenuItem>
-                      ))}
-                    {session.sidebarGroup && (
-                      <>
-                        {availableMoveGroups.length > 0 && (
-                          <DropdownMenuSeparator className="my-1 bg-border/70" />
-                        )}
-                        <DropdownMenuItem
-                          className="text-[11px] h-[30px] px-2 rounded-none focus:bg-muted/30"
-                          onSelect={(e) => {
-                            e.stopPropagation();
-                            onMoveToGroup(session.id, undefined);
-                          }}
-                        >
-                          Remove from group
-                        </DropdownMenuItem>
-                      </>
-                    )}
-                    {(availableMoveGroups.length > 0 || session.sidebarGroup) && (
-                      <DropdownMenuSeparator className="my-1 bg-border/70" />
-                    )}
-                    <DropdownMenuItem
-                      className="text-[11px] h-[30px] px-2 rounded-none focus:bg-muted/30"
-                      onSelect={(e) => {
-                        e.stopPropagation();
-                        onNewGroupRequest?.(session.id);
-                      }}
-                    >
-                      New group...
-                    </DropdownMenuItem>
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-              )}
-              {!session.hidden ? (
-                <DropdownMenuItem
-                  className="text-[11px] h-[30px] px-2 gap-2 rounded-none focus:bg-muted/30"
-                  onSelect={(e) => {
-                    e.stopPropagation();
-                    void onArchive(session.id);
-                  }}
-                >
-                  <Archive className="h-3 w-3 text-muted-foreground" />
-                  Archive
-                </DropdownMenuItem>
-              ) : (
-                <DropdownMenuItem
-                  className="text-[11px] h-[30px] px-2 gap-2 rounded-none focus:bg-muted/30"
-                  onSelect={(e) => {
-                    e.stopPropagation();
-                    void onUnarchive(session.id);
-                  }}
-                >
-                  <Undo2 className="h-3 w-3 text-muted-foreground" />
-                  Unarchive
-                </DropdownMenuItem>
-              )}
-              <DropdownMenuSeparator className="my-1 bg-border/70" />
-              <DropdownMenuItem
-                className="text-[11px] h-[30px] px-2 gap-2 rounded-none text-destructive focus:text-destructive focus:bg-destructive/10"
-                onSelect={(e) => {
-                  e.stopPropagation();
-                  onDeleteRequest(session.id);
-                }}
-              >
-                <Trash2 className="h-3 w-3 text-destructive" />
-                Delete
-              </DropdownMenuItem>
+              <RowMenuItems variant="dropdown" session={session} {...rowMenuActions} />
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
       )}
     </div>
+      </ContextMenuTrigger>
+      {canShowActions && (
+        <ContextMenuContent
+          className="w-[156px] p-1 rounded-none border border-border bg-background shadow-none"
+          onKeyDown={handleRowMenuShortcut}
+        >
+          <RowMenuItems variant="context" session={session} {...rowMenuActions} />
+        </ContextMenuContent>
+      )}
+    </ContextMenu>
   );
 }
 
