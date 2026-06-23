@@ -619,14 +619,23 @@ fn copy_permission_flow_bundle() {
             .and_then(|c| c.parent()) // <arch>-apple-macosx/
             .and_then(|a| a.parent()) // PermissionFlowShimFFI/
             .map(|ffi| {
-                ffi.join(format!("{host_arch}-apple-macosx"))
-                    .join(
-                        bundle_src
-                            .parent()
-                            .and_then(|c| c.file_name())
-                            .unwrap_or_default(),
-                    )
-                    .join(bundle_name)
+                let config_dir = bundle_src
+                    .parent()
+                    .and_then(|c| c.file_name())
+                    .unwrap_or_default();
+                
+                let path1 = ffi.join(format!("{host_arch}-apple-macosx"))
+                    .join(config_dir)
+                    .join(bundle_name);
+                
+                if path1.exists() {
+                    path1
+                } else {
+                    let fallback_config = if config_dir == "release" { "debug" } else { "release" };
+                    ffi.join(format!("{host_arch}-apple-macosx"))
+                        .join(fallback_config)
+                        .join(bundle_name)
+                }
             })
             .filter(|p| p.exists())
             .unwrap_or(bundle_src)
