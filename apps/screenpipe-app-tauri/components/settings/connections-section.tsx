@@ -41,8 +41,7 @@ import { GoogleDocsCard } from "./google-docs-card";
 import { GoogleSheetsCard } from "./google-sheets-card";
 import { GmailCard } from "./gmail-card";
 import { IcsCalendarCard } from "./ics-calendar-card";
-import { OpenClawCard } from "./openclaw-card";
-import { HermesCard } from "./hermes-card";
+import { RemoteAgentCard } from "./remote-agent-card";
 import { BrowserUrlCard } from "./browser-url-card";
 import { UserBrowserCard } from "./user-browser-card";
 import { VoiceMemosCard } from "./voice-memos-card";
@@ -635,8 +634,7 @@ const INTEGRATION_ICONS: Record<string, React.ReactNode> = {
     "google-calendar": <img src="/images/google-calendar.svg" alt="Google Calendar" className="w-5 h-5" />,
     "google-docs": <img src="/images/google-docs.svg" alt="Google Docs" className="w-5 h-5" />,
     "ics-calendar": <CalendarIcon className="h-5 w-5 text-muted-foreground" />,
-    openclaw: <img src="/openclaw-icon.svg" alt="OpenClaw" className="w-5 h-5" />,
-    hermes: <img src="/images/hermes.png" alt="Hermes" className="w-5 h-5 rounded" />,
+    "remote-agent": <img src="/openclaw-icon.svg" alt="Remote agent" className="w-5 h-5" />,
     bee: <img src="/images/bee.png" alt="Bee" className="w-5 h-5 rounded" />,
     email: <Send className="h-5 w-5 text-muted-foreground" />,
     todoist: (
@@ -3778,12 +3776,9 @@ export function ConnectionsSection({
     detectInstalledConnectionIds()
       .then(setDetectedConnectionIds)
       .catch(() => setDetectedConnectionIds(new Set()));
-    getInstalledMcpVersion().then(v => {
-      const installed = !!v || localStorage.getItem("screenpipe_claude_connected") === "true";
-      setClaudeInstalled(installed);
-    }).catch(() => {
-      setClaudeInstalled(localStorage.getItem("screenpipe_claude_connected") === "true");
-    });
+    getInstalledMcpVersion()
+      .then(v => setClaudeInstalled(!!v))
+      .catch(() => setClaudeInstalled(false));
     isCursorMcpInstalled().then(setCursorInstalled).catch(() => {});
     isCodexMcpInstalled().then(setCodexInstalled).catch(() => {});
     isGrokMcpInstalled().then(setGrokInstalled).catch(() => {});
@@ -3916,8 +3911,7 @@ export function ConnectionsSection({
       { id: "google-docs", name: "Google Docs", icon: "google-docs", connected: false },
       { id: "gmail", name: "Gmail", icon: "gmail", connected: false },
       { id: "ics-calendar", name: "ICS Calendar", icon: "ics-calendar", connected: false },
-      { id: "openclaw", name: "OpenClaw", icon: "openclaw", connected: false },
-      { id: "hermes", name: "Hermes", icon: "hermes", connected: false },
+      { id: "remote-agent", name: "Remote agent", icon: "remote-agent", connected: false },
       { id: "whatsapp", name: "WhatsApp", icon: "whatsapp", connected: false, detected: detectedConnectionIds.has("whatsapp") },
       { id: "anythingllm", name: "AnythingLLM", icon: "anythingllm", connected: false, detected: detectedConnectionIds.has("anythingllm") },
       { id: "ollama", name: "Ollama", icon: "ollama", connected: false, detected: detectedConnectionIds.has("ollama") },
@@ -4033,8 +4027,8 @@ export function ConnectionsSection({
     if (!selected) return null;
     switch (selected) {
       case "claude": return <ClaudePanel
-        onConnected={() => { localStorage.setItem("screenpipe_claude_connected", "true"); setClaudeInstalled(true); }}
-        onDisconnected={() => { localStorage.removeItem("screenpipe_claude_connected"); setClaudeInstalled(false); }}
+        onConnected={() => setClaudeInstalled(true)}
+        onDisconnected={() => setClaudeInstalled(false)}
       />;
       case "cursor": return <CursorPanel
         onConnected={() => setCursorInstalled(true)}
@@ -4062,10 +4056,9 @@ export function ConnectionsSection({
       case "google-sheets": return <GoogleSheetsCard onConnectionChange={fetchIntegrations} />;
       case "gmail": return <GmailCard />;
       case "ics-calendar": return <IcsCalendarCard />;
-      case "openclaw": return <OpenClawCard />;
+      case "remote-agent": return <RemoteAgentCard />;
       case "whatsapp": return <WhatsAppPanel />;
       case "anythingllm": return <AnythingLLMPanel />;
-      case "hermes": return <HermesCard />;
       case "custom-mcp": return <CustomMcpCard />;
       case "skills": return <SkillsCard onChanged={loadSkillsCount} />;
       case "krisp": return <OAuthMcpPanel

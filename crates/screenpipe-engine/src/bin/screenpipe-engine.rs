@@ -294,6 +294,14 @@ async fn main() -> anyhow::Result<()> {
             handle_mcp_command(subcommand, &local_data_dir).await?;
             return Ok(());
         }
+        Command::Agent { ref subcommand } => {
+            screenpipe_engine::cli::agent::handle_agent_command(subcommand).await?;
+            return Ok(());
+        }
+        Command::Service { ref subcommand } => {
+            screenpipe_engine::cli::service::handle_service_command(subcommand).await?;
+            return Ok(());
+        }
         Command::Sync { ref subcommand } => {
             handle_sync_command(subcommand).await?;
             return Ok(());

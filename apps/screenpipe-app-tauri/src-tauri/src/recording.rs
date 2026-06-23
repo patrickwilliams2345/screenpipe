@@ -191,6 +191,16 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
             e
         );
     }
+
+    // stop_screenpipe rebuilds the engine's read/write pools on respawn, but the
+    // secret-store pool is a process-lifetime cache (min_connections=1, no idle
+    // reaping) that would otherwise keep a connection — and the poisoned `-shm`
+    // WAL-index — open across the restart. SQLite only rebuilds `-shm` once the
+    // LAST connection to the db closes, so without this the wedge survives an
+    // in-process restart and recording stays down until a full process exit.
+    // Pools recreate lazily on the next secret access after spawn reopens.
+    screenpipe_secrets::close_all_secret_pools().await;
+
     if let Err(e) = spawn_screenpipe(app.state::<RecordingState>(), app.clone(), None).await {
         error!("db wedge auto-recovery: spawn_screenpipe failed: {}", e);
     }

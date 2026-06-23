@@ -166,7 +166,7 @@ async function openSidebarConversationMenu(chatId: string): Promise<void> {
     async () =>
       (await browser.execute((id: string) =>
         !!document.querySelector(`[data-testid="chat-row-move-to-group-${id}"]`),
-      , chatId)) as boolean,
+      chatId)) as boolean,
     {
       timeout: t(5_000),
       interval: 200,

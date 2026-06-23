@@ -79,11 +79,26 @@ this is simpler and more efficient than per-record tracking — one timestamp te
 
 your cloud storage usage is shown in the archive status card. storage limits depend on your screenpipe pro plan.
 
-## important notes
+## download your archive
 
-<Warning>
-archived data is currently upload-only. download/restore is not yet available — local data older than your retention period will be permanently deleted from your device after upload.
-</Warning>
+if you need to retrieve archived data before it's automatically cleaned up, you can download your entire archive in one click:
+
+1. go to **settings → cloud archive**
+2. click **download my archive** (may take several minutes depending on archive size)
+3. monitor progress in the download status card
+4. once complete, click **open folder** to view the files in finder
+
+the archive is organized into two folders:
+- **media/**: video clips (.mp4) and screenshots (.jpg)
+- **metadata/**: json files containing transcriptions, accessibility text, and event logs
+
+all data is decrypted locally during download — the same encryption key used for upload is applied in reverse.
+
+<Info>
+download works even if cloud archiving is currently disabled, allowing you to retrieve previously archived data.
+</Info>
+
+## important notes
 
 <Info>
 cloud archive requires a screenpipe pro subscription. the archive process runs automatically in the background every 5 minutes when enabled.

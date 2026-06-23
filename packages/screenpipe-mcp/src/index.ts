@@ -19,13 +19,33 @@ import * as os from "os";
 // Parse command line arguments
 const args = process.argv.slice(2);
 let port = 3030;
+let host = "localhost";
+let baseOverride: string | undefined;
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--port" && args[i + 1]) {
     port = parseInt(args[i + 1], 10);
+  } else if (args[i] === "--screenpipe-host" && args[i + 1]) {
+    host = args[i + 1];
+  } else if (
+    (args[i] === "--screenpipe-url" || args[i] === "--screenpipe-api-url") &&
+    args[i + 1]
+  ) {
+    baseOverride = args[i + 1];
   }
 }
 
-const SCREENPIPE_API = `http://localhost:${port}`;
+// Resolve the screenpipe API base URL so this MCP can target a REMOTE
+// screenpipe (e.g. an agent on a VPS reading a synced copy of your data),
+// not just localhost. Priority:
+//   1. --screenpipe-url / --screenpipe-api-url flag
+//   2. SCREENPIPE_API_URL env (set by `screenpipe agent setup --api-url`)
+//   3. --screenpipe-host (+ --port) → http://host:port
+//   4. default http://localhost:<port>
+const SCREENPIPE_API = (
+  baseOverride ||
+  process.env.SCREENPIPE_API_URL ||
+  `http://${host}:${port}`
+).replace(/\/+$/, "");
 
 // Discover the local API key, in priority order:
 //
