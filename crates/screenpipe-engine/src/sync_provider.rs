@@ -157,16 +157,25 @@ fn sync_data_type_enabled(gate_dir: Option<&std::path::Path>, blob_type: BlobTyp
         Some(d) => d,
         None => return true,
     };
+    let store = match crate::cli::store_file::read_store_for(dir) {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    sync_data_type_enabled_in(&store, blob_type)
+}
+
+/// Pure predicate: whether `blob_type` is enabled per a decoded store's
+/// `sync_config`. Split out from the (possibly encrypted) store read so tests
+/// can exercise the SPSTORE1-encrypted path with an injected key. Fail-OPEN:
+/// types without a toggle, an absent key, or a missing `sync_config` default to
+/// enabled so existing data-sync users are never silently regressed.
+fn sync_data_type_enabled_in(store: &serde_json::Value, blob_type: BlobType) -> bool {
     // Map upload blob types to the UI's sync_config toggles. The accessibility
     // tree is screen text, so it follows the OCR toggle.
     let key = match blob_type {
         BlobType::Ocr | BlobType::Accessibility => "syncOcr",
         BlobType::Transcripts => "syncTranscripts",
         _ => return true,
-    };
-    let store = match crate::cli::store_file::read_store_for(dir) {
-        Ok(v) => v,
-        Err(_) => return true,
     };
     store
         .get("sync_config")
@@ -957,6 +966,56 @@ mod tests {
         ));
         // Types without a toggle are always enabled.
         assert!(sync_data_type_enabled(Some(dir.path()), BlobType::Input));
+    }
+
+    /// Fail-open coverage for the predicate: a `sync_config` that exists but is
+    /// missing the relevant key, or a missing `sync_config` entirely, must
+    /// default to enabled so existing data-sync users are never regressed.
+    #[test]
+    fn test_sync_data_type_predicate_fail_open() {
+        // Empty store object → enabled.
+        assert!(sync_data_type_enabled_in(
+            &serde_json::json!({}),
+            BlobType::Ocr
+        ));
+        // sync_config present but the toggle key is absent → enabled.
+        let partial = serde_json::json!({ "sync_config": { "syncTranscripts": false } });
+        assert!(sync_data_type_enabled_in(&partial, BlobType::Ocr));
+        assert!(!sync_data_type_enabled_in(&partial, BlobType::Transcripts));
+        // Non-bool toggle value → fall back to enabled, not panic.
+        let weird = serde_json::json!({ "sync_config": { "syncOcr": "nope" } });
+        assert!(sync_data_type_enabled_in(&weird, BlobType::Ocr));
+    }
+
+    /// End-to-end of the real on-disk shape when store encryption is ON: the
+    /// SPSTORE1-encrypted `store.bin` must decrypt and the per-type toggles must
+    /// be honored. Guards the B1 regression class (a plaintext-only reader
+    /// silently returns the fail-open default for encrypted stores). Uses an
+    /// injected key so the system keychain is never touched (CI-safe).
+    #[test]
+    fn test_sync_data_type_gating_encrypted_store() {
+        use crate::cli::store_file::{read_store_for_with_key, write_store_for_with_key};
+        let key = [7u8; 32];
+        let dir = tempfile::tempdir().unwrap();
+
+        let store = serde_json::json!({
+            "sync_config": { "syncOcr": false, "syncTranscripts": true }
+        });
+        // Write the encrypted (SPSTORE1) form, then read it back via the
+        // keychain-decrypting path with the same injected key.
+        write_store_for_with_key(dir.path(), &store, true, || Ok(key)).unwrap();
+
+        // Sanity: the on-disk bytes are actually encrypted, not plaintext JSON.
+        let raw = std::fs::read(dir.path().join("store.bin")).unwrap();
+        assert_eq!(&raw[..8], b"SPSTORE1");
+
+        let decoded = read_store_for_with_key(dir.path(), || Ok(key)).unwrap();
+        assert!(!sync_data_type_enabled_in(&decoded, BlobType::Ocr));
+        assert!(!sync_data_type_enabled_in(
+            &decoded,
+            BlobType::Accessibility
+        ));
+        assert!(sync_data_type_enabled_in(&decoded, BlobType::Transcripts));
     }
 
     #[test]

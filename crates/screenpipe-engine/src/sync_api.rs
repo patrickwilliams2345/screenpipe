@@ -1328,6 +1328,15 @@ fn is_settings_bool_enabled(screenpipe_dir: &std::path::Path, key: &str) -> bool
         Ok(v) => v,
         Err(_) => return false,
     };
+    settings_bool(&store, key)
+}
+
+/// Pure predicate: read `settings.<key>` as a bool from a decoded store, false
+/// if the key is missing or not a bool. Split out from the (possibly
+/// encrypted) store read so tests can exercise it against a store decoded with
+/// an injected key — see `is_settings_bool_enabled` for why the read path
+/// matters (B1: encrypted stores silently disabled background sync).
+fn settings_bool(store: &serde_json::Value, key: &str) -> bool {
     store
         .get("settings")
         .and_then(|s| s.get(key))
@@ -1844,6 +1853,64 @@ mod tests {
         assert!(!is_settings_bool_enabled(dir.path(), "pipeSyncEnabled"));
         // Absent key → false.
         assert!(!is_settings_bool_enabled(dir.path(), "memoriesSyncEnabled"));
+    }
+
+    /// Pure-predicate edge cases for `settings.<key>`: missing `settings`,
+    /// missing key, and a non-bool value all read as `false`.
+    #[test]
+    fn test_settings_bool_predicate_edges() {
+        // No `settings` object at all.
+        assert!(!settings_bool(
+            &serde_json::json!({}),
+            "connectionsSyncEnabled"
+        ));
+        // `settings` present, key absent.
+        assert!(!settings_bool(
+            &serde_json::json!({ "settings": { "other": true } }),
+            "connectionsSyncEnabled"
+        ));
+        // Non-bool value (e.g. a string "true") is not treated as enabled.
+        assert!(!settings_bool(
+            &serde_json::json!({ "settings": { "connectionsSyncEnabled": "true" } }),
+            "connectionsSyncEnabled"
+        ));
+        assert!(settings_bool(
+            &serde_json::json!({ "settings": { "connectionsSyncEnabled": true } }),
+            "connectionsSyncEnabled"
+        ));
+    }
+
+    /// End-to-end of the B1 fix: when store encryption is ON, `store.bin` is
+    /// SPSTORE1-encrypted and the OLD plaintext `read_to_string + serde` reader
+    /// silently failed — returning `false` for EVERY sync toggle and disabling
+    /// background connection/pipe/memory sync. This writes the encrypted form
+    /// and asserts every toggle is read correctly through the decrypting path.
+    /// Injected key → no system keychain needed (CI-safe).
+    #[test]
+    fn test_settings_toggles_read_through_encrypted_store() {
+        use crate::cli::store_file::{read_store_for_with_key, write_store_for_with_key};
+        let key = [9u8; 32];
+        let dir = tempfile::tempdir().unwrap();
+
+        let store = serde_json::json!({
+            "settings": {
+                "connectionsSyncEnabled": true,
+                "pipeSyncEnabled": true,
+                "memoriesSyncEnabled": false,
+            }
+        });
+        write_store_for_with_key(dir.path(), &store, true, || Ok(key)).unwrap();
+
+        // The encrypted layout must NOT be readable as plaintext JSON — this is
+        // exactly the condition the old reader choked on.
+        let raw = std::fs::read(dir.path().join("store.bin")).unwrap();
+        assert_eq!(&raw[..8], b"SPSTORE1");
+        assert!(serde_json::from_slice::<serde_json::Value>(&raw).is_err());
+
+        let decoded = read_store_for_with_key(dir.path(), || Ok(key)).unwrap();
+        assert!(settings_bool(&decoded, "connectionsSyncEnabled"));
+        assert!(settings_bool(&decoded, "pipeSyncEnabled"));
+        assert!(!settings_bool(&decoded, "memoriesSyncEnabled"));
     }
 
     #[test]

@@ -250,6 +250,11 @@ export interface UsageStatus {
 	resets_at: string;
 	model_access: string[];
 	credits_balance?: number;
+	/** Gateway-controlled signal for the app's at-the-cap upsell banner. True only
+	 *  for non-Business tiers while model gating is enabled — so the master
+	 *  kill-switch (MODEL_GATING_ENABLED) turns the banner off server-side too,
+	 *  no app release needed. */
+	upsell_banner?: boolean;
 	upgrade_options?: {
 		login?: { benefit: string };
 		subscribe?: { benefit: string };

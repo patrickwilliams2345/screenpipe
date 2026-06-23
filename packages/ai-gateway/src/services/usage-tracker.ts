@@ -205,26 +205,31 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
       'meta-llama/llama-4-scout',
     ],
   },
+  // logged_in = signed in but NOT on Business. NB: the gateway has no separate
+  // "Basic" tier — Free and Basic both resolve here (recording is gated by
+  // app_entitled elsewhere). This is the Free/Basic -> Business upgrade gate:
+  // the marquee models (Sonnet, Opus, GPT-5.x, Fable, *-pro, 397b) are
+  // Business-only, while everyone keeps `auto` + the free/fast models. Free
+  // models carry query_weight 0 so they never count against dailyQueries —
+  // the free experience stays effectively unlimited; dailyQueries caps only
+  // PAID-model messages and is tunable live via LIMIT_LOGGED_IN_DAILY (CF env,
+  // no redeploy).
   logged_in: {
-    dailyQueries: 50,
+    dailyQueries: 30,
     rpm: 25,
     allowedModels: [
       'auto',
       'claude-haiku-4-5',
-      'claude-sonnet-4-5',
       'gemini-2.5-flash',
       'gemini-3-flash',
       'gemini-3.1-flash-lite',
       'gemini-3.5-flash',
-      'gemini-3-pro',
-      'gemini-3.1-pro',
       'glm-4.7',
       'glm-5',
       'kimi-k2.5',
       'deepseek/deepseek-chat',
       'deepseek/deepseek-v3.2-speciale',
       'qwen/qwen3.5-flash',
-      'qwen/qwen3.5-397b',
       'meta-llama/llama-4-scout',
       'meta-llama/llama-4-maverick',
       'gemma4-31b',
@@ -469,6 +474,9 @@ export async function getUsageStatus(
     remaining,
     resets_at: getNextResetTime(),
     model_access: limits.allowedModels,
+    // Server-controlled visibility for the app's at-the-cap banner. Only
+    // non-Business tiers, and suppressed entirely by the master kill-switch.
+    upsell_banner: tier !== 'subscribed' && isModelGatingEnabled(env),
   };
 
   // Fetch credit balance if user is logged in
@@ -492,9 +500,27 @@ export async function getUsageStatus(
 }
 
 /**
+ * Master kill-switch for the Free/Basic -> Business model gate. Default ON.
+ * Set MODEL_GATING_ENABLED=false (Cloudflare env var — takes effect with no app
+ * release) to instantly neutralize the whole gate: no model 403s, no `locked`
+ * flags in /v1/models, no upsell banner. Use it to react fast if the gate ever
+ * starts firing on paying users. Mirrors the FLEX_TIER_ENABLED pattern.
+ */
+export function isModelGatingEnabled(env?: Env): boolean {
+  const raw = (env as { MODEL_GATING_ENABLED?: string } | undefined)?.MODEL_GATING_ENABLED;
+  return String(raw ?? 'true').toLowerCase() !== 'false';
+}
+
+/**
  * Check if a model is allowed for a given tier
  */
 export function isModelAllowed(model: string, tier: UserTier, env?: Env): boolean {
+  // Master kill-switch: when model gating is disabled, every model is allowed
+  // for every tier (emergency rollback without an app release).
+  if (!isModelGatingEnabled(env)) {
+    return true;
+  }
+
   // Internal zero-cost models (e.g., the workflow event classifier on our
   // own vLLM) are always allowed regardless of tier — we eat the cost and
   // they're gated at the feature level (opt-in setting), not the tier.
