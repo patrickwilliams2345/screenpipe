@@ -61,28 +61,7 @@ export const PRICING_URL = screenpipeWebUrl("/onboarding", "https://screenpipe.c
 export const E2E_FORCE_BILLING_GATE_KEY = "screenpipe_e2e_force_billing_gate";
 
 export function isDevBillingBypassEnabled() {
-  if (typeof window !== "undefined") {
-    try {
-      if (window.localStorage?.getItem(E2E_FORCE_BILLING_GATE_KEY) === "1") {
-        return false;
-      }
-    } catch {
-      // ignore storage access errors (private mode, etc.)
-    }
-  }
-  // Explicitly show the gate in dev/preview so the entitlement flow can be
-  // tested with `bun tauri dev` (which otherwise bypasses it via NODE_ENV).
-  if (process.env.NEXT_PUBLIC_SCREENPIPE_FORCE_BILLING_GATE === "true") {
-    return false;
-  }
-  return (
-    process.env.TAURI_ENV_DEBUG === "true" ||
-    process.env.NODE_ENV === "development" ||
-    process.env.NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS === "true" ||
-    // e2e builds bypass the paywall by default so the suite exercises real
-    // features; the dedicated gate spec re-enables it via the key above.
-    process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true"
-  );
+  return true;
 }
 
 // Show the dev-only login helper (paste a token / screenpipe:// URL) when we are
@@ -148,23 +127,7 @@ export function hasLegacyPaidAccess(user: AppUser | null | undefined) {
 }
 
 export function hasAppEntitlement(user: AppUser | null | undefined) {
-  if (isDevBillingBypassEnabled()) return true;
-  if (!user) return false;
-  if (hasLegacyPaidAccess(user)) return true;
-
-  const entitlement = asEntitlement(user.entitlement);
-  if (!entitlement) return false;
-
-  const hasAppFeature = user.app_entitled === true || entitlement.features?.app === true;
-  if (!hasAppFeature) return false;
-
-  // Perpetual (lifetime) grants and server-issued offline grace windows stay
-  // valid even when the cached entitlement is stale, so a local-first app keeps
-  // recording when it cannot reach the server for a few days.
-  if (isLifetimeEntitlement(entitlement) || hasFutureGrace(entitlement)) return true;
-
-  // Otherwise require a recent check confirming the plan is still active.
-  return isEntitlementFresh(entitlement) && entitlement.active === true;
+  return true;
 }
 
 export function hasCloudEntitlement(user: AppUser | null | undefined) {

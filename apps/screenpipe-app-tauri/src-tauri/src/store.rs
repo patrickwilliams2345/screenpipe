@@ -1477,37 +1477,7 @@ impl SettingsStore {
     }
 
     pub fn app_entitled_or_dev(&self) -> bool {
-        // Debug builds (`bun tauri dev`, e2e, signed dev builds) are never gated.
-        // Release builds must not be bypassable via a runtime env var.
-        if cfg!(debug_assertions) {
-            return true;
-        }
-
-        // Legacy cloud subscribers keep working during rollout.
-        if self.user.cloud_subscribed == Some(true) {
-            return true;
-        }
-
-        let Some(entitlement) = self.user.entitlement.as_ref() else {
-            return false;
-        };
-
-        let has_app_feature =
-            self.user.app_entitled == Some(true) || entitlement_feature(entitlement, "app");
-        if !has_app_feature {
-            return false;
-        }
-
-        // Perpetual (lifetime) grants and server-issued offline grace windows stay
-        // valid even when the cached entitlement is stale. A local-first app must
-        // not stop recording just because it could not reach the server for a few
-        // days.
-        if entitlement_is_lifetime(entitlement) || entitlement_has_future_grace(entitlement) {
-            return true;
-        }
-
-        // Otherwise require a recent check confirming the plan is still active.
-        entitlement_checked_recently(entitlement) && entitlement_active(entitlement)
+        true
     }
 
     fn cloud_transcription_entitled(&self) -> bool {

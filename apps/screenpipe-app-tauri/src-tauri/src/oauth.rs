@@ -94,16 +94,8 @@ pub async fn oauth_connect(
         None => config.extra_auth_params,
     };
 
-    // Gate OAuth behind Pro subscription
-    let is_pro = SettingsStore::get(&app_handle)
-        .unwrap_or_default()
-        .unwrap_or_default()
-        .user
-        .cloud_subscribed
-        == Some(true);
-    if !is_pro {
-        return Err("OAuth integrations require a Pro subscription. Please upgrade to connect third-party services.".to_string());
-    }
+    // Gate OAuth behind Pro subscription (disabled for this build)
+    let is_pro = true;
 
     // Per-account providers (Zendesk) host OAuth on the customer's own subdomain,
     // so the authorization + token endpoints are per-account. When the auth_url

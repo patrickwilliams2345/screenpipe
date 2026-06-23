@@ -243,12 +243,12 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
   }, []);
 
   useEffect(() => {
-    if (settings.user?.token && (canSkipLogin || hasAppEntitlement(settings.user)) && !hasAdvanced.current) {
+    if ((canSkipLogin || (settings.user?.token && hasAppEntitlement(settings.user))) && !hasAdvanced.current) {
       hasAdvanced.current = true;
       posthog.capture("onboarding_login_completed");
       setTimeout(() => handleNextSlide(), 500);
     }
-  }, [canSkipLogin, settings.user, settings.user?.token, handleNextSlide]);
+  }, [canSkipLogin, settings.user, handleNextSlide]);
 
   const handleLogin = useCallback(() => {
     posthog.capture("onboarding_login_clicked");
