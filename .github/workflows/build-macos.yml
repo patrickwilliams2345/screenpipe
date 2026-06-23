@@ -90,6 +90,11 @@ jobs:
           # reports like Thread 0/worker crashes with only raw offsets.
           CARGO_PROFILE_RELEASE_STRIP: none
           CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          # Full LTO plus DWARF line tables can sit silently in rustc for hours
+          # on GitHub's macOS ARM runners. Thin LTO keeps symbols while avoiding
+          # the long full-LTO link/codegen phase for CI artifacts.
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
         run: |
           bun tauri build --target aarch64-apple-darwin --features "metal,redact-onnx-coreml,official-build"
 
