@@ -3937,9 +3937,16 @@ export function ConnectionsSection({
     // embedded sidebar, no user-facing controls. obsidian-memories is hidden
     // too: it's a memory-sync destination surfaced as a subsection inside the
     // Obsidian card, not a standalone connection tile.
+    // openclaw + hermes are hidden as standalone tiles too: both are surfaced
+    // inside the unified "Remote agent" card (RemoteAgentCard), which owns their
+    // MCP/skill/sync setup AND the outbound "Connect" credential flow. Showing
+    // separate Productivity tiles next to "Remote agent" duplicated them and
+    // confused users. The backend integrations stay registered so pipes calling
+    // /connections/{openclaw,hermes} keep working.
+    const REMOTE_AGENT_TILE_IDS = new Set(["openclaw", "hermes"]);
     const hardcodedIds = new Set(hardcoded.map(h => h.id));
     const apiTiles: ConnectionTile[] = integrations
-      .filter(i => !hardcodedIds.has(i.id) && i.id !== "owned-default" && i.id !== "obsidian-memories")
+      .filter(i => !hardcodedIds.has(i.id) && i.id !== "owned-default" && i.id !== "obsidian-memories" && !REMOTE_AGENT_TILE_IDS.has(i.id))
       .map(i => ({
         id: i.id,
         name: i.name,
