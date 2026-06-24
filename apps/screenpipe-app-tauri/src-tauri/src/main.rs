@@ -799,6 +799,7 @@ async fn main() {
         is_starting: Arc::new(AtomicBool::new(false)),
         is_starting_capture: Arc::new(AtomicBool::new(false)),
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
+        wants_recording: Arc::new(AtomicBool::new(false)),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
         cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
         db_wedge_breaker: recording::new_db_wedge_breaker(),

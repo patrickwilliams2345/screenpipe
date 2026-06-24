@@ -4,6 +4,7 @@
 
 pub mod audio_devices;
 pub mod audio_health;
+pub mod connections;
 pub mod db_recovery;
 pub mod meetings;
 pub mod permissions;

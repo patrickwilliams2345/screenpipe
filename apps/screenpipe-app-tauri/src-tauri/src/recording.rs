@@ -301,6 +301,15 @@ pub struct RecordingState {
     pub is_starting_capture: Arc<AtomicBool>,
     /// Epoch seconds of last successful spawn — enforces cooldown between restarts
     pub last_spawn_epoch: Arc<AtomicU64>,
+    /// Capture intent: true while capture is supposed to be running. Tracked at
+    /// every on/off point — `spawn_screenpipe`/`start_capture` set it,
+    /// `stop_screenpipe`/`stop_capture` clear it — because capture has two
+    /// on-paths (full spawn vs the tray toggle) and two off-paths. Lets the
+    /// health watchdog tell a crash (intent still ON → respawn) from a
+    /// deliberate stop (intent OFF → leave it down), including the tray "stop
+    /// recording" that keeps the server up. `last_spawn_epoch` can't carry this
+    /// — it's reset to 0 on a failed spawn too, and never sees the tray toggle.
+    pub wants_recording: Arc<AtomicBool>,
     /// Recently active meeting to revive when capture is immediately restarted.
     pub(crate) interrupted_meeting: Arc<Mutex<Option<InterruptedMeeting>>>,
     /// App-scoped cloud-auth token (Clerk JWT). Outlives the Server (which
@@ -315,6 +324,22 @@ pub struct RecordingState {
     /// Restart-storm guard for DB-wedge auto-recovery. Shared across server
     /// restarts so a DB that stays broken after N restarts stops retrying.
     pub db_wedge_breaker: DbWedgeBreaker,
+}
+
+impl RecordingState {
+    /// Single source of truth for `wants_recording`. Call from every capture
+    /// on/off path so the health watchdog can tell a crash from a deliberate
+    /// stop: `start_capture` / `spawn_screenpipe` set it on; `stop_capture` /
+    /// `stop_screenpipe` clear it. (Capture has two on-paths and two off-paths;
+    /// missing any one is how a tray-stopped capture got resurrected.)
+    pub fn set_capture_intent(&self, on: bool) {
+        self.wants_recording.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether capture is currently intended to be running.
+    pub fn capture_intended(&self) -> bool {
+        self.wants_recording.load(Ordering::SeqCst)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +457,11 @@ pub async fn stop_capture(
 ) -> Result<(), String> {
     info!("Stopping capture session (server stays alive)");
 
+    // The tray/shortcut "stop recording" lands here (server stays up, capture
+    // off). Clear the intent so a later engine crash doesn't get auto-respawned
+    // — which would resurrect capture the user deliberately stopped.
+    state.set_capture_intent(false);
+
     remember_active_meeting_for_capture_restart(&state).await;
 
     let mut capture_guard = state.capture.lock().await;
@@ -546,6 +576,11 @@ pub async fn start_capture(
     let store = SettingsStore::get(&app).ok().flatten().unwrap_or_default();
     require_app_entitlement(&store)?;
 
+    // Capture is now intended to run (tray/shortcut start, mic-grant reinit, …)
+    // — record it so the health watchdog will respawn a crashed engine instead
+    // of treating the absence of capture as a deliberate stop.
+    state.set_capture_intent(true);
+
     // Race guard: short-circuit duplicate invocations.
     //
     // `<DeeplinkHandler />` is mounted in every non-overlay webview, and the
@@ -640,6 +675,10 @@ pub async fn stop_screenpipe(
 ) -> Result<(), String> {
     info!("stop_screenpipe: stopping capture and server");
 
+    // Deliberate stop → clear the intent so the health watchdog leaves the
+    // server down instead of auto-respawning it.
+    state.set_capture_intent(false);
+
     // Stop capture first
     {
         *state.interrupted_meeting.lock().await = None;
@@ -681,6 +720,11 @@ pub async fn spawn_screenpipe(
     _override_args: Option<Vec<String>>,
 ) -> Result<(), String> {
     info!("spawn_screenpipe: starting server + capture");
+
+    // Mark recording as intended-ON up front (even if the start below fails or
+    // is deferred by cooldown) so the health watchdog will keep trying to bring
+    // a crashed/failed server back instead of treating it as a user stop.
+    state.set_capture_intent(true);
 
     // --- Cooldown enforcement ---
     let now_epoch = std::time::SystemTime::now()
