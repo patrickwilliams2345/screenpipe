@@ -38,8 +38,6 @@ import {
   KeyRound,
   Loader2,
   RotateCw,
-  PanelRightClose,
-  PanelRightOpen,
 } from "lucide-react";
 import {
   loadConversationFile,
@@ -69,6 +67,7 @@ const STATE_EVENT = "owned-browser:state";
 const DEFAULT_WIDTH = 480;
 const MIN_WIDTH = 320;
 const MIN_CHAT_WIDTH = 360;
+const INSPECTOR_WIDTH = 280;
 const CHROME_WEBSTORE_URL =
   "https://chromewebstore.google.com/search/screenpipe%20browser%20bridge";
 
@@ -84,8 +83,14 @@ interface BrowserSidebarProps {
     visible: boolean;
     previousMode: "browser" | "hidden";
   } | null;
-  onCloseFilePreview?: () => void;
   onReplaceFilePreviewPath?: (path: string) => void;
+  /** When set, rendered in place of the browser/file-preview content inside
+   *  the same panel container (same width, drag handle, background). */
+  inspectorContent?: React.ReactNode | null;
+  /** Called when an agent navigation event would reveal the browser panel,
+   *  so the parent can close the inspector first. */
+  onBecomeVisible?: () => void;
+  onPanelStateChange?: (state: { hasUrl: boolean; open: boolean }) => void;
 }
 
 interface SessionAccessEvent {
@@ -156,8 +161,10 @@ export function BrowserSidebar({
   conversationId,
   agentSessionId,
   filePreview,
-  onCloseFilePreview,
   onReplaceFilePreviewPath,
+  inspectorContent,
+  onBecomeVisible,
+  onPanelStateChange,
 }: BrowserSidebarProps) {
   const { settings, updateSettings } = useSettings();
   const [visible, setVisible] = useState(false);
@@ -198,10 +205,14 @@ export function BrowserSidebar({
   );
   const previewActive = filePreview?.visible === true && !!filePreview.path;
   const previewPath = previewActive ? filePreview.path : null;
+  const inspectorActive = !!inspectorContent;
 
   const effectiveWidth = clampWidth(requestedWidth, availableW);
   const browserPanelOpen = visible && !collapsed && effectiveWidth > 0;
-  const panelOpen = previewActive || browserPanelOpen;
+  const inspectorShouldFloat =
+    inspectorActive && availableW < MIN_CHAT_WIDTH + INSPECTOR_WIDTH;
+  const panelOpen = inspectorActive || previewActive || browserPanelOpen;
+  const inlinePanelOpen = panelOpen && !inspectorShouldFloat;
 
   useEffect(() => {
     try {
@@ -444,6 +455,7 @@ export function BrowserSidebar({
           setVisible(true);
           setCollapsed(false);
           persistState({ url, collapsed: false });
+          onBecomeVisible?.();
         } else {
           persistState({ url });
         }
@@ -740,6 +752,10 @@ export function BrowserSidebar({
       commands.ownedBrowserHide().catch(() => {});
       return;
     }
+    if (inspectorActive) {
+      commands.ownedBrowserHide().catch(() => {});
+      return;
+    }
     const el = placeholderRef.current;
     if (!el) return;
     schedulePushBounds();
@@ -756,7 +772,14 @@ export function BrowserSidebar({
     return () => {
       ro.disconnect();
     };
-  }, [panelOpen, effectiveWidth, availableW, schedulePushBounds, previewActive]);
+  }, [
+    panelOpen,
+    effectiveWidth,
+    availableW,
+    schedulePushBounds,
+    previewActive,
+    inspectorActive,
+  ]);
 
   // ---------------------------------------------------------------------------
   // Drag-resize
@@ -936,6 +959,49 @@ export function BrowserSidebar({
     persistState({ collapsed: false });
   }, [persistState]);
 
+  const toggleFromHeader = useCallback((action: "toggle" | "show" = "toggle") => {
+    if (!currentUrl) return;
+    if (action === "show") {
+      setVisible(true);
+      expand();
+      return;
+    }
+    if (visible && !collapsed) {
+      collapse();
+    } else {
+      setVisible(true);
+      expand();
+    }
+  }, [collapsed, collapse, currentUrl, expand, visible]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const action =
+        event instanceof CustomEvent && event.detail?.action === "show"
+          ? "show"
+          : "toggle";
+      toggleFromHeader(action);
+    };
+    window.addEventListener("screenpipe:browser-sidebar-toggle", handler);
+    return () => {
+      window.removeEventListener("screenpipe:browser-sidebar-toggle", handler);
+    };
+  }, [toggleFromHeader]);
+
+  useEffect(() => {
+    onPanelStateChange?.({
+      hasUrl: !!currentUrl,
+      open: !!currentUrl && visible && !collapsed && !previewActive && !inspectorActive,
+    });
+  }, [
+    collapsed,
+    currentUrl,
+    inspectorActive,
+    onPanelStateChange,
+    previewActive,
+    visible,
+  ]);
+
   const answerSessionAccess = useCallback(
     async (allow: boolean) => {
       const request = sessionAccessRequest;
@@ -975,21 +1041,28 @@ export function BrowserSidebar({
 
   return (
     <>
-      {panelOpen && (
+      {inlinePanelOpen && (
         <div
           ref={panelRef}
-          // Inline flex item — sits *beside* the chat, doesn't overlay
-          // it. shrink-0 keeps us at effectiveWidth; the chat content
-          // (flex-1 min-w-0) gives way. The JS clamp on effectiveWidth
-          // guarantees viewport - chat ≥ 360px so the chat is never
-          // crushed below readable width.
-          style={{ width: effectiveWidth, flexBasis: effectiveWidth }}
-          className="border-l border-border/50 bg-muted/30 flex flex-col overflow-hidden shrink-0 relative"
+          // Inline flex item beside the chat — pushes the chat column
+          // narrower. Browser/file-preview get the full sidebar chrome
+          // (border, tinted bg, resize handle). Inspector gets the same
+          // background as the chat surface with no border or chrome so
+          // the layout reads as one page with a quiet right-side region.
+          style={inspectorActive
+            ? { width: INSPECTOR_WIDTH, flexBasis: INSPECTOR_WIDTH }
+            : { width: effectiveWidth, flexBasis: effectiveWidth }
+          }
+          className={inspectorActive
+            ? "bg-background flex flex-col overflow-hidden shrink-0"
+            : "border-l border-border/50 bg-muted/30 flex flex-col overflow-hidden shrink-0 relative"
+          }
         >
-          {/* Drag handle — 10px hot zone on the left edge with a thicker
-                visible grip in the vertical center. The 1px border
-                reads as the panel's edge; the 32px tall grip bar is the
-                discoverable affordance. */}
+          {/* Drag handle — hidden when inspector is active (no resize needed).
+                10px hot zone on the left edge with a thicker visible grip in
+                the vertical center. The 1px border reads as the panel's edge;
+                the 32px tall grip bar is the discoverable affordance. */}
+          {!inspectorActive && (
           <div
             onMouseDown={onDragStart}
             className="absolute top-0 left-0 h-full w-2.5 cursor-ew-resize z-10 group/resize -translate-x-1/2"
@@ -998,12 +1071,14 @@ export function BrowserSidebar({
             <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-px bg-border/60 group-hover/resize:bg-foreground/40 transition-colors" />
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-10 w-1 rounded-full bg-border group-hover/resize:bg-foreground/60 group-hover/resize:w-1.5 transition-all" />
           </div>
+          )}
 
-          {previewActive ? (
+          {inspectorActive ? (
+            inspectorContent
+          ) : previewActive ? (
             previewPath ? (
               <FilePreviewSidebar
                 path={previewPath}
-                onClose={onCloseFilePreview}
                 onReplacePath={onReplaceFilePreviewPath}
               />
             ) : null
@@ -1036,13 +1111,6 @@ export function BrowserSidebar({
                   className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
                 >
                   <RotateCw className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  onClick={collapse}
-                  title="Hide panel"
-                  className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-                >
-                  <PanelRightClose className="h-3.5 w-3.5" />
                 </button>
                 {loading && (
                   <div
@@ -1205,18 +1273,15 @@ export function BrowserSidebar({
         </div>
       )}
 
-      {/* Floating re-open affordance: shown when a URL is saved but the
-          panel is collapsed. Pinned to the viewport's top-right corner so
-          it's discoverable regardless of the chat layout state. */}
-      {!previewActive && visible && collapsed && currentUrl && (
-        <button
-          onClick={expand}
-          title={`Show browser (${currentUrl})`}
-          className="fixed right-3 top-14 z-20 p-1.5 rounded border border-border/50 bg-background/80 backdrop-blur text-muted-foreground hover:text-foreground hover:bg-muted/60 shadow-sm"
+      {inspectorShouldFloat && inspectorContent ? (
+        <div
+          className="fixed right-3 top-9 z-40 max-h-[calc(100vh-3.25rem)] overflow-y-auto"
+          style={{ width: INSPECTOR_WIDTH }}
         >
-          <PanelRightOpen className="h-4 w-4" />
-        </button>
-      )}
+          {inspectorContent}
+        </div>
+      ) : null}
+
     </>
   );
 }

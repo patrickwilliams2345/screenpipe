@@ -46,7 +46,7 @@ export function usePipeWatchSession({
             "@/lib/pipe-ndjson-to-chat"
           );
           let messagesFromStdout = execution.stdout
-            ? parsePipeNdjsonToMessages(execution.stdout)
+            ? parsePipeNdjsonToMessages(execution.stdout, pipeName)
             : [];
           if (messagesFromStdout.length === 0) {
             const fallback =
@@ -89,7 +89,7 @@ export function usePipeWatchSession({
       if (!storeNow.sessions[pipeSid]) {
         storeNow.actions.upsert({
           id: pipeSid,
-          title: pipeName,
+          title: `${pipeName} #${executionId}`,
           preview: "",
           status: "streaming",
           messageCount: 0,
@@ -106,7 +106,7 @@ export function usePipeWatchSession({
 
       const pipeConversation: ChatConversation = {
         id: pipeSid,
-        title: pipeName,
+        title: `${pipeName} #${executionId}`,
         messages: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),

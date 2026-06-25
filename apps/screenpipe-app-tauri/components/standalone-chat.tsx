@@ -7,6 +7,8 @@ import * as React from "react";
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
+import { Settings2, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { BrowserSidebar } from "@/components/browser-sidebar";
 import { toast } from "@/components/ui/use-toast";
@@ -19,6 +21,8 @@ import { usePlatform } from "@/lib/hooks/use-platform";
 import { useHardcodedTiles } from "@/lib/hooks/use-hardcoded-tiles";
 import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
 import { useChatFilePreview } from "@/lib/hooks/use-chat-file-preview";
+import { useChatInspector } from "@/lib/hooks/use-chat-inspector";
+import { ChatInspector } from "@/components/chat/chat-inspector";
 import { useSqlAutocomplete, useTagAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import {
   buildAppMentionSuggestions,
@@ -467,6 +471,109 @@ export function StandaloneChat({
   } = useNextTurnAttachments(conversationId);
   const { filePreview, openFilePreview, closeFilePreview } =
     useChatFilePreview(conversationId);
+  const { inspectorOpen, setInspectorOpen, outputs: inspectorOutputs, sources: inspectorSources } =
+    useChatInspector(messages);
+  const [activeSideView, setActiveSideView] = useState<"inspector" | "side" | null>(null);
+  const [browserHiddenBehindInspector, setBrowserHiddenBehindInspector] = useState(false);
+  const [browserPanelState, setBrowserPanelState] = useState({
+    hasUrl: false,
+    open: false,
+  });
+  const filePreviewOpen = filePreview?.visible === true && !!filePreview.path;
+  const sidePanelHasContent = filePreviewOpen || browserPanelState.hasUrl;
+  const sidePanelOpen = activeSideView === "side" && sidePanelHasContent;
+  const inspectorHasContent =
+    inspectorOpen ||
+    inspectorOutputs.length > 0 ||
+    inspectorSources.length > 0;
+
+  useEffect(() => {
+    setActiveSideView(null);
+    setBrowserHiddenBehindInspector(false);
+  }, [conversationId]);
+
+  // Auto-show side panel when a file preview is opened externally
+  // (e.g. clicking an artifact in the brain section emits
+  // "chat-load-conversation" with filePreviewPath).
+  useEffect(() => {
+    if (filePreviewOpen) {
+      setActiveSideView("side");
+    }
+  }, [filePreviewOpen]);
+
+  const toggleInspector = useCallback(() => {
+    if (inspectorOpen && activeSideView === "inspector") {
+      setInspectorOpen(false);
+      if (browserHiddenBehindInspector && browserPanelState.hasUrl) {
+        setActiveSideView("side");
+      } else {
+        setActiveSideView(null);
+      }
+      setBrowserHiddenBehindInspector(false);
+    } else {
+      setBrowserHiddenBehindInspector(
+        activeSideView === "side" && browserPanelState.open && !filePreviewOpen,
+      );
+      closeFilePreview();
+      setInspectorOpen(true);
+      setActiveSideView("inspector");
+    }
+  }, [
+    activeSideView,
+    browserHiddenBehindInspector,
+    browserPanelState.hasUrl,
+    browserPanelState.open,
+    closeFilePreview,
+    filePreviewOpen,
+    inspectorOpen,
+    setInspectorOpen,
+  ]);
+
+  const toggleBrowserPanel = useCallback(() => {
+    if (activeSideView === "side" && filePreviewOpen) {
+      closeFilePreview();
+      setActiveSideView(inspectorOpen ? "inspector" : null);
+      return;
+    }
+    if (activeSideView === "side" && browserPanelState.hasUrl) {
+      window.dispatchEvent(
+        new CustomEvent("screenpipe:browser-sidebar-toggle", {
+          detail: { action: "toggle" },
+        }),
+      );
+      setActiveSideView(inspectorOpen ? "inspector" : null);
+      return;
+    }
+    setBrowserHiddenBehindInspector(false);
+    setActiveSideView("side");
+    window.dispatchEvent(
+      new CustomEvent("screenpipe:browser-sidebar-toggle", {
+        detail: { action: "show" },
+      }),
+    );
+  }, [
+    activeSideView,
+    browserPanelState.hasUrl,
+    closeFilePreview,
+    filePreviewOpen,
+    inspectorOpen,
+  ]);
+
+  const handlePanelStateChange = useCallback(
+    (nextState: { hasUrl: boolean; open: boolean }) => {
+      setBrowserPanelState((currentState) =>
+        currentState.hasUrl === nextState.hasUrl &&
+        currentState.open === nextState.open
+          ? currentState
+          : nextState,
+      );
+      if (nextState.open) {
+        setActiveSideView("side");
+      }
+    },
+    [],
+  );
+
   const currentQueueSessionId = conversationId ?? piSessionIdRef.current;
   const {
     queuedActionPromptId,
@@ -942,6 +1049,50 @@ export function StandaloneChat({
           piStoppedIntentionallyRef.current = true;
           await startNewConversation();
         }}
+        rightActions={
+          <div className="relative z-10 flex items-center gap-1">
+            {inspectorHasContent ? (
+              <Button
+                variant="ghost"
+                size="icon"
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleInspector();
+                }}
+                className={cn("h-7 w-7", activeSideView === "inspector" && "bg-muted")}
+                title="Inspector"
+              >
+                <Settings2 size={14} />
+              </Button>
+            ) : null}
+            {sidePanelHasContent ? (
+              <Button
+                variant="ghost"
+                size="icon"
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleBrowserPanel();
+                }}
+                className={cn("h-7 w-7", sidePanelOpen && "bg-muted")}
+                title={
+                  filePreviewOpen
+                    ? "Hide preview"
+                    : browserPanelState.open
+                      ? "Hide browser"
+                      : "Show browser"
+                }
+              >
+                {sidePanelOpen ? (
+                  <PanelRightClose size={14} />
+                ) : (
+                  <PanelRightOpen size={14} />
+                )}
+              </Button>
+            ) : null}
+          </div>
+        }
       />
 
       <div className="flex-1 flex min-h-0" data-browser-panel-host>
@@ -1134,8 +1285,23 @@ export function StandaloneChat({
         // this chat's own agent navigations even if `conversationId` state lags.
         agentSessionId={piSessionIdRef.current}
         filePreview={filePreview}
-        onCloseFilePreview={closeFilePreview}
         onReplaceFilePreviewPath={openFilePreview}
+        inspectorContent={inspectorOpen && activeSideView === "inspector" ? (
+          <ChatInspector
+            outputs={inspectorOutputs}
+            sources={inspectorSources}
+            onOpenFile={(path) => {
+              setBrowserHiddenBehindInspector(false);
+              setActiveSideView("side");
+              openFilePreview(path);
+            }}
+          />
+        ) : null}
+        onBecomeVisible={() => {
+          setBrowserHiddenBehindInspector(false);
+          setActiveSideView("side");
+        }}
+        onPanelStateChange={handlePanelStateChange}
       />
       </div> {/* End of horizontal chat+browser split */}
 

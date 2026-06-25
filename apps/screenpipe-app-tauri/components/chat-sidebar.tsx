@@ -115,7 +115,9 @@ import { requestPipeStop } from "@/lib/pipe-stop";
 import {
   applySidebarRecentsCap,
   buildSidebarRecentsSections,
+  listMoveTargetGroups,
   recurringPipeGroupKeys,
+  sessionGroupKey,
   type SidebarItem,
   validateSidebarGroupName,
 } from "@/lib/utils/chat-sidebar-grouping";
@@ -232,6 +234,15 @@ function useQueueDepths(): Map<string, number> {
  */
 export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
   const currentId = useChatStore((s) => s.currentId);
+  // Reactive group key for the current session — re-evaluates when the
+  // session appears in the store (handles the race where currentId is set
+  // before the session record lands).
+  const currentSessionGroupKey = useChatStore((s) => {
+    if (!s.currentId) return null;
+    const session = s.sessions[s.currentId];
+    if (!session || (session.kind === "pipe-watch" && session.isLoading)) return null;
+    return sessionGroupKey(session);
+  });
   const diskHydrated = useChatStore((s) => s.diskHydrated);
   const actions = useChatActions();
   const queueDepths = useQueueDepths();
@@ -506,6 +517,22 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     });
   };
 
+  // Auto-expand the pipe group containing the current session so the
+  // highlighted row is visible (e.g. after "open in chat" from Pipes).
+  // Uses a reactive store selector so it also fires when the session
+  // record lands after currentId was set (race on new conversations).
+  // In-memory only — doesn't persist to localStorage since this is a
+  // transient convenience, not a user preference.
+  useEffect(() => {
+    if (!currentSessionGroupKey) return;
+    setExpandedGroups((prev) => {
+      if (prev.has(currentSessionGroupKey)) return prev;
+      const next = new Set(prev);
+      next.add(currentSessionGroupKey);
+      return next;
+    });
+  }, [currentSessionGroupKey, setExpandedGroups]);
+
   // GC stale expand-state keys on mount — compare against the full
   // (pre-cap) recents list so we don't accidentally prune keys for
   // real groups that are past the 15-row cap.
@@ -545,21 +572,14 @@ export function ChatSidebar({ className, onViewAll }: ChatSidebarProps) {
     } catch { /* ignore */ }
   }, [groupedSections]);
 
-  // Derive existing manual group names from all visible non-hidden
-  // sessions (pinned + recents) so the "Move to group" submenu
-  // includes groups that currently only contain pinned chats.
-  const existingGroups = useMemo(() => {
-    const groups: string[] = [];
-    const seen = new Set<string>();
-    for (const s of [...pinned, ...recents]) {
-      const g = s.sidebarGroup?.trim();
-      if (g && !seen.has(g)) {
-        seen.add(g);
-        groups.push(g);
-      }
-    }
-    return groups;
-  }, [pinned, recents]);
+  // Group names offered in the "Move to group" submenu, derived from all
+  // visible non-hidden sessions (pinned + recents): manual groups plus the
+  // auto pipe-groups the user actually sees in the sidebar. Moving a chat
+  // into a pipe-group's name folds it into that same group.
+  const existingGroups = useMemo(
+    () => listMoveTargetGroups([...pinned, ...recents]),
+    [pinned, recents],
+  );
 
   // Resolve each running pipe to its SessionRecord so the Scheduled-row
   // kebab can offer Pin / Rename / Archive / Delete with the same
@@ -2206,8 +2226,14 @@ export function SidebarChatRow({
   const age = formatCompactAge(activityAt, now);
   const canSwapAgeForMenu = !isLive && !isError && queuedCount === 0 && !isUnread && Boolean(age);
   const menuOpen = openConversationMenuId === session.id;
+  // Exclude the group the session already lives in — whether it was placed
+  // there manually (sidebarGroup) or auto-grouped by pipe name.
+  const currentGroup = (
+    session.sidebarGroup ?? session.pipeContext?.pipeName
+  )?.trim().toLowerCase();
   const availableMoveGroups =
-    existingGroups?.filter((group) => group !== session.sidebarGroup) ?? [];
+    existingGroups?.filter((group) => group.trim().toLowerCase() !== currentGroup) ??
+    [];
   const rowMenuActions = {
     onArchive,
     onUnarchive,

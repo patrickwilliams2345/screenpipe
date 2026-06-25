@@ -111,7 +111,8 @@ import { useToast } from "@/components/ui/use-toast";
 import { useQueryState } from "nuqs";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { pipeExecutionToConversation } from "@/lib/pipe-ndjson-to-chat";
-import { saveConversationFile } from "@/lib/chat-storage";
+import { loadConversationFile, saveConversationFile } from "@/lib/chat-storage";
+import { pipeSessionId } from "@/lib/events/types";
 import { PublishDialog } from "@/components/pipe-store";
 import {
   Dialog,
@@ -987,6 +988,7 @@ export function PipesSection() {
   // Favorites — per-machine preference persisted via /pipes/favorites.
   // `showOnly` toggles a filter that hides non-starred pipes.
   const pipeFavorites = usePipeFavorites();
+  const [copiedExecId, setCopiedExecId] = useState<number | null>(null);
   const [availableConnections, setAvailableConnections] = useState<AvailableConnection[]>([]);
   const [connectionModal, setConnectionModal] = useState<{ pipeName: string; connections: string[] } | null>(null);
   const [availableUpdates, setAvailableUpdates] = useState<Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }>>({});
@@ -2724,16 +2726,26 @@ export function PipesSection() {
                                   {exec.model && <span className="text-muted-foreground/60 truncate max-w-[100px]">{exec.model}</span>}
                                   {exec.status === "completed" && exec.stdout && cleanPipeStdout(exec.stdout) && (
                                     <div className="ml-auto flex items-center gap-1">
-                                      <button className="text-muted-foreground hover:text-foreground p-0.5" title="copy" onClick={() => commands.copyTextToClipboard(cleanPipeStdout(exec.stdout))}>
-                                        <Copy className="w-3.5 h-3.5" />
+                                      <button className="text-muted-foreground hover:text-foreground p-0.5" title="copy" onClick={() => {
+                                        commands.copyTextToClipboard(cleanPipeStdout(exec.stdout));
+                                        setCopiedExecId(exec.id);
+                                        setTimeout(() => setCopiedExecId((prev) => prev === exec.id ? null : prev), 1500);
+                                      }}>
+                                        {copiedExecId === exec.id ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
                                       </button>
                                       <button className="text-muted-foreground hover:text-foreground p-0.5" title="open in chat" onClick={async () => {
-                                        const conv = pipeExecutionToConversation(exec.pipe_name, exec.id, exec.stdout, exec.started_at);
-                                        await saveConversationFile(conv);
-                                        localStorage.setItem("pending-chat-conversation", conv.id);
-                                        const url = new URL(window.location.href);
-                                        url.searchParams.set("section", "home");
-                                        window.location.href = url.toString();
+                                        // Check if the recorder already saved this execution
+                                        const recorderSid = pipeSessionId(exec.pipe_name, exec.id);
+                                        const existing = await loadConversationFile(recorderSid);
+                                        if (!existing) {
+                                          const conv = pipeExecutionToConversation(exec.pipe_name, exec.id, exec.stdout, exec.started_at);
+                                          conv.id = recorderSid;
+                                          conv.kind = "pipe-run";
+                                          conv.titleSource = "user";
+                                          conv.pipeContext = { pipeName: exec.pipe_name, executionId: exec.id, startedAt: exec.started_at || new Date().toISOString() };
+                                          await saveConversationFile(conv);
+                                        }
+                                        await emit("chat-load-conversation", { conversationId: recorderSid });
                                       }}>
                                         <MessageSquare className="w-3.5 h-3.5" />
                                       </button>
@@ -2778,10 +2790,14 @@ export function PipesSection() {
                                   <div className="relative group">
                                     <button
                                       className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-muted"
-                                      onClick={() => commands.copyTextToClipboard(cleanPipeStdout(log.stdout))}
+                                      onClick={() => {
+                                        commands.copyTextToClipboard(cleanPipeStdout(log.stdout));
+                                        setCopiedExecId(-(i + 1));
+                                        setTimeout(() => setCopiedExecId((prev) => prev === -(i + 1) ? null : prev), 1500);
+                                      }}
                                       title="copy"
                                     >
-                                      <Copy className="h-3 w-3 text-muted-foreground" />
+                                      {copiedExecId === -(i + 1) ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3 text-muted-foreground" />}
                                     </button>
                                     <div className="text-xs text-muted-foreground max-h-96 overflow-y-auto scrollbar-hide"><MemoizedReactMarkdown className="prose prose-xs dark:prose-invert max-w-none break-words text-xs [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_h1]:text-sm [&_h2]:text-xs [&_h3]:text-xs [&_p]:text-xs [&_li]:text-xs [&_code]:text-[10px]">{cleanPipeStdout(log.stdout)}</MemoizedReactMarkdown></div>
                                   </div>

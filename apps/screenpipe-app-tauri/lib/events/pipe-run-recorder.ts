@@ -69,7 +69,6 @@ let unregister: Unregister | null = null;
 
 const TERMINAL_EVENT_TYPES = new Set([
   "agent_end",
-  "turn_end",
   "pipe_done",
 ]);
 
@@ -191,7 +190,7 @@ async function finalizeBuffer(sid: string, buf: PipeRunBuffer): Promise<void> {
   }
 
   const ndjson = buf.lines.join("\n");
-  const messages: ChatMessage[] = parsePipeNdjsonToMessages(ndjson);
+  const messages: ChatMessage[] = parsePipeNdjsonToMessages(ndjson, buf.pipeName);
 
   // Skip empty conversations — pipes that emitted no parseable
   // assistant content (e.g. raw_line-only streams that the parser
@@ -205,6 +204,7 @@ async function finalizeBuffer(sid: string, buf: PipeRunBuffer): Promise<void> {
   const conv: ChatConversation = {
     id: sid,
     title: `${buf.pipeName} #${buf.executionId}`,
+    titleSource: "user",
     messages,
     createdAt: buf.firstEventAt,
     updatedAt: buf.lastEventAt,

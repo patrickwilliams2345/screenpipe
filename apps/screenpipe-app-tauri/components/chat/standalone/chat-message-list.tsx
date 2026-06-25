@@ -53,6 +53,7 @@ export interface ChatMessageListProps {
   sendMessage: (message: string, displayLabel?: string, imageDataUrls?: string[]) => Promise<void>;
   openFilePreview: (path: string) => void;
   branchConversation: (messageId: string) => Promise<void> | void;
+  suppressSourceFooters?: boolean;
 }
 
 export function ChatMessageList({
@@ -85,6 +86,7 @@ export function ChatMessageList({
   sendMessage,
   openFilePreview,
   branchConversation,
+  suppressSourceFooters = false,
 }: ChatMessageListProps) {
   return (
     <>
@@ -263,6 +265,7 @@ export function ChatMessageList({
                         <MessageContent
                           message={message}
                           deferSourceFooter={
+                            suppressSourceFooters ||
                             citationPlan.deferredMessageIds.has(message.id) ||
                             message.id === activeSourceFooterMessageId
                           }
@@ -361,7 +364,7 @@ export function ChatMessageList({
                   ) : null}
                 </div>
               </motion.div>,
-              turnAggregatedCitations && turnAggregatedCitations.length > 0 ? (
+              !suppressSourceFooters && turnAggregatedCitations && turnAggregatedCitations.length > 0 ? (
                 <motion.div
                   key={`turn-sources-${message.id}`}
                   initial={{ opacity: 0, y: 4 }}

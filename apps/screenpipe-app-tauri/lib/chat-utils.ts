@@ -258,7 +258,14 @@ export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> 
     // drop prefill events because no chat listener exists yet.
     await commands.showWindow({ Home: { page: "home" } });
   } else {
-    await commands.showWindow("Chat");
+    // Use show_window_activated, not show_window: this path is reached from
+    // notification clicks (e.g. the "automate something" pipe-suggestion
+    // action), which fire from outside the app's active space. The Chat
+    // overlay is a NonActivating panel, so plain show_window resolves Ok
+    // without ever raising the window — the prefilled prompt then runs with
+    // the window hidden and the user sees nothing happen. Matches the
+    // open_chat / open_timeline notification handlers.
+    await commands.showWindowActivated("Chat");
   }
 
   await waitForChatReady(targetWindow);

@@ -32,7 +32,7 @@ interface SourceCitationFooterProps {
   onOpenFile?: (path: string) => void;
 }
 
-const KIND_ICON: Record<SourceCitationKind, React.ComponentType<{ className?: string }>> = {
+export const KIND_ICON: Record<SourceCitationKind, React.ComponentType<{ className?: string }>> = {
   screenpipe: Search,
   database: Database,
   connector: Plug,
@@ -241,7 +241,7 @@ function SourceCitationRow({
   );
 }
 
-function SourceCitationIcon({
+export function SourceCitationIcon({
   citation,
   fallback: FallbackIcon,
 }: {
