@@ -374,8 +374,8 @@ fn emit_meeting_note_route_with_retries(app: &tauri::AppHandle, deeplink_url: &s
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::{
-        fallback_local_api_config, notification_copy_value, notification_source_url,
-        parse_meeting_deeplink,
+        fallback_local_api_config, is_login_callback_scheme, notification_copy_value,
+        notification_source_url, parse_meeting_deeplink,
     };
     use serde_json::json;
 
@@ -402,6 +402,11 @@ mod tests {
             None
         );
         assert_eq!(parse_meeting_deeplink("screenpipe://settings"), None);
+    }
+
+    #[test]
+    fn login_callback_accepts_website_fallback_scheme() {
+        assert!(is_login_callback_scheme("screenpipe"));
     }
 
     #[test]
@@ -1782,28 +1787,16 @@ pub fn deep_link_scheme() -> &'static str {
     }
 }
 
+fn is_login_callback_scheme(scheme: &str) -> bool {
+    scheme == deep_link_scheme() || scheme == "screenpipe"
+}
+
 /// Open the screenpipe.com login page.
-/// Windows: system browser + registered deep-link scheme handles the redirect.
 /// macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
-/// Linux: in-app WebView that intercepts the screenpipe:// redirect.
+/// Windows/Linux: in-app WebView that intercepts the screenpipe:// redirect.
 #[tauri::command]
 #[specta::specta]
 pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), String> {
-    // Windows: open in system browser — deep link is registered via
-    // tauri_plugin_deep_link::register_all() so the screenpipe:// redirect works
-    #[cfg(target_os = "windows")]
-    {
-        use tauri_plugin_opener::OpenerExt;
-        app_handle
-            .opener()
-            .open_url(
-                format!("{}?return_scheme={}", LOGIN_URL, deep_link_scheme()),
-                None::<&str>,
-            )
-            .map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-
     #[cfg(target_os = "macos")]
     {
         // ASWebAuthenticationSession intercepts the redirect itself (no OS
@@ -1833,7 +1826,7 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
         return Ok(());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     {
         use tauri::{WebviewUrl, WebviewWindowBuilder};
 
@@ -1859,7 +1852,7 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
         .focused(true);
 
         builder = builder.on_navigation(move |url| {
-            if url.scheme() == deep_link_scheme() {
+            if is_login_callback_scheme(url.scheme()) {
                 info!("login window intercepted deep link callback");
                 let _ = app_for_nav.emit("deep-link-received", url.to_string());
                 if let Some(w) = app_for_nav.get_webview_window("login-browser") {
@@ -1918,7 +1911,7 @@ pub async fn open_google_calendar_auth_window(
     }
 
     builder = builder.on_navigation(move |url| {
-        if url.scheme() == deep_link_scheme() {
+        if is_login_callback_scheme(url.scheme()) {
             info!("google calendar auth window intercepted deep link: {}", url);
             let _ = app_for_nav.emit("deep-link-received", url.to_string());
             if let Some(w) = app_for_nav.get_webview_window("google-calendar-auth") {

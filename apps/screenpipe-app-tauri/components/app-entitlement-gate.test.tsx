@@ -16,6 +16,8 @@ const mocks = vi.hoisted(() => ({
   openLoginWindow: vi.fn().mockResolvedValue(undefined),
   setCloudToken: vi.fn().mockResolvedValue(undefined),
   getCloudToken: vi.fn().mockResolvedValue(null),
+  platform: vi.fn(() => "windows"),
+  arch: vi.fn(() => "x86_64"),
   loadUser: vi.fn().mockResolvedValue(undefined),
   updateSettings: vi.fn().mockResolvedValue(undefined),
   state: { isSettingsLoaded: true, user: null as any },
@@ -57,6 +59,10 @@ vi.mock("@/lib/hooks/use-enterprise-policy", () => ({
 
 vi.mock("posthog-js", () => ({ default: { capture: mocks.capture } }));
 vi.mock("@tauri-apps/plugin-shell", () => ({ open: mocks.open }));
+vi.mock("@tauri-apps/plugin-os", () => ({
+  platform: mocks.platform,
+  arch: mocks.arch,
+}));
 
 // The resume effect only restarts the engine from the primary window, which it
 // detects via getCurrentWindow().label. Stand in as the primary "main" window so
@@ -416,6 +422,66 @@ describe("AppEntitlementGate", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("routes enterprise accounts away from the consumer app", async () => {
+    mocks.state.user = baseUser({
+      app_entitled: true,
+      cloud_subscribed: true,
+      subscription_plan: "pro",
+      enterprise_account: {
+        org_name: "Bungalow",
+        role: "member",
+        requires_enterprise_app: true,
+      },
+      entitlement: {
+        active: true,
+        plan: "pro",
+        source: "enterprise",
+        checked_at: minsAgo(1),
+        features: { app: true, cloud: true },
+      },
+    });
+
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+
+    expect(screen.getByText(/enterprise app required/i)).toBeInTheDocument();
+    expect(screen.getByText(/belongs to Bungalow/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("protected-app")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /download enterprise app/i }));
+
+    const downloadUrl = String(mocks.open.mock.calls.at(-1)?.[0] ?? "");
+    expect(downloadUrl).toContain("/api/download");
+    expect(downloadUrl).toContain("token=verified");
+    expect(downloadUrl).toContain("channel=enterprise");
+    expect(downloadUrl).toContain("platform=windows");
+  });
+
+  it("does not show the consumer-app warning inside the enterprise build", () => {
+    mocks.enterprise.isEnterprise = true;
+    mocks.state.user = baseUser({
+      app_entitled: true,
+      cloud_subscribed: true,
+      subscription_plan: "pro",
+      enterprise_account: {
+        org_name: "Bungalow",
+        role: "member",
+        requires_enterprise_app: true,
+      },
+      entitlement: {
+        active: true,
+        plan: "pro",
+        source: "enterprise",
+        checked_at: minsAgo(1),
+        features: { app: true, cloud: true },
+      },
+    });
+
+    render(<AppEntitlementGate>{protectedApp}</AppEntitlementGate>);
+
+    expect(screen.queryByText(/enterprise app required/i)).not.toBeInTheDocument();
+    expect(screen.getByTestId("protected-app")).toBeInTheDocument();
   });
 
   it("resumes recording when access transitions to entitled", async () => {

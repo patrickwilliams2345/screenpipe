@@ -45,15 +45,24 @@ export type AppEntitlement = {
   features?: AppEntitlementFeatures | null;
 };
 
+export type AppEnterpriseAccount = {
+  org_name?: string | null;
+  role?: string | null;
+  requires_enterprise_app?: boolean | null;
+};
+
 export type AppUser = User & {
   app_entitled?: boolean | null;
   subscription_plan?: string | null;
   entitlement?: AppEntitlement | JsonValue | null;
+  enterprise_account?: AppEnterpriseAccount | JsonValue | null;
 };
 
 export const APP_ENTITLEMENT_MAX_STALE_MS = 72 * 60 * 60 * 1000;
 export const APP_ENTITLEMENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const PRICING_URL = screenpipeWebUrl("/onboarding", "https://screenpipe.com");
+export const ENTERPRISE_BUILDS_URL = screenpipeWebUrl("/enterprise?tab=builds", "https://screenpipe.com");
+export const ENTERPRISE_DOWNLOAD_URL = screenpipeWebUrl("/api/download", "https://screenpipe.com");
 
 // localStorage key an e2e spec can set to force the gate ON even in a bypassed
 // build. It can only ever make the gate stricter (never bypass), so it is safe
@@ -81,6 +90,16 @@ function asEntitlement(entitlement: AppUser["entitlement"] | undefined): AppEnti
     return null;
   }
   return entitlement as AppEntitlement;
+}
+
+export function getEnterpriseAccount(
+  user: AppUser | null | undefined,
+): AppEnterpriseAccount | null {
+  const account = user?.enterprise_account;
+  if (!account || typeof account !== "object" || Array.isArray(account)) {
+    return null;
+  }
+  return account as AppEnterpriseAccount;
 }
 
 function parseEntitlementTime(value: string | null | undefined) {

@@ -5,12 +5,16 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CreditCard, LogIn, RefreshCw } from "lucide-react";
+import { Building2, CreditCard, Download, LogIn, RefreshCw } from "lucide-react";
 import posthog from "posthog-js";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
+import { arch as getOsArch, platform as getOsPlatform } from "@tauri-apps/plugin-os";
 import { Button } from "@/components/ui/button";
 import {
   AppUser,
+  ENTERPRISE_BUILDS_URL,
+  ENTERPRISE_DOWNLOAD_URL,
+  getEnterpriseAccount,
   hasAppEntitlement,
   hasPersistedEntitlementEvidence,
   isDevBillingBypassEnabled,
@@ -43,6 +47,29 @@ function isPrimaryWindow(): boolean {
     return label === "main-window" || label === "main";
   } catch {
     return false;
+  }
+}
+
+function getDownloadPlatform(): string | null {
+  try {
+    const os = getOsPlatform();
+    if (os === "windows") return getOsArch() === "aarch64" ? "windows-arm" : "windows";
+    if (os === "macos") return getOsArch() === "aarch64" ? "macos-arm" : "macos-intel";
+    if (os === "linux") return "linux";
+  } catch {}
+  return null;
+}
+
+function getEnterpriseDownloadUrl() {
+  try {
+    const url = new URL(ENTERPRISE_DOWNLOAD_URL);
+    url.searchParams.set("token", "verified");
+    url.searchParams.set("channel", "enterprise");
+    const platform = getDownloadPlatform();
+    if (platform) url.searchParams.set("platform", platform);
+    return url.toString();
+  } catch {
+    return ENTERPRISE_BUILDS_URL;
   }
 }
 
@@ -94,6 +121,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   const devBypass = isDevBillingBypassEnabled();
   const isEntitled = hasAppEntitlement(user);
   const needsRefresh = needsAppEntitlementRefresh(user);
+  const enterpriseAccount = getEnterpriseAccount(user);
 
   // loadUser is re-created on every render (it is NOT memoized), so the
   // background re-verify poll below can't depend on its identity without
@@ -134,10 +162,19 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     !needsLicenseKey &&
     !isSectionHidden("account");
   const shouldGateForEnterpriseLogin = enterpriseRequiresLogin && !user?.token;
+  const shouldGateForEnterpriseApp =
+    !devBypass &&
+    !isEnterprise &&
+    Boolean(user?.token) &&
+    enterpriseAccount?.requires_enterprise_app === true;
   const shouldGateForEntitlement =
     !devBypass && !isEntitled && !failOpenForTransientAccessLoss;
-  const shouldGate = shouldGateForEnterpriseLogin || shouldGateForEntitlement;
+  const shouldGate =
+    shouldGateForEnterpriseApp ||
+    shouldGateForEnterpriseLogin ||
+    shouldGateForEntitlement;
   const email = user?.email || "this account";
+  const enterpriseOrgName = enterpriseAccount?.org_name || "your workspace";
   const planLabel = useMemo(
     () => normalizePlanLabel(user?.subscription_plan),
     [user?.subscription_plan],
@@ -246,6 +283,14 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     } catch {}
     commands.openLoginWindow();
   }, [updateSettings]);
+
+  const downloadEnterpriseApp = useCallback(() => {
+    const url = getEnterpriseDownloadUrl();
+    posthog.capture("app_entitlement_enterprise_download_clicked", {
+      org_name: enterpriseAccount?.org_name ?? null,
+    });
+    openUrl(url).catch(() => window.open(url, "_blank"));
+  }, [enterpriseAccount?.org_name]);
 
   // Dev/preview only: deep links do not reach the `bun tauri dev` binary on
   // macOS, so paste the login token (or the whole screenpipe://...api_key=...
@@ -414,6 +459,34 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
 
   if (!shouldGate) {
     return <>{children}</>;
+  }
+
+  if (shouldGateForEnterpriseApp) {
+    return (
+      <EntitlementShell
+        title="enterprise app required"
+        description={`${email} belongs to ${enterpriseOrgName}. download the screenpipe enterprise app so this device follows workspace policy and uploads to your org storage.`}
+      >
+        <div className="flex flex-col gap-3">
+          <Button onClick={downloadEnterpriseApp} className="w-full gap-2">
+            <Download className="h-4 w-4" />
+            download enterprise app
+          </Button>
+          <Button
+            onClick={() => openUrl(ENTERPRISE_BUILDS_URL).catch(() => window.open(ENTERPRISE_BUILDS_URL, "_blank"))}
+            variant="outline"
+            className="w-full gap-2"
+          >
+            <Building2 className="h-4 w-4" />
+            open enterprise builds
+          </Button>
+          <Button onClick={useDifferentAccount} variant="ghost" className="w-full">
+            use different account
+          </Button>
+        </div>
+        {devLoginBlock}
+      </EntitlementShell>
+    );
   }
 
   if (shouldGateForEnterpriseLogin) {
