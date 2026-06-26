@@ -471,58 +471,18 @@ const DEFAULT_IGNORED_WINDOWS_PER_OS: Record<string, string[]> = {
 	linux: ["Info center", "Discover", "Parted"],
 };
 
-// Default screenpipe-cloud presets on first install — every seed runs on
-// "auto": the ai-gateway routes to the best model the user's tier allows, so
-// nobody starts pinned to a specific (possibly tier-gated) Claude model.
-// - "Chat":  default preset, used by interactive chat.
-// - "Pipes": same routing, separate id so recurring pipe runs can be
-//           customized independently; users can override per-pipe.
-const CHAT_PRESET_ID = "chat";
-const PIPES_PRESET_ID = "pipes";
+// screenpipe — AI that knows everything you've seen, said, or heard
+// https://screenpi.pe
 
-// Non-pro users get a single "screenpipe" preset on auto — auto handles
-// model routing without needing the user to know what to pick.
-const SCREENPIPE_PRESET_ID = "screenpipe";
-
-export function makeDefaultPresets(isPro: boolean): AIPreset[] {
-	if (isPro) {
-		return [
-			{
-				id: CHAT_PRESET_ID,
-				provider: "screenpipe-cloud",
-				url: "",
-				model: "auto",
-				maxContextChars: 200000,
-				defaultPreset: true,
-				prompt: "",
-			},
-			{
-				id: PIPES_PRESET_ID,
-				provider: "screenpipe-cloud",
-				url: "",
-				model: "auto",
-				maxContextChars: 200000,
-				defaultPreset: false,
-				prompt: "",
-			},
-		];
-	}
-	return [
-		{
-			id: SCREENPIPE_PRESET_ID,
-			provider: "screenpipe-cloud",
-			url: "",
-			model: "auto",
-			maxContextChars: 200000,
-			defaultPreset: true,
-			prompt: "",
-		},
-	];
+// [fork patch] No screenpipe-cloud presets are seeded automatically.
+// The user creates their own AI presets (chatgpt, ollama, etc.) in Settings.
+// Returning [] means no built-in screenpipe-cloud option appears by default.
+export function makeDefaultPresets(_isPro: boolean): AIPreset[] {
+	return [];
 }
 
-// Seed value — module load can't know pro status yet, so fall back to non-pro.
-// ensureDefaultPreset() re-seeds with pro status once settings.user is loaded.
-const DEFAULT_CLOUD_PRESET: AIPreset = makeDefaultPresets(false)[0];
+// No default cloud preset is seeded; callers must guard for the empty case.
+const DEFAULT_CLOUD_PRESET: AIPreset | undefined = undefined;
 
 const DEFAULT_AUDIO_ENGINE = "whisper-large-v3-turbo-quantized";
 
@@ -853,31 +813,13 @@ function createSettingsStore() {
 		// installs default to "meetings-only" (via createDefaultSettingsObject, which
 		// get() returns directly when there are no stored settings).
 
-		// Migration: Add default presets if user has none
-		if (!settings.aiPresets || settings.aiPresets.length === 0) {
-			const isPro = settings.user?.cloud_subscribed === true;
-			settings.aiPresets = makeDefaultPresets(isPro) as any;
-			needsUpdate = true;
-		}
+		// [fork patch] Do NOT auto-seed presets for existing users. The original
+		// migration re-added a screenpipe-cloud preset whenever none was present,
+		// which resurrected the deleted "screenpipe" preset on every launch.
 
-		// b2 seed: the first time we see a logged-in user, replace the anonymous
-		// "screenpipe" placeholder with the pro pair (chat + pipes) IF they're pro.
-		// Anonymous users keep the placeholder forever (which is correct — non-pro
-		// stays on the single "screenpipe" auto preset). Existing users with their
-		// own presets are untouched. Runs exactly once per install.
-		if (!(settings as any)._presetsSeededForUser && settings.user?.token) {
-			const isPro = settings.user?.cloud_subscribed === true;
-			const presets = settings.aiPresets ?? [];
-			const isAnonymousPlaceholder =
-				presets.length === 1 &&
-				(presets[0] as any)?.id === SCREENPIPE_PRESET_ID &&
-				(presets[0] as any)?.provider === "screenpipe-cloud";
-			if (isPro && isAnonymousPlaceholder) {
-				settings.aiPresets = makeDefaultPresets(true) as any;
-			}
-			(settings as any)._presetsSeededForUser = true;
-			needsUpdate = true;
-		}
+		// [fork patch] Do NOT re-seed presets when the list is empty. The original
+		// migration repopulated screenpipe-cloud presets after the user deleted
+		// all of them; we leave the list empty so deletions stick.
 
 		// Migration: Rename "pi" provider to "screenpipe-cloud" for clarity
 		if (settings.aiPresets?.some((p: any) => p.provider === "pi")) {
@@ -895,17 +837,9 @@ function createSettingsStore() {
 			needsUpdate = true;
 		}
 
-		// Migration: Add screenpipe-cloud preset for existing users (without touching their existing presets)
-		const hasCloudPreset = settings.aiPresets?.some(
-			(p: any) => p.id === "screenpipe-cloud" || p.provider === "screenpipe-cloud"
-		);
-		if (settings.aiPresets && settings.aiPresets.length > 0 && !hasCloudPreset) {
-			// Only set as default if no other preset is already default
-			const hasDefault = settings.aiPresets.some((p: any) => p.defaultPreset);
-			const cloudPreset = { ...DEFAULT_CLOUD_PRESET, defaultPreset: !hasDefault };
-			settings.aiPresets = [cloudPreset as any, ...settings.aiPresets];
-			needsUpdate = true;
-		}
+		// [fork patch] Removed "Add screenpipe-cloud preset for existing users"
+		// migration. It re-added a screenpipe-cloud preset whenever the user had
+		// presets but none were screenpipe-cloud — resurrecting the deleted preset.
 
 		// Migration: Add chat history for existing users
 		if (!settings.chatHistory) {
