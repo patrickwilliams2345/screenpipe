@@ -126,6 +126,23 @@ impl PresetBreaker {
         );
     }
 
+    /// Transition to OPEN with a precise reset timestamp (e.g. from the
+    /// `resets_at` field in a `daily_cost_limit_exceeded` response). Skips
+    /// exponential backoff — the provider told us exactly when we can retry.
+    pub fn trip_at(&mut self, reason: FailureReason, reset_at_epoch: u64) {
+        self.state = BreakerState::Open;
+        self.reason = Some(reason);
+        self.failure_count += 1;
+        self.success_streak = 0;
+        self.cooldown_until = reset_at_epoch;
+
+        let secs_from_now = reset_at_epoch.saturating_sub(now_epoch());
+        info!(
+            "circuit breaker tripped: reason={:?}, failure_count={}, cooldown_until={} ({}s from now)",
+            reason, self.failure_count, reset_at_epoch, secs_from_now
+        );
+    }
+
     /// Record a success. After 5 consecutive successes, reset backoff.
     pub fn record_success(&mut self) {
         self.state = BreakerState::Closed;
@@ -334,6 +351,26 @@ impl PresetFallbackRegistry {
     pub fn record_failure_from_output(&self, preset_id: &str, stderr: &str, stdout: &str) -> bool {
         let combined = format!("{} {}", stderr, stdout).to_lowercase();
 
+        // daily_cost_limit_exceeded: account-wide daily budget exhausted.
+        // Check before the generic 429/usage-limit catch-all — this is
+        // CreditsExhausted, not a transient rate limit, and we want to use
+        // the provider-supplied `resets_at` timestamp rather than backoff.
+        if combined.contains("daily_cost_limit_exceeded") {
+            let reset_at = parse_resets_at(stderr)
+                .or_else(|| parse_resets_at(stdout))
+                .unwrap_or_else(|| {
+                    // Default: next midnight UTC (worst-case safe estimate)
+                    let now = now_epoch();
+                    let secs_since_midnight = now % 86400;
+                    now + (86400 - secs_since_midnight)
+                });
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let breaker = state.presets.entry(preset_id.to_string()).or_default();
+            breaker.trip_at(FailureReason::CreditsExhausted, reset_at);
+            self.persist(&state);
+            return true;
+        }
+
         let reason = if combined.contains("rate limit")
             || combined.contains("rate_limit")
             || combined.contains("usage limit")
@@ -416,6 +453,40 @@ fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Parse a `resets_at` ISO 8601 UTC timestamp from a provider error payload
+/// and convert it to a Unix epoch second. Only handles the
+/// `"resets_at":"2026-06-27T00:00:00.000Z"` form returned by the screenpipe
+/// cloud gateway.
+fn parse_resets_at(text: &str) -> Option<u64> {
+    let key = "\"resets_at\":\"";
+    let start = text.find(key)? + key.len();
+    let rest = &text[start..];
+    let end = rest.find('"')?;
+    let ts = &rest[..end]; // e.g. "2026-06-27T00:00:00.000Z"
+
+    // Manual parse: YYYY-MM-DDTHH:MM:SS[.mmm]Z
+    let date_part = ts.get(..10)?; // "2026-06-27"
+    let time_part = ts.get(11..19)?; // "00:00:00"
+
+    let year: i64 = date_part[..4].parse().ok()?;
+    let month: i64 = date_part[5..7].parse().ok()?;
+    let day: i64 = date_part[8..10].parse().ok()?;
+    let hour: i64 = time_part[..2].parse().ok()?;
+    let minute: i64 = time_part[3..5].parse().ok()?;
+    let second: i64 = time_part[6..8].parse().ok()?;
+
+    // Days since Unix epoch (1970-01-01) — Julian day number approach
+    let a = (14 - month) / 12;
+    let y = year + 4800 - a;
+    let m = month + 12 * a - 3;
+    let jdn = day + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
+    let unix_epoch_jdn: i64 = 2440588; // JDN of 1970-01-01
+    let days = jdn - unix_epoch_jdn;
+
+    let secs = days * 86400 + hour * 3600 + minute * 60 + second;
+    u64::try_from(secs).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -654,5 +725,70 @@ mod tests {
         // And no stray temp file should be left behind.
         assert!(!dir.join("ai_preset_fallback.json.tmp").exists());
         drop(err);
+    }
+
+    #[test]
+    fn test_parse_resets_at_midnight_utc() {
+        let payload = r#"{"error":"daily_cost_limit_exceeded","resets_at":"2026-06-27T00:00:00.000Z"}"#;
+        let ts = parse_resets_at(payload).expect("should parse resets_at");
+        // 2026-06-27T00:00:00Z in Unix seconds
+        // Days from 1970-01-01 to 2026-06-27: quick reference check
+        assert!(ts > 1_750_000_000, "timestamp too small: {}", ts);
+        assert!(ts < 2_000_000_000, "timestamp too large: {}", ts);
+        // Midnight UTC means seconds portion is 0
+        assert_eq!(ts % 86400, 0, "expected midnight UTC (seconds % 86400 == 0)");
+    }
+
+    #[test]
+    fn test_parse_resets_at_none_when_missing() {
+        assert!(parse_resets_at("no timestamp here").is_none());
+        assert!(parse_resets_at(r#"{"error":"rate_limited"}"#).is_none());
+    }
+
+    #[test]
+    fn test_daily_limit_trips_credits_exhausted_with_reset_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = PresetFallbackRegistry::new(dir.path());
+
+        // Simulate the exact error screenpipe cloud returns
+        let stderr = r#"429 "{\"error\":\"daily_cost_limit_exceeded\",\"message\":\"You've hit today's AI usage limit.\",\"resets_at\":\"2026-06-27T00:00:00.000Z\",\"tier\":\"logged_in\"}""#;
+        let tripped = registry.record_failure_from_output("ollama", stderr, "");
+        assert!(tripped, "daily limit error must trip the circuit breaker");
+
+        let state = registry.state.lock().unwrap();
+        let breaker = state.presets.get("ollama").expect("breaker state must exist");
+        assert_eq!(
+            breaker.reason,
+            Some(FailureReason::CreditsExhausted),
+            "daily limit must map to CreditsExhausted, not RateLimit"
+        );
+        // cooldown_until must align to midnight UTC (divisible by 86400)
+        assert_eq!(
+            breaker.cooldown_until % 86400,
+            0,
+            "cooldown_until should be midnight UTC: {}",
+            breaker.cooldown_until
+        );
+        assert!(
+            breaker.cooldown_until > now_epoch(),
+            "cooldown must be in the future"
+        );
+    }
+
+    #[test]
+    fn test_daily_limit_fallback_without_resets_at() {
+        // When resets_at is absent, should still trip with CreditsExhausted
+        // and default cooldown_until to next midnight UTC.
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = PresetFallbackRegistry::new(dir.path());
+
+        let stderr = r#"daily_cost_limit_exceeded"#;
+        let tripped = registry.record_failure_from_output("ollama", stderr, "");
+        assert!(tripped);
+
+        let state = registry.state.lock().unwrap();
+        let breaker = state.presets.get("ollama").unwrap();
+        assert_eq!(breaker.reason, Some(FailureReason::CreditsExhausted));
+        assert!(breaker.cooldown_until > now_epoch());
     }
 }

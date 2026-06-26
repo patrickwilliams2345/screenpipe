@@ -65,6 +65,13 @@ fn is_rate_limit_error(text: &str) -> bool {
         || lower.contains("\"reset_in\"")
 }
 
+/// Whether the failure is a daily account budget exhaustion (not a transient
+/// per-minute rate limit). Retrying immediately is pointless — the quota
+/// resets at midnight UTC, not in seconds.
+fn is_daily_limit_error(text: &str) -> bool {
+    text.contains("daily_cost_limit_exceeded")
+}
+
 /// Fetch the model catalog from the Cloudflare Worker gateway and convert
 /// it into the format Pi's `models.json` expects.
 ///
@@ -1742,6 +1749,7 @@ impl AgentExecutor for PiExecutor {
         while !output.success
             && rate_limit_retries < MAX_RATE_LIMIT_RETRIES
             && is_rate_limit_error(&output.stderr)
+            && !is_daily_limit_error(&output.stderr)
         {
             rate_limit_retries += 1;
             let wait_secs = parse_rate_limit_reset_secs(&output.stderr)
