@@ -1359,9 +1359,9 @@ fn read_store_bin(path: &Path) -> Option<serde_json::Value> {
 /// Read `~/.screenpipe/store.bin` and find the preset by id.
 /// Falls back to the default preset if `preset_id` is `"default"`.
 /// Creates store.bin with a default preset if it doesn't exist (CLI mode).
-fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
-    // store.bin lives at ~/.screenpipe/store.bin (sibling of pipes/)
-    let store_path = pipes_dir.parent()?.join("store.bin");
+fn resolve_preset(_pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
+    // store.bin lives at ~/.screenpipe/store.bin (sibling of pipes/ by default, but always in home)
+    let store_path = crate::paths::default_screenpipe_data_dir().join("store.bin");
 
     if !store_path.exists() {
         // Bootstrap for CLI users who don't have the app.
@@ -1483,11 +1483,9 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
 /// Enumerate the preset IDs currently in `store.bin`, for surfacing in error
 /// messages. Returns an empty vec if the store is missing or unreadable —
 /// callers should phrase the message accordingly.
-fn list_available_preset_ids(pipes_dir: &Path) -> Vec<String> {
-    let Some(parent) = pipes_dir.parent() else {
-        return Vec::new();
-    };
-    let Some(store) = read_store_bin(&parent.join("store.bin")) else {
+fn list_available_preset_ids(_pipes_dir: &Path) -> Vec<String> {
+    let store_path = crate::paths::default_screenpipe_data_dir().join("store.bin");
+    let Some(store) = read_store_bin(&store_path) else {
         return Vec::new();
     };
     store
