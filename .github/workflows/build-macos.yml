@@ -97,7 +97,6 @@ jobs:
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           bun tauri build --target aarch64-apple-darwin --features "metal,redact-onnx-coreml,official-build"
 
