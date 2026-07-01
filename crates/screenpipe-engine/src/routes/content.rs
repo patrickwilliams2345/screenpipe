@@ -606,7 +606,14 @@ fn validate_raw_sql(query: &str) -> Result<(), String> {
     // a SELECT/WITH/EXPLAIN wrapper (e.g. `SELECT * FROM x; ATTACH ...`).
     // ATTACH DATABASE can read/write arbitrary files on the filesystem.
     const BLOCKLIST: [&str; 8] = [
-        "ATTACH", "DETACH", "PRAGMA", "CREATE", "DROP", "ALTER", "REINDEX", "SAVEPOINT",
+        "ATTACH",
+        "DETACH",
+        "PRAGMA",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "REINDEX",
+        "SAVEPOINT",
     ];
     for kw in &BLOCKLIST {
         if upper.contains(kw) {
@@ -801,9 +808,7 @@ mod raw_sql_validation_tests {
     #[test]
     fn blocks_attach_database() {
         assert!(validate_raw_sql("ATTACH DATABASE '/etc/passwd' AS stolen LIMIT 1").is_err());
-        assert!(
-            validate_raw_sql("SELECT 1 LIMIT 1; ATTACH DATABASE '/tmp/x.db' AS x").is_err()
-        );
+        assert!(validate_raw_sql("SELECT 1 LIMIT 1; ATTACH DATABASE '/tmp/x.db' AS x").is_err());
     }
 
     #[test]

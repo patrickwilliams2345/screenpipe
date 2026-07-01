@@ -181,7 +181,9 @@ pub async fn validate_media(file_path: &str) -> Result<()> {
 
     // Reject obvious path-traversal attempts before touching the filesystem.
     if file_path.contains("..") {
-        return Err(anyhow::anyhow!("invalid media path: path traversal detected"));
+        return Err(anyhow::anyhow!(
+            "invalid media path: path traversal detected"
+        ));
     }
 
     if !try_exists(file_path).await? {
