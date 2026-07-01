@@ -1031,4 +1031,196 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn parse_connection_key_with_instance() {
+        let (id, instance) = parse_connection_key("notion:work");
+        assert_eq!(id, "notion");
+        assert_eq!(instance, Some("work"));
+    }
+
+    #[test]
+    fn parse_connection_key_without_instance() {
+        let (id, instance) = parse_connection_key("notion");
+        assert_eq!(id, "notion");
+        assert_eq!(instance, None);
+    }
+
+    #[test]
+    fn parse_connection_key_multiple_colons() {
+        let (id, instance) = parse_connection_key("notion:work:project");
+        assert_eq!(id, "notion");
+        assert_eq!(instance, Some("work:project"));
+    }
+
+    #[test]
+    fn make_key_with_instance() {
+        assert_eq!(make_key("notion", Some("work")), "notion:work");
+    }
+
+    #[test]
+    fn make_key_without_instance() {
+        assert_eq!(make_key("notion", None), "notion");
+    }
+
+    #[test]
+    fn percent_encode_query_value_plain() {
+        assert_eq!(percent_encode_query_value("hello"), "hello");
+    }
+
+    #[test]
+    fn percent_encode_query_value_special() {
+        assert_eq!(percent_encode_query_value("hello world"), "hello%20world");
+        assert_eq!(percent_encode_query_value("a&b=c"), "a%26b%3Dc");
+    }
+
+    #[test]
+    fn percent_encode_query_value_unreserved() {
+        assert_eq!(percent_encode_query_value("a-b.c_d~e"), "a-b.c_d~e");
+    }
+
+    #[test]
+    fn require_str_present() {
+        let mut map = Map::new();
+        map.insert("key".to_string(), Value::String("value".to_string()));
+        assert_eq!(require_str(&map, "key").unwrap(), "value");
+    }
+
+    #[test]
+    fn require_str_missing() {
+        let map = Map::new();
+        assert!(require_str(&map, "key").is_err());
+    }
+
+    #[test]
+    fn require_str_wrong_type() {
+        let mut map = Map::new();
+        map.insert("key".to_string(), Value::Number(42.into()));
+        assert!(require_str(&map, "key").is_err());
+    }
+
+    #[test]
+    fn load_store_empty_dir() {
+        let dir = temp_screenpipe_dir();
+        let store = load_store(&dir);
+        assert!(store.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_and_load_store_roundtrip() {
+        let dir = temp_screenpipe_dir();
+        let mut store = HashMap::new();
+        store.insert(
+            "discord".to_string(),
+            SavedConnection {
+                enabled: true,
+                credentials: manual_webhook_creds(),
+            },
+        );
+        save_store(&dir, &store).unwrap();
+
+        let loaded = load_store(&dir);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.get("discord").unwrap().enabled);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn all_integrations_has_unique_ids() {
+        let integrations = all_integrations();
+        let mut seen = std::collections::HashSet::new();
+        for i in &integrations {
+            assert!(
+                seen.insert(i.def().id),
+                "duplicate integration id: {}",
+                i.def().id
+            );
+        }
+    }
+
+    #[test]
+    fn all_integrations_have_nonempty_name() {
+        for i in all_integrations() {
+            assert!(
+                !i.def().name.is_empty(),
+                "integration {} has empty name",
+                i.def().id
+            );
+        }
+    }
+
+    #[test]
+    fn all_integrations_have_nonempty_description() {
+        for i in all_integrations() {
+            assert!(
+                !i.def().description.is_empty(),
+                "integration {} has empty description",
+                i.def().id
+            );
+        }
+    }
+
+    #[test]
+    fn connection_context_header_formats_correctly() {
+        let def = &IntegrationDef {
+            id: "test",
+            name: "Test",
+            icon: "test",
+            category: Category::Productivity,
+            fields: &[],
+            description: "Test integration",
+        };
+        let header = connection_context_header(def, None);
+        assert!(header.contains("## Test (test)"));
+
+        let header_inst = connection_context_header(def, Some("work"));
+        assert!(header_inst.contains("## Test (test, instance: work)"));
+    }
+
+    #[test]
+    fn instance_query_with_instance() {
+        let q = instance_query(Some("my-workspace"));
+        assert_eq!(q, "?instance=my-workspace");
+    }
+
+    #[test]
+    fn instance_query_without_instance() {
+        let q = instance_query(None);
+        assert_eq!(q, "");
+    }
+
+    #[test]
+    fn instance_query_encodes_special_chars() {
+        let q = instance_query(Some("my workspace"));
+        assert_eq!(q, "?instance=my%20workspace");
+    }
+
+    #[tokio::test]
+    async fn connection_manager_find_nonexistent() {
+        let dir = temp_screenpipe_dir();
+        let mgr = ConnectionManager::new(dir.clone(), None);
+        let result = mgr.get_credentials("nonexistent_integration_xyz").await;
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn connect_and_disconnect() {
+        let dir = temp_screenpipe_dir();
+        let mgr = ConnectionManager::new(dir.clone(), None);
+
+        mgr.connect("discord", manual_webhook_creds())
+            .await
+            .unwrap();
+        let creds = mgr.get_credentials("discord").await.unwrap();
+        assert!(creds.is_some());
+
+        mgr.disconnect("discord").await.unwrap();
+        let creds = mgr.get_credentials("discord").await.unwrap();
+        assert!(creds.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

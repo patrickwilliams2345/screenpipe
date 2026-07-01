@@ -69,3 +69,49 @@ impl AudioCaptureHealthEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speaker_silent_constructor() {
+        let e = AudioCaptureHealthEvent::speaker_silent(
+            vec!["Headphones".to_string()],
+            vec!["Speakers".to_string()],
+        );
+        assert_eq!(e.state, AudioCaptureHealthState::SpeakerSilent);
+        assert_eq!(e.rendering_endpoints, vec!["Headphones"]);
+        assert_eq!(e.captured_outputs, vec!["Speakers"]);
+    }
+
+    #[test]
+    fn recovered_constructor() {
+        let e = AudioCaptureHealthEvent::recovered(vec![], vec![]);
+        assert_eq!(e.state, AudioCaptureHealthState::Recovered);
+    }
+
+    #[test]
+    fn event_names() {
+        assert_eq!(
+            AudioCaptureHealthEvent::speaker_silent(vec![], vec![]).event_name(),
+            "audio_capture_health_speaker_silent"
+        );
+        assert_eq!(
+            AudioCaptureHealthEvent::recovered(vec![], vec![]).event_name(),
+            "audio_capture_health_recovered"
+        );
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let e = AudioCaptureHealthEvent::speaker_silent(
+            vec!["WH-1000XM4".to_string()],
+            vec!["Realtek Audio".to_string()],
+        );
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: AudioCaptureHealthEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.state, AudioCaptureHealthState::SpeakerSilent);
+        assert_eq!(parsed.rendering_endpoints.len(), 1);
+    }
+}

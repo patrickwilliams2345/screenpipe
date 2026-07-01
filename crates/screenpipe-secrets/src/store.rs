@@ -567,6 +567,111 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_get_updated_at() {
+        let store = make_store(None).await;
+        store.set("ts:key", b"value").await.unwrap();
+        let ts = store.get_updated_at("ts:key").await.unwrap();
+        assert!(ts.is_some());
+        let ts_str = ts.unwrap();
+        assert!(
+            ts_str.contains("T"),
+            "timestamp should be RFC3339-ish: {}",
+            ts_str
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_updated_at_nonexistent() {
+        let store = make_store(None).await;
+        let ts = store.get_updated_at("no:such:key").await.unwrap();
+        assert!(ts.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_secret_count_zero() {
+        let store = make_store(None).await;
+        store.set("plain:a", b"alpha").await.unwrap();
+        store.set("plain:b", b"bravo").await.unwrap();
+        assert_eq!(store.encrypted_secret_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_secret_count_with_encryption() {
+        let key = [77u8; 32];
+        let store = make_store(Some(key)).await;
+        store.set("enc:a", b"alpha").await.unwrap();
+        store.set("enc:b", b"bravo").await.unwrap();
+        assert_eq!(store.encrypted_secret_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_no_error() {
+        let store = make_store(None).await;
+        store.delete("nonexistent").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_empty_prefix() {
+        let store = make_store(None).await;
+        store.set("a:1", b"v1").await.unwrap();
+        store.set("b:2", b"v2").await.unwrap();
+        let keys = store.list("").await.unwrap();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_no_match() {
+        let store = make_store(None).await;
+        store.set("foo:bar", b"v").await.unwrap();
+        let keys = store.list("baz:").await.unwrap();
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_json_roundtrip_nested() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq)]
+        struct Config {
+            name: String,
+            tags: Vec<String>,
+        }
+
+        let store = make_store(None).await;
+        let cfg = Config {
+            name: "test".to_string(),
+            tags: vec!["a".to_string(), "b".to_string()],
+        };
+        store.set_json("config:test", &cfg).await.unwrap();
+        let retrieved: Config = store.get_json("config:test").await.unwrap().unwrap();
+        assert_eq!(retrieved, cfg);
+    }
+
+    #[tokio::test]
+    async fn test_get_json_nonexistent() {
+        let store = make_store(None).await;
+        let result: Option<String> = store.get_json("no:key").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_binary_data_roundtrip() {
+        let store = make_store(None).await;
+        let binary = vec![0u8, 1, 2, 255, 254, 253, 0, 128];
+        store.set("bin:data", &binary).await.unwrap();
+        let result = store.get("bin:data").await.unwrap().unwrap();
+        assert_eq!(result, binary);
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_binary_data_roundtrip() {
+        let key = [55u8; 32];
+        let store = make_store(Some(key)).await;
+        let binary = vec![0u8, 1, 2, 255, 254, 253, 0, 128];
+        store.set("bin:enc", &binary).await.unwrap();
+        let result = store.get("bin:enc").await.unwrap().unwrap();
+        assert_eq!(result, binary);
+    }
+
     // ── #4263: shared secret-store pool (no ad-hoc per-call connections) ──────
 
     /// `open()` returns a working store backed by the shared pool and creates

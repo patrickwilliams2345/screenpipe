@@ -244,3 +244,174 @@ pub async fn decrypt_data_dir(
     info!("vault unlock: decryption complete");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn migration_progress_fraction_nonzero() {
+        let p = MigrationProgress {
+            total_files: 10,
+            processed_files: 5,
+            total_bytes: 1000,
+            processed_bytes: 500,
+        };
+        assert!((p.fraction() - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn migration_progress_fraction_zero_bytes() {
+        let p = MigrationProgress {
+            total_files: 0,
+            processed_files: 0,
+            total_bytes: 0,
+            processed_bytes: 0,
+        };
+        assert!((p.fraction() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn migration_progress_fraction_complete() {
+        let p = MigrationProgress {
+            total_files: 5,
+            processed_files: 5,
+            total_bytes: 2048,
+            processed_bytes: 2048,
+        };
+        assert!((p.fraction() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn collect_files_empty_dir() {
+        let dir = TempDir::new().unwrap();
+        let files = collect_files(dir.path());
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn collect_files_finds_nested() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        std::fs::write(sub.join("b.txt"), "world").unwrap();
+
+        let files = collect_files(dir.path());
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn collect_files_skips_vault_tmp() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("data.db"), "data").unwrap();
+        std::fs::write(dir.path().join("data.db.vault_tmp"), "tmp").unwrap();
+        std::fs::write(dir.path().join(".vault_journal"), "journal").unwrap();
+
+        let files = collect_files(dir.path());
+        assert_eq!(files.len(), 1);
+        assert!(files[0].file_name().unwrap().to_str().unwrap() == "data.db");
+    }
+
+    #[test]
+    fn load_journal_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join(".vault_journal");
+        let set = load_journal(&journal);
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn journal_append_and_load_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join(".vault_journal");
+
+        journal_append(&journal, Path::new("/data/file1.db")).unwrap();
+        journal_append(&journal, Path::new("/data/file2.db")).unwrap();
+
+        let set = load_journal(&journal);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(Path::new("/data/file1.db")));
+        assert!(set.contains(Path::new("/data/file2.db")));
+    }
+
+    #[test]
+    fn journal_append_is_idempotent_in_set() {
+        let dir = TempDir::new().unwrap();
+        let journal = dir.path().join(".vault_journal");
+
+        journal_append(&journal, Path::new("/data/same.db")).unwrap();
+        journal_append(&journal, Path::new("/data/same.db")).unwrap();
+
+        let set = load_journal(&journal);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn encrypt_decrypt_data_dir_roundtrip() {
+        let screenpipe_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+
+        std::fs::write(data_dir.path().join("test.txt"), "hello world").unwrap();
+        let sub = data_dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("nested.txt"), "nested data").unwrap();
+
+        let _salt = crypto::generate_salt(); // 16 bytes, just for coverage
+        let key: [u8; KEY_SIZE] = [42u8; KEY_SIZE];
+
+        let (tx, _rx) = watch::channel(MigrationProgress {
+            total_files: 0,
+            processed_files: 0,
+            total_bytes: 0,
+            processed_bytes: 0,
+        });
+
+        encrypt_data_dir(screenpipe_dir.path(), data_dir.path(), key, tx)
+            .await
+            .unwrap();
+
+        // Files should be encrypted now
+        let encrypted = std::fs::read(data_dir.path().join("test.txt")).unwrap();
+        assert_ne!(encrypted, b"hello world");
+
+        // Journal should be cleaned up after successful run
+        assert!(!screenpipe_dir.path().join(".vault_journal").exists());
+
+        let (tx2, _rx2) = watch::channel(MigrationProgress {
+            total_files: 0,
+            processed_files: 0,
+            total_bytes: 0,
+            processed_bytes: 0,
+        });
+
+        decrypt_data_dir(screenpipe_dir.path(), data_dir.path(), key, tx2)
+            .await
+            .unwrap();
+
+        let decrypted = std::fs::read_to_string(data_dir.path().join("test.txt")).unwrap();
+        assert_eq!(decrypted, "hello world");
+
+        let nested = std::fs::read_to_string(sub.join("nested.txt")).unwrap();
+        assert_eq!(nested, "nested data");
+    }
+
+    #[tokio::test]
+    async fn encrypt_data_dir_empty() {
+        let screenpipe_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let key: [u8; KEY_SIZE] = [42u8; KEY_SIZE];
+
+        let (tx, _rx) = watch::channel(MigrationProgress {
+            total_files: 0,
+            processed_files: 0,
+            total_bytes: 0,
+            processed_bytes: 0,
+        });
+
+        encrypt_data_dir(screenpipe_dir.path(), data_dir.path(), key, tx)
+            .await
+            .unwrap();
+    }
+}

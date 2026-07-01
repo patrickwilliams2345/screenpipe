@@ -62,3 +62,40 @@ impl DbRecoveryEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_failed_constructor() {
+        let e = DbRecoveryEvent::restart_failed();
+        assert_eq!(e.state, DbRecoveryState::RestartFailed);
+    }
+
+    #[test]
+    fn needs_recovery_constructor() {
+        let e = DbRecoveryEvent::needs_recovery();
+        assert_eq!(e.state, DbRecoveryState::NeedsRecovery);
+    }
+
+    #[test]
+    fn event_names() {
+        assert_eq!(
+            DbRecoveryEvent::restart_failed().event_name(),
+            "db_recovery_restart_failed"
+        );
+        assert_eq!(
+            DbRecoveryEvent::needs_recovery().event_name(),
+            "db_recovery_needs_recovery"
+        );
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let e = DbRecoveryEvent::needs_recovery();
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: DbRecoveryEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.state, DbRecoveryState::NeedsRecovery);
+    }
+}
