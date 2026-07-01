@@ -92,3 +92,84 @@ impl PermissionEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_with_reason() {
+        let e = PermissionEvent::lost(PermissionKind::ScreenRecording, Some("revoked".to_string()));
+        assert_eq!(e.kind, PermissionKind::ScreenRecording);
+        assert_eq!(e.state, PermissionState::Lost);
+        assert_eq!(e.reason, Some("revoked".to_string()));
+    }
+
+    #[test]
+    fn lost_without_reason() {
+        let e = PermissionEvent::lost(PermissionKind::Microphone, None);
+        assert_eq!(e.state, PermissionState::Lost);
+        assert!(e.reason.is_none());
+    }
+
+    #[test]
+    fn restored_has_no_reason() {
+        let e = PermissionEvent::restored(PermissionKind::Accessibility);
+        assert_eq!(e.state, PermissionState::Restored);
+        assert!(e.reason.is_none());
+    }
+
+    #[test]
+    fn needed_has_no_reason() {
+        let e = PermissionEvent::needed(PermissionKind::Keychain);
+        assert_eq!(e.state, PermissionState::Needed);
+        assert!(e.reason.is_none());
+    }
+
+    #[test]
+    fn event_names() {
+        assert_eq!(
+            PermissionEvent::lost(PermissionKind::ScreenRecording, None).event_name(),
+            "permission_lost"
+        );
+        assert_eq!(
+            PermissionEvent::restored(PermissionKind::Microphone).event_name(),
+            "permission_restored"
+        );
+        assert_eq!(
+            PermissionEvent::needed(PermissionKind::Accessibility).event_name(),
+            "permission_needed"
+        );
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let e = PermissionEvent::lost(PermissionKind::ScreenRecording, Some("denied".to_string()));
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: PermissionEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kind, PermissionKind::ScreenRecording);
+        assert_eq!(parsed.state, PermissionState::Lost);
+        assert_eq!(parsed.reason, Some("denied".to_string()));
+    }
+
+    #[test]
+    fn serde_reason_skipped_when_none() {
+        let e = PermissionEvent::restored(PermissionKind::Microphone);
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("reason"));
+    }
+
+    #[test]
+    fn permission_kind_variants() {
+        let kinds = [
+            PermissionKind::ScreenRecording,
+            PermissionKind::Microphone,
+            PermissionKind::Accessibility,
+            PermissionKind::Keychain,
+        ];
+        for kind in kinds {
+            let e = PermissionEvent::needed(kind);
+            assert_eq!(e.kind, kind);
+        }
+    }
+}

@@ -573,4 +573,311 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].title, "No Title");
     }
+
+    #[test]
+    fn normalize_meeting_url_google_meet() {
+        let url = Some("https://meet.google.com/abc-defg-hij".to_string());
+        let result = normalize_meeting_url(url);
+        assert_eq!(
+            result,
+            Some("https://meet.google.com/abc-defg-hij".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_meeting_url_zoom() {
+        let url = Some("https://zoom.us/j/123456789".to_string());
+        assert_eq!(
+            normalize_meeting_url(url),
+            Some("https://zoom.us/j/123456789".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_meeting_url_teams() {
+        let url = Some("https://teams.microsoft.com/l/meetup-join/abc".to_string());
+        assert_eq!(
+            normalize_meeting_url(url),
+            Some("https://teams.microsoft.com/l/meetup-join/abc".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_meeting_url_webex() {
+        let url = Some("https://company.webex.com/meet/john".to_string());
+        assert_eq!(
+            normalize_meeting_url(url),
+            Some("https://company.webex.com/meet/john".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_meeting_url_strips_angle_brackets() {
+        let url = Some("<https://meet.google.com/abc-defg-hij>".to_string());
+        assert_eq!(
+            normalize_meeting_url(url),
+            Some("https://meet.google.com/abc-defg-hij".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_meeting_url_strips_trailing_punctuation() {
+        let url = Some("https://zoom.us/j/123456789).".to_string());
+        assert_eq!(
+            normalize_meeting_url(url),
+            Some("https://zoom.us/j/123456789".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_meeting_url_rejects_non_meeting() {
+        assert!(normalize_meeting_url(Some("https://example.com".to_string())).is_none());
+        assert!(normalize_meeting_url(Some("https://github.com/org/repo".to_string())).is_none());
+    }
+
+    #[test]
+    fn normalize_meeting_url_none_input() {
+        assert!(normalize_meeting_url(None).is_none());
+    }
+
+    #[test]
+    fn normalize_meeting_url_empty_input() {
+        assert!(normalize_meeting_url(Some(String::new())).is_none());
+    }
+
+    #[test]
+    fn normalize_meeting_url_adds_https() {
+        let url = Some("meet.google.com/abc-defg-hij".to_string());
+        let result = normalize_meeting_url(url);
+        assert!(result.unwrap().starts_with("https://"));
+    }
+
+    #[test]
+    fn extract_meeting_url_from_text() {
+        let text = Some("Join at https://meet.google.com/abc-defg-hij for the standup");
+        let result = extract_meeting_url(text);
+        assert_eq!(
+            result,
+            Some("https://meet.google.com/abc-defg-hij".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_meeting_url_no_url() {
+        assert!(extract_meeting_url(Some("No meeting link here")).is_none());
+        assert!(extract_meeting_url(None).is_none());
+    }
+
+    #[test]
+    fn extract_meeting_url_from_angle_brackets() {
+        let text = Some("Location: <https://zoom.us/j/123456789>");
+        assert!(extract_meeting_url(text).is_some());
+    }
+
+    #[test]
+    fn windows_tz_to_iana_known() {
+        assert_eq!(
+            windows_tz_to_iana("Pacific Standard Time"),
+            Some("America/Los_Angeles")
+        );
+        assert_eq!(
+            windows_tz_to_iana("Eastern Standard Time"),
+            Some("America/New_York")
+        );
+        assert_eq!(windows_tz_to_iana("UTC"), Some("Etc/UTC"));
+        assert_eq!(
+            windows_tz_to_iana("Tokyo Standard Time"),
+            Some("Asia/Tokyo")
+        );
+        assert_eq!(
+            windows_tz_to_iana("GMT Standard Time"),
+            Some("Europe/London")
+        );
+        assert_eq!(
+            windows_tz_to_iana("India Standard Time"),
+            Some("Asia/Kolkata")
+        );
+    }
+
+    #[test]
+    fn windows_tz_to_iana_unknown() {
+        assert_eq!(windows_tz_to_iana("Nonexistent Time Zone"), None);
+    }
+
+    #[test]
+    fn resolve_timezone_iana() {
+        assert!(resolve_timezone("America/New_York").is_some());
+        assert!(resolve_timezone("Europe/London").is_some());
+        assert!(resolve_timezone("Asia/Tokyo").is_some());
+    }
+
+    #[test]
+    fn resolve_timezone_windows_name() {
+        assert!(resolve_timezone("Pacific Standard Time").is_some());
+        assert!(resolve_timezone("Eastern Standard Time").is_some());
+    }
+
+    #[test]
+    fn resolve_timezone_invalid() {
+        assert!(resolve_timezone("Not/A/Timezone/At/All").is_none());
+    }
+
+    #[test]
+    fn is_all_day_date_only() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        assert!(is_all_day(&DatePerhapsTime::Date(d)));
+    }
+
+    #[test]
+    fn is_all_day_datetime() {
+        let ndt = chrono::NaiveDate::from_ymd_opt(2026, 7, 1)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap();
+        let dt = ndt.and_utc();
+        assert!(!is_all_day(&DatePerhapsTime::DateTime(
+            CalendarDateTime::Utc(dt)
+        )));
+    }
+
+    #[test]
+    fn parse_ics_calendar_settings_missing_key() {
+        let root = json!({});
+        let settings = parse_ics_calendar_settings(&root).unwrap();
+        assert!(settings.entries.is_empty());
+    }
+
+    #[test]
+    fn parse_ics_calendar_settings_null_value() {
+        let root = json!({"ics_calendars": null});
+        let settings = parse_ics_calendar_settings(&root).unwrap();
+        assert!(settings.entries.is_empty());
+    }
+
+    #[test]
+    fn parse_ics_all_day_event() {
+        let now = Utc::now();
+        let today = now.format("%Y%m%d");
+        let tomorrow = (now + chrono::Duration::days(1)).format("%Y%m%d");
+        let ics_data = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:allday-test\r\nDTSTAMP:20241010T101010Z\r\nDTSTART;VALUE=DATE:{}\r\nDTEND;VALUE=DATE:{}\r\nSUMMARY:Holiday\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            today, tomorrow
+        );
+
+        let events = parse_ics_to_events(&ics_data, "test", now, 24, 24);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_all_day);
+        assert_eq!(events[0].start_display, "All day");
+        assert_eq!(events[0].end_display, "All day");
+        assert_eq!(events[0].source, "ics");
+    }
+
+    #[test]
+    fn parse_ics_event_with_attendees() {
+        let now = Utc::now();
+        let starts_at = now + chrono::Duration::hours(1);
+        let ends_at = now + chrono::Duration::hours(2);
+        let ics_data = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:attendees-test\r\nDTSTAMP:20241010T101010Z\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:Team Standup\r\nATTENDEE:mailto:alice@example.com\r\nATTENDEE:mailto:bob@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            starts_at.format("%Y%m%dT%H%M%SZ"),
+            ends_at.format("%Y%m%dT%H%M%SZ")
+        );
+
+        let events = parse_ics_to_events(&ics_data, "test", now, 0, 8);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].attendees.len(), 2);
+        assert!(events[0]
+            .attendees
+            .contains(&"alice@example.com".to_string()));
+        assert!(events[0].attendees.contains(&"bob@example.com".to_string()));
+    }
+
+    #[test]
+    fn parse_ics_event_with_location() {
+        let now = Utc::now();
+        let starts_at = now + chrono::Duration::hours(1);
+        let ends_at = now + chrono::Duration::hours(2);
+        let ics_data = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:loc-test\r\nDTSTAMP:20241010T101010Z\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:Offsite\r\nLOCATION:Conference Room A\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            starts_at.format("%Y%m%dT%H%M%SZ"),
+            ends_at.format("%Y%m%dT%H%M%SZ")
+        );
+
+        let events = parse_ics_to_events(&ics_data, "test", now, 0, 8);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].location, Some("Conference Room A".to_string()));
+    }
+
+    #[test]
+    fn parse_ics_extracts_meeting_url_from_location() {
+        let now = Utc::now();
+        let starts_at = now + chrono::Duration::hours(1);
+        let ends_at = now + chrono::Duration::hours(2);
+        let ics_data = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:meet-loc-test\r\nDTSTAMP:20241010T101010Z\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:Standup\r\nLOCATION:https://meet.google.com/abc-defg-hij\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            starts_at.format("%Y%m%dT%H%M%SZ"),
+            ends_at.format("%Y%m%dT%H%M%SZ")
+        );
+
+        let events = parse_ics_to_events(&ics_data, "test", now, 0, 8);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].meeting_url,
+            Some("https://meet.google.com/abc-defg-hij".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ics_invalid_data() {
+        let now = Utc::now();
+        let events = parse_ics_to_events("not valid ics", "test", now, 0, 8);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_ics_event_uid_format() {
+        let now = Utc::now();
+        let starts_at = now + chrono::Duration::hours(1);
+        let ends_at = now + chrono::Duration::hours(2);
+        let ics_data = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:my-event-123\r\nDTSTAMP:20241010T101010Z\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            starts_at.format("%Y%m%dT%H%M%SZ"),
+            ends_at.format("%Y%m%dT%H%M%SZ")
+        );
+
+        let events = parse_ics_to_events(&ics_data, "test", now, 0, 8);
+        assert_eq!(events[0].id, "ics-my-event-123");
+    }
+
+    #[test]
+    fn is_encrypted_store_bytes_true() {
+        let mut data = Vec::from(STORE_MAGIC.as_slice());
+        data.extend_from_slice(b"\x00\x00\x00");
+        assert!(is_encrypted_store_bytes(&data));
+    }
+
+    #[test]
+    fn is_encrypted_store_bytes_false_plain_json() {
+        assert!(!is_encrypted_store_bytes(b"{}"));
+    }
+
+    #[test]
+    fn is_encrypted_store_bytes_false_too_short() {
+        assert!(!is_encrypted_store_bytes(b"SP"));
+    }
+
+    #[test]
+    fn missing_store_bin_returns_empty_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = load_ics_calendar_settings_from_store(dir.path()).unwrap();
+        assert!(settings.entries.is_empty());
+    }
+
+    #[test]
+    fn empty_store_bin_returns_empty_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("store.bin"), "   ").unwrap();
+        let settings = load_ics_calendar_settings_from_store(dir.path()).unwrap();
+        assert!(settings.entries.is_empty());
+    }
 }

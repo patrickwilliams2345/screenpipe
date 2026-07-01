@@ -39,3 +39,53 @@ pub struct PowerProfileChangedEvent {
     #[serde(default)]
     pub reason: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn power_profile_event_name_const() {
+        assert_eq!(POWER_PROFILE_CHANGED_EVENT, "power_profile_changed");
+    }
+
+    #[test]
+    fn serde_roundtrip_with_all_fields() {
+        let e = PowerProfileChangedEvent {
+            from: Some("normal".to_string()),
+            to: "saver".to_string(),
+            battery_pct: Some(20),
+            is_downgrade: true,
+            reason: Some("battery_low".to_string()),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: PowerProfileChangedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.from, Some("normal".to_string()));
+        assert_eq!(parsed.to, "saver");
+        assert_eq!(parsed.battery_pct, Some(20));
+        assert!(parsed.is_downgrade);
+        assert_eq!(parsed.reason, Some("battery_low".to_string()));
+    }
+
+    #[test]
+    fn serde_roundtrip_initial_publish() {
+        let e = PowerProfileChangedEvent {
+            from: None,
+            to: "normal".to_string(),
+            battery_pct: None,
+            is_downgrade: false,
+            reason: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: PowerProfileChangedEvent = serde_json::from_str(&json).unwrap();
+        assert!(parsed.from.is_none());
+        assert!(!parsed.is_downgrade);
+    }
+
+    #[test]
+    fn serde_reason_defaults_to_none() {
+        let json = r#"{"from":null,"to":"normal","battery_pct":null,"is_downgrade":false}"#;
+        let parsed: PowerProfileChangedEvent = serde_json::from_str(json).unwrap();
+        assert!(parsed.reason.is_none());
+    }
+}

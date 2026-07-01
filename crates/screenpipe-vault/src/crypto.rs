@@ -395,4 +395,120 @@ mod tests {
         decrypt_file(&path, &key).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"");
     }
+
+    #[test]
+    fn test_decrypt_small_too_short() {
+        let key = generate_master_key();
+        let result = decrypt_small(&[0u8; 5], &key);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encrypt_small_empty() {
+        let key = generate_master_key();
+        let encrypted = encrypt_small(b"", &key).unwrap();
+        let decrypted = decrypt_small(&encrypted, &key).unwrap();
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn test_encrypt_small_large_data() {
+        let key = generate_master_key();
+        let data = vec![0xABu8; 100_000];
+        let encrypted = encrypt_small(&data, &key).unwrap();
+        let decrypted = decrypt_small(&encrypted, &key).unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_is_encrypted_file_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, "not encrypted").unwrap();
+        assert!(!is_encrypted_file(&path).unwrap());
+    }
+
+    #[test]
+    fn test_is_encrypted_file_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enc.bin");
+        let key = generate_master_key();
+        std::fs::write(&path, b"some data").unwrap();
+        encrypt_file(&path, &key).unwrap();
+        assert!(is_encrypted_file(&path).unwrap());
+    }
+
+    #[test]
+    fn test_is_encrypted_file_too_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.bin");
+        std::fs::write(&path, b"SPV").unwrap(); // too short to be our magic
+        assert!(!is_encrypted_file(&path).unwrap());
+    }
+
+    #[test]
+    fn test_generate_salt_unique() {
+        let s1 = generate_salt();
+        let s2 = generate_salt();
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn test_generate_master_key_unique() {
+        let k1 = generate_master_key();
+        let k2 = generate_master_key();
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_key_derivation_different_salts() {
+        let salt1 = generate_salt();
+        let salt2 = generate_salt();
+        let key1 = derive_key("password", &salt1).unwrap();
+        let key2 = derive_key("password", &salt2).unwrap();
+        assert_ne!(key1.as_ref(), key2.as_ref());
+    }
+
+    #[test]
+    fn test_chunk_nonce_distinct() {
+        let base = [1u8; 12];
+        let n0 = chunk_nonce(&base, 0);
+        let n1 = chunk_nonce(&base, 1);
+        let n2 = chunk_nonce(&base, 2);
+        assert_ne!(n0, n1);
+        assert_ne!(n1, n2);
+        assert_ne!(n0, n2);
+    }
+
+    #[test]
+    fn test_chunk_nonce_deterministic() {
+        let base = [42u8; 12];
+        let n1 = chunk_nonce(&base, 7);
+        let n2 = chunk_nonce(&base, 7);
+        assert_eq!(n1, n2);
+    }
+
+    #[test]
+    fn test_encrypt_small_tampered() {
+        let key = generate_master_key();
+        let mut encrypted = encrypt_small(b"hello", &key).unwrap();
+        // Tamper with the ciphertext portion (after the nonce)
+        if encrypted.len() > NONCE_SIZE + 1 {
+            encrypted[NONCE_SIZE + 1] ^= 0xFF;
+        }
+        assert!(decrypt_small(&encrypted, &key).is_err());
+    }
+
+    #[test]
+    fn test_file_exactly_chunk_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact_chunk.bin");
+        let key = generate_master_key();
+        let original = vec![0x42u8; CHUNK_SIZE];
+
+        std::fs::write(&path, &original).unwrap();
+        encrypt_file(&path, &key).unwrap();
+        decrypt_file(&path, &key).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
 }

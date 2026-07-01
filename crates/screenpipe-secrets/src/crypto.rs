@@ -51,4 +51,58 @@ mod tests {
         let result = decrypt(&ciphertext, &nonce, &wrong_key);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_empty_plaintext() {
+        let key = [42u8; 32];
+        let (ciphertext, nonce) = encrypt(b"", &key).unwrap();
+        let decrypted = decrypt(&ciphertext, &nonce, &key).unwrap();
+        assert!(decrypted.is_empty());
+    }
+
+    #[test]
+    fn test_large_plaintext() {
+        let key = [42u8; 32];
+        let plaintext = vec![0xABu8; 1024 * 1024]; // 1 MB
+        let (ciphertext, nonce) = encrypt(&plaintext, &key).unwrap();
+        let decrypted = decrypt(&ciphertext, &nonce, &key).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_unique_nonces() {
+        let key = [42u8; 32];
+        let plaintext = b"same data";
+        let (_, nonce1) = encrypt(plaintext, &key).unwrap();
+        let (_, nonce2) = encrypt(plaintext, &key).unwrap();
+        assert_ne!(nonce1, nonce2);
+    }
+
+    #[test]
+    fn test_wrong_nonce_fails() {
+        let key = [42u8; 32];
+        let plaintext = b"secret";
+        let (ciphertext, _nonce) = encrypt(plaintext, &key).unwrap();
+        let wrong_nonce = [0u8; 12];
+        assert!(decrypt(&ciphertext, &wrong_nonce, &key).is_err());
+    }
+
+    #[test]
+    fn test_tampered_ciphertext_fails() {
+        let key = [42u8; 32];
+        let plaintext = b"sensitive";
+        let (mut ciphertext, nonce) = encrypt(plaintext, &key).unwrap();
+        ciphertext[0] ^= 0xFF;
+        assert!(decrypt(&ciphertext, &nonce, &key).is_err());
+    }
+
+    #[test]
+    fn test_ciphertext_differs_from_plaintext() {
+        let key = [42u8; 32];
+        let plaintext = b"hello world";
+        let (ciphertext, _) = encrypt(plaintext, &key).unwrap();
+        assert_ne!(ciphertext.as_slice(), plaintext.as_slice());
+        // ciphertext includes 16-byte auth tag
+        assert!(ciphertext.len() > plaintext.len());
+    }
 }

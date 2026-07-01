@@ -19,3 +19,36 @@ pub struct PipeCompletedEvent {
     pub duration_secs: f64,
     pub timestamp: DateTime<Utc>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_completed_serde_roundtrip() {
+        let e = PipeCompletedEvent {
+            pipe_name: "meeting-notes".to_string(),
+            success: true,
+            duration_secs: 1.5,
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: PipeCompletedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pipe_name, "meeting-notes");
+        assert!(parsed.success);
+        assert!((parsed.duration_secs - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pipe_completed_failure() {
+        let e = PipeCompletedEvent {
+            pipe_name: "broken-pipe".to_string(),
+            success: false,
+            duration_secs: 0.01,
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: PipeCompletedEvent = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.success);
+    }
+}

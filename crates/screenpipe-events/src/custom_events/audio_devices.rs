@@ -119,3 +119,83 @@ impl AudioDeviceStatusChangedEvent {
         "audio_device_status_changed"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_engaged_sets_state() {
+        let e = AudioDeviceFallbackEvent::engaged("AirPods (input)", "MacBook Mic");
+        assert_eq!(e.state, AudioDeviceFallbackState::Engaged);
+        assert_eq!(e.pinned_device, "AirPods (input)");
+        assert_eq!(e.fallback_device, "MacBook Mic");
+    }
+
+    #[test]
+    fn fallback_cleared_sets_state() {
+        let e = AudioDeviceFallbackEvent::cleared("AirPods (input)", "MacBook Mic");
+        assert_eq!(e.state, AudioDeviceFallbackState::Cleared);
+    }
+
+    #[test]
+    fn fallback_unavailable_sets_empty_fallback() {
+        let e = AudioDeviceFallbackEvent::unavailable("AirPods (input)");
+        assert_eq!(e.state, AudioDeviceFallbackState::Unavailable);
+        assert!(e.fallback_device.is_empty());
+    }
+
+    #[test]
+    fn fallback_event_names() {
+        assert_eq!(
+            AudioDeviceFallbackEvent::engaged("a", "b").event_name(),
+            "audio_device_fallback_engaged"
+        );
+        assert_eq!(
+            AudioDeviceFallbackEvent::cleared("a", "b").event_name(),
+            "audio_device_fallback_cleared"
+        );
+        assert_eq!(
+            AudioDeviceFallbackEvent::unavailable("a").event_name(),
+            "audio_device_fallback_unavailable"
+        );
+    }
+
+    #[test]
+    fn status_started() {
+        let e = AudioDeviceStatusChangedEvent::started("MacBook Air Microphone (input)");
+        assert!(e.is_running);
+        assert!(!e.is_user_disabled);
+        assert_eq!(e.device_name, "MacBook Air Microphone (input)");
+    }
+
+    #[test]
+    fn status_stopped() {
+        let e = AudioDeviceStatusChangedEvent::stopped("MacBook Air Microphone (input)");
+        assert!(!e.is_running);
+        assert!(e.is_user_disabled);
+    }
+
+    #[test]
+    fn status_event_name() {
+        let e = AudioDeviceStatusChangedEvent::started("mic");
+        assert_eq!(e.event_name(), "audio_device_status_changed");
+    }
+
+    #[test]
+    fn fallback_event_serde_roundtrip() {
+        let e = AudioDeviceFallbackEvent::engaged("AirPods", "MacBook Mic");
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: AudioDeviceFallbackEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.state, AudioDeviceFallbackState::Engaged);
+        assert_eq!(parsed.pinned_device, "AirPods");
+    }
+
+    #[test]
+    fn status_event_serde_roundtrip() {
+        let e = AudioDeviceStatusChangedEvent::started("mic");
+        let json = serde_json::to_string(&e).unwrap();
+        let parsed: AudioDeviceStatusChangedEvent = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_running);
+    }
+}
