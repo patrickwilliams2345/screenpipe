@@ -178,7 +178,9 @@ impl VaultManager {
         tokio::spawn(async move {
             // Write sentinel FIRST — if we crash mid-encryption, startup
             // still knows the vault is locked and won't try to open the DB.
-            let _ = std::fs::write(&sentinel, "locked");
+            if let Err(e) = std::fs::write(&sentinel, "locked") {
+                tracing::error!("failed to write vault lock sentinel: {}", e);
+            }
 
             // Encrypt DB file (must be closed by caller already)
             if db_path.exists() {
@@ -190,7 +192,9 @@ impl VaultManager {
                 for ext in &["sqlite-wal", "sqlite-shm"] {
                     let p = db_path.with_extension(ext);
                     if p.exists() {
-                        let _ = crypto::encrypt_file(&p, &key_bytes);
+                        if let Err(e) = crypto::encrypt_file(&p, &key_bytes) {
+                            tracing::error!("failed to encrypt db.{}: {}", ext, e);
+                        }
                     }
                 }
             }
@@ -279,7 +283,9 @@ impl VaultManager {
                 for ext in &["sqlite-wal", "sqlite-shm"] {
                     let p = db_path.with_extension(ext);
                     if p.exists() {
-                        let _ = crypto::decrypt_file(&p, &key_bytes);
+                        if let Err(e) = crypto::decrypt_file(&p, &key_bytes) {
+                            tracing::error!("failed to decrypt db.{}: {}", ext, e);
+                        }
                     }
                 }
             }

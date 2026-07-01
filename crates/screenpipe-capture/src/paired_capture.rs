@@ -264,7 +264,13 @@ pub async fn paired_capture(
     } else {
         match tree_snapshot {
             Some(snap) if !snap.text_content.is_empty() => {
-                let json = serde_json::to_string(&snap.nodes).ok();
+                let json = match serde_json::to_string(&snap.nodes) {
+                    Ok(j) => Some(j),
+                    Err(e) => {
+                        tracing::warn!("failed to serialize accessibility tree nodes: {}", e);
+                        None
+                    }
+                };
                 (
                     Some(snap.text_content.clone()),
                     json,

@@ -259,9 +259,11 @@ pub async fn pipe_store_install(
         Err(e) => return Json(json!({ "error": format!("failed to install pipe: {}", e) })),
     };
 
-    // 3. Increment install count on registry (fire and forget)
+    // 3. Increment install count on registry (best-effort)
     let increment_url = format!("{}/api/pipes/store/{}/install", base, body.slug);
-    let _ = client.post(&increment_url).send().await;
+    if let Err(e) = client.post(&increment_url).send().await {
+        tracing::debug!("failed to increment install count for {}: {}", body.slug, e);
+    }
 
     Json(json!({ "success": true, "name": name, "slug": body.slug, "connections": connections }))
 }

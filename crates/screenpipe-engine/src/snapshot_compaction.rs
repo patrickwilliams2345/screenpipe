@@ -235,7 +235,12 @@ async fn compact_chunk(
                     device_name
                 );
                 for batch in ids.chunks(100) {
-                    let _ = db.clear_snapshot_paths_queued(batch.to_vec()).await;
+                    if let Err(e) = db.clear_snapshot_paths_queued(batch.to_vec()).await {
+                        warn!(
+                            "snapshot compaction: failed to clear stale snapshot_path entries: {}",
+                            e
+                        );
+                    }
                 }
                 return Ok(None);
             }
@@ -274,7 +279,12 @@ async fn compact_chunk(
             );
             // Route through write queue instead of read pool to avoid
             // unserialized writes that cause WAL contention and pool exhaustion.
-            let _ = db.clear_snapshot_paths_queued(vec![*frame_id]).await;
+            if let Err(e) = db.clear_snapshot_paths_queued(vec![*frame_id]).await {
+                warn!(
+                    "snapshot compaction: failed to clear missing snapshot DB pointer: {}",
+                    e
+                );
+            }
             continue;
         }
 
@@ -300,7 +310,9 @@ async fn compact_chunk(
     finish_ffmpeg_process(child, Some(stdin)).await;
 
     if encoded_frames.is_empty() {
-        let _ = tokio::fs::remove_file(&mp4_path).await;
+        if let Err(e) = tokio::fs::remove_file(&mp4_path).await {
+            debug!("snapshot compaction: failed to remove empty MP4: {}", e);
+        }
         return Ok(None);
     }
 
@@ -308,7 +320,9 @@ async fn compact_chunk(
     let mp4_size = match tokio::fs::metadata(&mp4_path).await {
         Ok(m) if m.len() > 0 => m.len(),
         Ok(_) => {
-            let _ = tokio::fs::remove_file(&mp4_path).await;
+            if let Err(e) = tokio::fs::remove_file(&mp4_path).await {
+                warn!("snapshot compaction: failed to remove empty MP4: {}", e);
+            }
             return Err(anyhow::anyhow!("ffmpeg produced empty MP4"));
         }
         Err(_) => {

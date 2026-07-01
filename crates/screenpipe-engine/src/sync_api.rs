@@ -139,9 +139,15 @@ async fn sync_init_inner(
                     max_blobs_per_cycle: 10,
                     sync_on_startup: true,
                 };
-                let _ = rt.service_handle.update_config(cfg).await;
-                let _ = rt.service_handle.resume().await;
-                let _ = rt.service_handle.sync_now().await;
+                if let Err(e) = rt.service_handle.update_config(cfg).await {
+                    warn!("sync upgrade: failed to update config: {}", e);
+                }
+                if let Err(e) = rt.service_handle.resume().await {
+                    warn!("sync upgrade: failed to resume service: {}", e);
+                }
+                if let Err(e) = rt.service_handle.sync_now().await {
+                    warn!("sync upgrade: failed to trigger sync: {}", e);
+                }
                 return Ok(SyncInitResponse {
                     success: true,
                     is_new_user: false,

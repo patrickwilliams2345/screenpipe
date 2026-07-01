@@ -12,7 +12,7 @@ use oasgen::{oasgen, OaSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::server::AppState;
 
@@ -172,8 +172,14 @@ pub(crate) async fn evict_media_handler(
                     Err(e) => warn!("failed to evict video file {}: {}", path, e),
                 }
             }
-            Err(_) => {
-                let _ = std::fs::remove_file(path);
+            Err(e) => {
+                debug!(
+                    "metadata unavailable for video file {}, attempting removal: {}",
+                    path, e
+                );
+                if std::fs::remove_file(path).is_ok() {
+                    video_files_deleted += 1;
+                }
             }
         }
     }
@@ -191,8 +197,14 @@ pub(crate) async fn evict_media_handler(
                     Err(e) => warn!("failed to evict audio file {}: {}", path, e),
                 }
             }
-            Err(_) => {
-                let _ = std::fs::remove_file(path);
+            Err(e) => {
+                debug!(
+                    "metadata unavailable for audio file {}, attempting removal: {}",
+                    path, e
+                );
+                if std::fs::remove_file(path).is_ok() {
+                    audio_files_deleted += 1;
+                }
             }
         }
     }
@@ -207,8 +219,14 @@ pub(crate) async fn evict_media_handler(
                     bytes_freed = bytes_freed.saturating_add(size);
                 }
             }
-            Err(_) => {
-                let _ = std::fs::remove_file(path);
+            Err(e) => {
+                debug!(
+                    "metadata unavailable for snapshot file {}, attempting removal: {}",
+                    path, e
+                );
+                if std::fs::remove_file(path).is_ok() {
+                    snapshot_files_deleted += 1;
+                }
             }
         }
     }
@@ -455,7 +473,12 @@ pub(crate) async fn backup_handler(
 
     state.db.backup_to(&dest).await.map_err(|e| {
         // Clean up partial file on failure
-        let _ = std::fs::remove_file(&dest);
+        if let Err(cleanup_err) = std::fs::remove_file(&dest) {
+            warn!(
+                "failed to clean up partial backup file {}: {}",
+                dest, cleanup_err
+            );
+        }
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             JsonResponse(json!({"error": format!("backup failed: {}", e)})),

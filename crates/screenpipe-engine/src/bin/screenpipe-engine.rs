@@ -1461,7 +1461,9 @@ async fn main() -> anyhow::Result<()> {
     if config.api_auth {
         pipe_manager.set_local_api_key(config.api_auth_key.clone());
     }
-    pipe_manager.install_builtin_pipes().ok();
+    if let Err(e) = pipe_manager.install_builtin_pipes() {
+        tracing::warn!("failed to install builtin pipes: {}", e);
+    }
     if let Err(e) = pipe_manager.load_pipes().await {
         tracing::warn!("failed to load pipes: {}", e);
     }

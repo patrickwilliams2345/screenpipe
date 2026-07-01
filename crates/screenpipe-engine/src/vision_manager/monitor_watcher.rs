@@ -394,7 +394,7 @@ pub async fn start_monitor_watcher(
                          no frame persisted for {}s — restarting VisionManager (#3939)",
                         reason, attempt_age, db_stale
                     );
-                    let _ = screenpipe_events::send_event(
+                    if let Err(e) = screenpipe_events::send_event(
                         "vision_capture_wedge_restart",
                         serde_json::json!({
                             "reason": reason,
@@ -402,7 +402,9 @@ pub async fn start_monitor_watcher(
                             "attempt_age_secs": attempt_age,
                             "uptime_secs": snap.uptime_secs,
                         }),
-                    );
+                    ) {
+                        debug!("failed to send vision_capture_wedge_restart event: {}", e);
+                    }
                     if let Err(e) = vision_manager.stop().await {
                         warn!("wedge watchdog: vision stop failed: {:?}", e);
                     }
@@ -561,14 +563,16 @@ pub async fn start_monitor_watcher(
                 suppress_next_topology_event = false;
             } else if !initial_pass && (!added.is_empty() || !removed.is_empty()) {
                 let active_count = vision_manager.active_monitors().await.len();
-                let _ = screenpipe_events::send_event(
+                if let Err(e) = screenpipe_events::send_event(
                     "monitor_topology_changed",
                     serde_json::json!({
                         "added": added,
                         "removed": removed,
                         "active_count": active_count,
                     }),
-                );
+                ) {
+                    debug!("failed to send monitor_topology_changed event: {}", e);
+                }
             }
 
             // Wait for the next display reconfiguration event. On macOS the
