@@ -1379,20 +1379,33 @@ impl DatabaseManager {
     /// insufficient disk VACUUM errors (surfaced as 500) without corrupting
     /// anything.
     pub async fn compact(&self) -> Result<(), sqlx::Error> {
-        let _write_guard = self.write_semaphore.acquire().await.ok();
+        let _write_guard = self
+            .write_semaphore
+            .acquire()
+            .await
+            .map_err(|_| sqlx::Error::PoolClosed)?;
 
         let mut conn = self.pool.acquire().await?;
-        let _ = sqlx::query("PRAGMA busy_timeout = 60000")
+        if let Err(e) = sqlx::query("PRAGMA busy_timeout = 60000")
             .execute(&mut *conn)
-            .await;
-        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .await
+        {
+            tracing::warn!("compact: failed to set busy_timeout: {}", e);
+        }
+        if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&mut *conn)
-            .await;
+            .await
+        {
+            tracing::warn!("compact: wal_checkpoint failed: {}", e);
+        }
         let result = sqlx::query("VACUUM").execute(&mut *conn).await.map(|_| ());
         // Restore the default busy_timeout on this pooled connection.
-        let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+        if let Err(e) = sqlx::query("PRAGMA busy_timeout = 5000")
             .execute(&mut *conn)
-            .await;
+            .await
+        {
+            tracing::warn!("compact: failed to restore busy_timeout: {}", e);
+        }
         result
     }
 }

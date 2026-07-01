@@ -200,7 +200,9 @@ pub fn report_state(kind: PermissionKind, now_granted: bool, reason: Option<&str
         );
         PermissionEvent::lost(kind, reason.map(str::to_owned))
     };
-    let _ = send_event(evt.event_name(), evt);
+    if let Err(e) = send_event(evt.event_name(), evt) {
+        tracing::debug!("failed to send permission event: {}", e);
+    }
 }
 
 /// Notify the monitor that the system just woke from sleep. Suppresses

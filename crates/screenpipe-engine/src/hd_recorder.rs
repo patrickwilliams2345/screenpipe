@@ -247,7 +247,13 @@ mod macos {
         //   <base>/<YYYY-MM-DD>/hd_<device>_<ms>.mp4
         let chunk_start = Utc::now();
         let dir = data_base_dir.join(chunk_start.format("%Y-%m-%d").to_string());
-        tokio::fs::create_dir_all(&dir).await.ok();
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            tracing::error!(
+                "hd recorder: failed to create data dir {}: {}",
+                dir.display(),
+                e
+            );
+        }
         let file = dir.join(format!(
             "hd_{}_{}.mp4",
             device_name,

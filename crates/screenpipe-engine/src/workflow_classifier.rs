@@ -136,7 +136,7 @@ pub async fn start_workflow_classifier(
             result.confidence * 100.0,
             result.description
         );
-        let _ = screenpipe_events::send_event(
+        if let Err(e) = screenpipe_events::send_event(
             "workflow_event",
             WorkflowEvent {
                 event_type: result.event.clone(),
@@ -145,7 +145,9 @@ pub async fn start_workflow_classifier(
                 activities,
                 timestamp: chrono::Utc::now(),
             },
-        );
+        ) {
+            tracing::debug!("failed to send workflow_event: {}", e);
+        }
         last_event = Some((result.event, Instant::now()));
     }
 }
