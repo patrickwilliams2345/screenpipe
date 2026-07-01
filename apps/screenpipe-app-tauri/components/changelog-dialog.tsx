@@ -9,6 +9,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { CodeBlock } from "./ui/codeblock";
 import { Sparkles, Wrench, Bug, ExternalLink } from "lucide-react";
+import { formatDateFull } from "@/lib/utils/date-format";
 
 interface ChangelogEntry {
   version: string;
@@ -72,14 +73,7 @@ function CategorySection({
   );
 }
 
-function formatDate(dateStr: string): string {
-  try {
-    const d = new Date(dateStr + "T00:00:00");
-    return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-  } catch {
-    return dateStr;
-  }
-}
+
 
 export const ChangelogDialog: React.FC = () => {
   const [entries, setEntries] = useState<ChangelogEntry[] | null>(null);
@@ -134,7 +128,7 @@ export const ChangelogDialog: React.FC = () => {
                 <div key={entry.version} className="pb-6 border-b border-border/40 last:border-b-0">
                   <div className="flex items-baseline gap-3 mb-2">
                     <span className="font-mono text-sm font-semibold">v{entry.version}</span>
-                    <span className="text-xs text-muted-foreground">{formatDate(entry.date)}</span>
+                    <span className="text-xs text-muted-foreground">{formatDateFull(entry.date)}</span>
                   </div>
                   {entry.summary && (
                     <p className="text-sm text-foreground/80 mb-2">{entry.summary}</p>

@@ -20,6 +20,7 @@ import {
   isSteeredAssistantMessage,
 } from "@/lib/chat/message-rendering";
 import { cn } from "@/lib/utils";
+import { formatTime } from "@/lib/utils/meeting-format";
 import type { Message } from "@/lib/chat/types";
 import type { MarkdownCitationPlan } from "@/lib/chat/markdown-export";
 
@@ -329,7 +330,7 @@ export function ChatMessageList({
                               </PopoverTrigger>
                               <PopoverContent className="w-48 p-1" align="end" side="top">
                                 <div className="text-xs text-muted-foreground px-2 py-1 mb-1">
-                                  {new Date(message.timestamp).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                                  {formatTime(new Date(message.timestamp).toISOString())}
                                 </div>
                                 {!message.content.includes("used all your free queries") &&
                                   !message.content.startsWith("Error") &&

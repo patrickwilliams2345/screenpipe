@@ -29,6 +29,7 @@ use crate::meeting_telemetry::{
 use crate::routes::meetings::{emit_meeting_status_changed, resolve_meeting_status_from};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt};
+use screenpipe_core::time::iso_now;
 use screenpipe_db::{DatabaseManager, MEETING_END_REASON_AUTO_END, MEETING_END_REASON_SHUTDOWN};
 use screenpipe_events::subscribe_to_event;
 use serde::{Deserialize, Serialize};
@@ -3060,9 +3061,7 @@ pub async fn run_meeting_detection_loop(
                     | MeetingState::Ending { meeting_id, .. } = &state
                 {
                     if *meeting_id >= 0 {
-                        let now = Utc::now()
-                            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                            .to_string();
+                        let now = iso_now();
                         if let Err(e) = db
                             .end_meeting(*meeting_id, &now, Some(MEETING_END_REASON_SHUTDOWN))
                             .await
@@ -3116,7 +3115,7 @@ pub async fn run_meeting_detection_loop(
             );
 
             if manual_matches || detector_matches {
-                let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                let now = iso_now();
                 match db
                     .end_meeting_with_typed_text(
                         request.meeting_id,
@@ -3301,7 +3300,7 @@ pub async fn run_meeting_detection_loop(
             }
             state = new_state;
             if let Some(meeting_id) = ended_id {
-                let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                let now = iso_now();
                 match db
                     .end_meeting_with_typed_text(meeting_id, &now, true, None)
                     .await
@@ -3571,7 +3570,7 @@ pub async fn run_meeting_detection_loop(
                         // the Ending grace period elapsed). Leave end_reason
                         // NULL so the merge window still applies if the user
                         // rejoins the same call within ~120s.
-                        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                        let now = iso_now();
                         match db
                             .end_meeting_with_typed_text(meeting_id, &now, true, None)
                             .await
