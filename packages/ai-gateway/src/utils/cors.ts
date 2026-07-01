@@ -7,7 +7,6 @@ export function addCorsHeaders(response: Response): Response {
   response.headers.set('Access-Control-Allow-Origin', '*');
   response.headers.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
   response.headers.set('Access-Control-Allow-Headers', '*');
-  response.headers.set('Access-Control-Allow-Credentials', 'true');
   response.headers.set('Access-Control-Max-Age', '86400');
   response.headers.append('Vary', 'Origin');
   return response;
@@ -62,7 +61,6 @@ export function createSuccessResponse(body: string | object, status = 200): Resp
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': '*',
-      'Access-Control-Allow-Credentials': 'true',
       'Access-Control-Max-Age': '86400',
       'Content-Type': contentType,
     },
@@ -86,7 +84,6 @@ export function createErrorResponse(status: number, message: string): Response {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': '*',
-        'Access-Control-Allow-Credentials': 'true',
         'Access-Control-Max-Age': '86400',
         'Content-Type': 'application/json',
       },
