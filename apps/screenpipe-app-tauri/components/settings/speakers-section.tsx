@@ -4,6 +4,7 @@
 "use client";
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
+import { formatTimeAgo } from "@/lib/utils/date-format";
 import type { SettingsField } from "./settings-search";
 
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
@@ -81,16 +82,7 @@ function parseSamples(metadata: string): AudioSample[] {
   }
 }
 
-function formatTimeAgo(timestamp: number): string {
-  if (!timestamp) return "";
-  const now = Date.now() / 1000;
-  const diff = now - timestamp;
-  if (diff < 60) return "just now";
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
-  return new Date(timestamp * 1000).toLocaleDateString();
-}
+
 
 function getLatestSampleTime(speaker: Speaker): number {
   const samples = parseSamples(speaker.metadata);
@@ -389,7 +381,7 @@ function ClusterCard({
               {latestTime > 0 && (
                 <span className="text-[10px] text-muted-foreground flex items-center gap-1">
                   <Clock className="h-2.5 w-2.5" />
-                  {formatTimeAgo(latestTime)}
+                  {formatTimeAgo(latestTime * 1000)}
                 </span>
               )}
             </div>
@@ -548,7 +540,7 @@ function IdentifiedSpeakerCard({
               </span>
               {latestTime > 0 && (
                 <span className="text-[10px] text-muted-foreground">
-                  {formatTimeAgo(latestTime)}
+                  {formatTimeAgo(latestTime * 1000)}
                 </span>
               )}
             </div>
@@ -686,7 +678,7 @@ function SpeakerDetail({
             </span>
             {s.timestamp && s.timestamp > 0 && (
               <span className="text-[10px] text-muted-foreground shrink-0">
-                {formatTimeAgo(s.timestamp)}
+                {formatTimeAgo((s.timestamp ?? 0) * 1000)}
               </span>
             )}
           </div>

@@ -17,6 +17,7 @@ import { loadAllConversations } from "@/lib/chat-storage";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { readTextFile, writeTextFile, exists } from "@tauri-apps/plugin-fs";
 import { localFetch } from "@/lib/api";
+import { formatTimeAgo } from "@/lib/utils/date-format";
 
 type TimeRange = "day" | "week" | "month" | "all";
 
@@ -298,16 +299,7 @@ export function UsageSection() {
     ? entries.filter((e) => e.source === "chat" && e.timestamp >= since).length
     : entries.filter((e) => e.source === "chat").length;
 
-  const formatDate = (ts: number) => {
-    const d = new Date(ts);
-    const now = new Date();
-    const diff = now.getTime() - d.getTime();
-    if (diff < 60000) return "just now";
-    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-    if (diff < 604800000) return `${Math.floor(diff / 86400000)}d ago`;
-    return d.toLocaleDateString();
-  };
+
 
   const providerLabel = (p: string) => {
     switch (p) {
@@ -462,7 +454,7 @@ export function UsageSection() {
                   </div>
                   <div className="flex items-center gap-3 shrink-0">
                     <span className="text-xs text-muted-foreground">
-                      {formatDate(u.lastUsed)}
+                      {formatTimeAgo(u.lastUsed)}
                     </span>
                     <span className="font-mono font-medium w-12 text-right">
                       {u.count}

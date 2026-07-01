@@ -61,6 +61,7 @@ import {
   formatDuration,
   type MeetingRecord,
 } from "@/lib/utils/meeting-format";
+import { formatDateShort, formatElapsed } from "@/lib/utils/date-format";
 import type {
   LiveCaptureDevice,
   LiveCaptureState,
@@ -932,7 +933,7 @@ export function NoteView({
   const dockDuration = isLive
     ? formatElapsed(meeting.meeting_start, nowMs)
     : formatDuration(meeting.meeting_start, meeting.meeting_end);
-  const meetingDateLabel = formatDateOnly(meeting.meeting_start);
+  const meetingDateLabel = formatDateShort(meeting.meeting_start);
   const meetingStartClock = formatClock(meeting.meeting_start);
   const meetingEndClock = meeting.meeting_end
     ? formatClock(meeting.meeting_end)
@@ -1848,28 +1849,7 @@ function SaveIndicator({ state }: { state: SaveState }) {
   return <span aria-hidden>&nbsp;</span>;
 }
 
-function formatElapsed(startIso: string, nowMs: number): string {
-  const startMs = new Date(startIso).getTime();
-  if (!Number.isFinite(startMs)) return "00:00";
-  const totalSeconds = Math.max(0, Math.floor((nowMs - startMs) / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  const pad = (n: number) => String(n).padStart(2, "0");
 
-  if (hours > 0) {
-    return `${hours}:${pad(minutes)}:${pad(seconds)}`;
-  }
-
-  return `${pad(minutes)}:${pad(seconds)}`;
-}
-
-function formatDateOnly(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-  });
-}
 
 function transcriptOpenPreferenceKey(meetingId: number): string {
   return `screenpipe:meeting:${meetingId}:transcript-open`;

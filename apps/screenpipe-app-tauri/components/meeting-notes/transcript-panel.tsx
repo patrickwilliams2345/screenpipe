@@ -34,6 +34,7 @@ import {
   type MeetingAudioChunk,
 } from "@/lib/utils/meeting-context";
 import type { MeetingRecord } from "@/lib/utils/meeting-format";
+import { formatClockMs } from "@/lib/utils/date-format";
 import { ListeningSticks } from "./listening-sticks";
 import { splitForHighlight } from "./transcript-highlight";
 
@@ -246,12 +247,7 @@ function liveBlockToSpeakerBlock(
   };
 }
 
-function formatClock(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
+
 
 function liveErrorSummary(message: string | null): string {
   const lower = (message ?? "").toLowerCase();
@@ -638,7 +634,7 @@ export function TranscriptPanel({
   const handleCopy = async () => {
     if (displayBlocks.length === 0) return;
     const text = displayBlocks
-      .map((b) => `[${formatClock(b.startMs)}] ${b.speakerName}\n${b.text}`)
+      .map((b) => `[${formatClockMs(b.startMs)}] ${b.speakerName}\n${b.text}`)
       .join("\n\n");
     try {
       await commands.copyTextToClipboard(text);
@@ -1028,7 +1024,7 @@ function SpeakerParagraph({
           className="shrink-0 text-[10px] tabular-nums text-muted-foreground/60"
           title={new Date(block.startMs).toLocaleString()}
         >
-          {formatClock(block.startMs)}
+          {formatClockMs(block.startMs)}
         </span>
         {block.firstAudioFilePath && (
           <button

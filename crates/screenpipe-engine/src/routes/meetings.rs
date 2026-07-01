@@ -15,6 +15,7 @@ use screenpipe_db::{MeetingRecord, MeetingTranscriptSegment, MEETING_END_REASON_
 use crate::meeting_telemetry::{capture_detection_decision, capture_detection_feedback};
 use crate::server::AppState;
 use chrono::{DateTime, Utc};
+use screenpipe_core::time::iso_now;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -766,7 +767,7 @@ pub(crate) async fn stop_meeting_handler(
         })?,
     };
 
-    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    let now = iso_now();
 
     // Release runtime state BEFORE persisting. An explicit stop is a runtime
     // intent — the audio batch-deferral flag and detector tracking must release
