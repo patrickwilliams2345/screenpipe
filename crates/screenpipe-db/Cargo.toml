@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 
 screenpipe-config = { path = "../screenpipe-config" }
+screenpipe-core = { path = "../screenpipe-core" }
 zerocopy = { version = "0.7.32" }
 
 tokio = { workspace = true }
@@ -35,7 +36,6 @@ regex = { workspace = true }
 once_cell = { workspace = true }
 
 [dev-dependencies]
-screenpipe-core = { path = "../screenpipe-core" }
 screenpipe-secrets = { path = "../screenpipe-secrets" }
 tempfile = { workspace = true }
 
