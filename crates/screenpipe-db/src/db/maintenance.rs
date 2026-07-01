@@ -1354,7 +1354,10 @@ impl DatabaseManager {
     /// Create an atomic backup of the database using `VACUUM INTO`.
     /// The destination path must not already exist.
     pub async fn backup_to(&self, dest: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(&format!("VACUUM INTO '{}'", dest.replace('\'', "''")))
+        // Use a parameter bind instead of string interpolation to prevent
+        // SQL injection through a crafted destination path.
+        sqlx::query("VACUUM INTO ?1")
+            .bind(dest)
             .execute(&self.pool)
             .await?;
         Ok(())

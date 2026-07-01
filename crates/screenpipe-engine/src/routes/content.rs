@@ -602,6 +602,34 @@ fn validate_raw_sql(query: &str) -> Result<(), String> {
         .join(" ");
     let upper = normalized.to_uppercase();
 
+    // Block dangerous statements that can escape read-only intent even inside
+    // a SELECT/WITH/EXPLAIN wrapper (e.g. `SELECT * FROM x; ATTACH ...`).
+    // ATTACH DATABASE can read/write arbitrary files on the filesystem.
+    const BLOCKLIST: [&str; 8] = [
+        "ATTACH",
+        "DETACH",
+        "PRAGMA",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "REINDEX",
+        "SAVEPOINT",
+    ];
+    for kw in &BLOCKLIST {
+        if upper.contains(kw) {
+            return Err(format!(
+                "Query rejected: {kw} statements are not allowed via /raw_sql."
+            ));
+        }
+    }
+    // Block semicolons to prevent statement stacking / piggy-backed writes.
+    if normalized.contains(';') {
+        return Err(
+            "Query rejected: multiple statements (semicolons) are not allowed via /raw_sql."
+                .to_string(),
+        );
+    }
+
     // Only allow read-only queries — block writes via /raw_sql
     let trimmed = upper.trim_start();
     if !trimmed.starts_with("SELECT")
@@ -775,5 +803,28 @@ mod raw_sql_validation_tests {
         assert!(!contains_aggregate("SELECT ACCOUNT(X) FROM T"));
         assert!(contains_aggregate("SELECT COUNT(*) FROM T"));
         assert!(contains_aggregate("SELECT SUM(DURATION) FROM T"));
+    }
+
+    #[test]
+    fn blocks_attach_database() {
+        assert!(validate_raw_sql("ATTACH DATABASE '/etc/passwd' AS stolen LIMIT 1").is_err());
+        assert!(validate_raw_sql("SELECT 1 LIMIT 1; ATTACH DATABASE '/tmp/x.db' AS x").is_err());
+    }
+
+    #[test]
+    fn blocks_pragma() {
+        assert!(validate_raw_sql("PRAGMA table_info(frames)").is_err());
+    }
+
+    #[test]
+    fn blocks_semicolons() {
+        assert!(validate_raw_sql("SELECT 1 LIMIT 1; DROP TABLE frames").is_err());
+    }
+
+    #[test]
+    fn blocks_create_drop_alter() {
+        assert!(validate_raw_sql("CREATE TABLE evil (id INT)").is_err());
+        assert!(validate_raw_sql("DROP TABLE frames").is_err());
+        assert!(validate_raw_sql("ALTER TABLE frames ADD COLUMN x TEXT").is_err());
     }
 }

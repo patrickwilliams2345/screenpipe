@@ -443,6 +443,37 @@ pub(crate) async fn backup_handler(
             .into_owned()
     });
 
+    // Confine backups to the screenpipe data directory to prevent writing
+    // to arbitrary filesystem locations via path traversal.
+    let canonical_dest = std::path::Path::new(&dest)
+        .canonicalize()
+        .or_else(|_| {
+            // File doesn't exist yet — canonicalize the parent and append the filename.
+            let p = std::path::Path::new(&dest);
+            let parent = p.parent().unwrap_or(std::path::Path::new("."));
+            parent
+                .canonicalize()
+                .map(|c| c.join(p.file_name().unwrap_or_default()))
+        })
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": format!("invalid backup path: {}", e)})),
+            )
+        })?;
+    let canonical_dir = state
+        .screenpipe_dir
+        .canonicalize()
+        .unwrap_or_else(|_| state.screenpipe_dir.clone());
+    if !canonical_dest.starts_with(&canonical_dir) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            JsonResponse(
+                json!({"error": "backup path must be inside the screenpipe data directory"}),
+            ),
+        ));
+    }
+
     // Safety: don't overwrite an existing file
     if std::path::Path::new(&dest).exists() {
         return Err((

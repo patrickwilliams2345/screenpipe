@@ -179,6 +179,13 @@ pub struct ValidateMediaParams {
 pub async fn validate_media(file_path: &str) -> Result<()> {
     use tokio::fs::try_exists;
 
+    // Reject obvious path-traversal attempts before touching the filesystem.
+    if file_path.contains("..") {
+        return Err(anyhow::anyhow!(
+            "invalid media path: path traversal detected"
+        ));
+    }
+
     if !try_exists(file_path).await? {
         return Err(anyhow::anyhow!("media file does not exist: {}", file_path));
     }
