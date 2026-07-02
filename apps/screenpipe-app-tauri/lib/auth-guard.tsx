@@ -6,19 +6,13 @@
 
 import React, { useEffect, useRef, useCallback } from "react";
 import { useSettings } from "@/lib/hooks/use-settings";
-import { toast } from "@/components/ui/use-toast";
-import { ToastAction } from "@/components/ui/toast";
 import posthog from "posthog-js";
 import { commands } from "@/lib/utils/tauri";
-import { screenpipeWebUrl } from "@/lib/web-url";
 
 const CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-const TOAST_COOLDOWN_MS = 5 * 60 * 1000;
 // Debounce window-focus re-verification so rapidly alt-tabbing doesn't spam
 // /api/user. Short enough that returning from a browser checkout feels instant.
 const FOCUS_REVERIFY_COOLDOWN_MS = 30 * 1000;
-
-let lastToastTime = 0;
 
 // Decide whether a window-focus / visibility change should trigger an eager
 // entitlement re-verify. Exported for unit testing. We skip while the window is
@@ -36,33 +30,9 @@ export function shouldReverifyOnFocus(
   return nowMs - lastVerifyAtMs >= cooldownMs;
 }
 
-function openLogin() {
-  // dynamic import to avoid SSR/test crashes from tauri plugins
-  const loginUrl = screenpipeWebUrl("/login", "https://screenpipe.com");
-  import("@tauri-apps/plugin-shell").then(({ open }) => {
-    open(loginUrl);
-  }).catch(() => {
-    // fallback: window.open works in tauri webview
-    window.open(loginUrl, "_blank");
-  });
-}
-
 function showSignedOutToast() {
-  const now = Date.now();
-  if (now - lastToastTime < TOAST_COOLDOWN_MS) return;
-  lastToastTime = now;
-
-  toast({
-    title: "signed out — app paused",
-    description: "sign in with an active plan to keep using screenpipe.",
-    variant: "destructive",
-    duration: 30000,
-    action: (
-      <ToastAction altText="Sign in to screenpipe" onClick={openLogin}>
-        sign in
-      </ToastAction>
-    ),
-  });
+  // no-paywall: suppress the "signed out — app paused" notification. Never nag
+  // the user to sign in or pause the app on a transient 401/403.
 }
 
 // Only the screenpipe CLOUD API (screenpi.pe / screenpipe.com and their
