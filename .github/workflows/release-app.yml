@@ -919,9 +919,11 @@ jobs:
         if: matrix.os_type == 'macos'
         shell: bash
         env:
-          # no-paywall: updater disabled in tauri.conf.json (no fork TAURI_PRIVATE_KEY
-          # secret). Do not inject the empty signing-key env here — tauri's signer
-          # would try to decode "" and fail with "Missing comment in secret key".
+          # Fork has its own TAURI_PRIVATE_KEY secret (keypair at ~/.tauri/screenpipe-fork.key).
+          # Pass it to tauri build so the bundler can sign the .app.tar.gz updater artifact
+          # with the fork pubkey in tauri.prod.conf.json:61.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
           # for release
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # for macos signing - cert is pre-imported into build keychain above,
