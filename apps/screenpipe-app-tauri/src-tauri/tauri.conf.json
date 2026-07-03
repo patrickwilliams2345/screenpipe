@@ -46,10 +46,6 @@
     }
   },
   "plugins": {
-    "updater": {
-      "endpoints": [],
-      "pubkey": ""
-    },
     "deep-link": {
       "desktop": {
         "schemes": [

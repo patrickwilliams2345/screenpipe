@@ -1540,14 +1540,16 @@ fn run_app_observer(
 }
 
 fn get_focused_app_info() -> Option<(i32, String)> {
-    let sys = ax::UiElement::sys_wide();
-    let app = sys.focused_app().ok()?;
-    let pid = app.pid().ok()?;
-    let name = ns::RunningApp::with_pid(pid)
-        .and_then(|app| app.localized_name())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "?".to_string());
-    Some((pid, name))
+    cidre::objc::ar_pool(|| {
+        let sys = ax::UiElement::sys_wide();
+        let app = sys.focused_app().ok()?;
+        let pid = app.pid().ok()?;
+        let name = ns::RunningApp::with_pid(pid)
+            .and_then(|app| app.localized_name())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        Some((pid, name))
+    })
 }
 
 // ============================================================================

@@ -168,41 +168,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # GitHub-hosted macOS 26 runner for Apple Silicon
+          # GitHub-hosted macOS 26 runner for Apple Silicon (arm64 only)
           - platform: ${{ needs.check_commit.outputs.macos_arm_runner || 'macos-latest' }}
             args: "--target aarch64-apple-darwin --features metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml"
             target: aarch64-apple-darwin
             tauri-args: "--target aarch64-apple-darwin --features metal,parakeet-mlx,rfdetr-mlx,redact-onnx-coreml,official-build"
             os_type: "macos"
-          - platform: "macos-26"
-            args: "--target x86_64-apple-darwin --features metal,redact-onnx-coreml"
-            target: x86_64-apple-darwin
-            tauri-args: "--target x86_64-apple-darwin --features metal,redact-onnx-coreml,official-build"
-            os_type: "macos"
-          - platform: ${{ needs.check_commit.outputs.windows_runner || 'windows-2022' }}
-            args: "--target x86_64-pc-windows-msvc"
-            pre-build-args: ""
-            tauri-args: "--target x86_64-pc-windows-msvc --features official-build,directml,redact-onnx-directml"
-            target: x86_64-pc-windows-msvc
-            os_type: "windows"
-          - platform: windows-11-arm
-            args: "--target aarch64-pc-windows-msvc"
-            pre-build-args: ""
-            tauri-args: "--target aarch64-pc-windows-msvc --features official-build,directml,redact-onnx-directml"
-            target: aarch64-pc-windows-msvc
-            os_type: "windows"
-          - platform: "ubuntu-24.04"
-            args: "--target x86_64-unknown-linux-gnu --features redact-onnx-cpu"
-            target: x86_64-unknown-linux-gnu
-            tauri-args: "--target x86_64-unknown-linux-gnu --features official-build,redact-onnx-cpu"
-            os_type: "linux"
 
     runs-on: ${{ matrix.platform == 'windows-desktop-test' && fromJSON('["self-hosted", "windows-desktop-test"]') || matrix.platform }}
     timeout-minutes: 120
     steps:
       - name: Enable Git long paths on Windows
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
           Write-Host "Enabling git core.longpaths..."
           # Use --global instead of --system to avoid permission issues on self-hosted runners
@@ -224,7 +202,7 @@ jobs:
 
       - name: Shorten target dir to avoid MAX_PATH (Windows)
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
           # vulkan-shaders-gen ExternalProject creates deeply nested paths
           # that exceed the 260-char Windows MAX_PATH limit when built under
@@ -272,21 +250,21 @@ jobs:
 
       - name: Install Rust (Windows x64)
         if: matrix.os_type == 'windows' && matrix.target == 'x86_64-pc-windows-msvc'
-        shell: powershell
+        shell: pwsh
         run: |
           Invoke-WebRequest https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe -OutFile rustup-init.exe
           .\rustup-init.exe -y
 
       - name: Install Rust (Windows ARM64 native)
         if: matrix.os_type == 'windows' && matrix.target == 'aarch64-pc-windows-msvc'
-        shell: powershell
+        shell: pwsh
         run: |
           Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
           .\rustup-init.exe -y
 
       - name: setup rust path
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
           $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
           echo "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -499,7 +477,7 @@ jobs:
 
       - name: Install Ninja (ARM64)
         if: matrix.os_type == 'windows' && matrix.target == 'aarch64-pc-windows-msvc'
-        shell: powershell
+        shell: pwsh
         run: |
           # The windows-11-arm runner image pre-installs Ninja at C:\Tools\Ninja
           # but winget is NOT on PATH by default - so blindly calling
@@ -534,7 +512,7 @@ jobs:
 
       - name: Verify Windows download support
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         env:
           SKIP_SCREENPIPE_SETUP: true
         run: |
@@ -779,6 +757,7 @@ jobs:
                   squashfs-root/usr/lib/libpcre2-8.so* \
                   squashfs-root/usr/lib/libsharpyuv.so* \
                   squashfs-root/usr/lib/libavif.so*
+            install -m 0755 src-tauri/bun-x86_64-unknown-linux-gnu squashfs-root/usr/bin/bun
             echo "Removed bundled GLib libs, repacking AppImage..."
             ARCH=x86_64 /tmp/appimagetool squashfs-root "$APPIMAGE"
             rm -rf squashfs-root
@@ -807,7 +786,7 @@ jobs:
 
       - name: Install CodeSignTool for SSL.com EV signing (Windows)
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
           # 1. CodeSignTool: signs the inner binaries + final NSIS installer
           #    via SSL.com eSigner (called by Tauri's signCommand wrapper).
@@ -846,7 +825,7 @@ jobs:
       - name: Build (Windows)
         if: matrix.os_type == 'windows'
         working-directory: apps/screenpipe-app-tauri
-        shell: powershell
+        shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
@@ -903,7 +882,7 @@ jobs:
         # transient SSL.com CSC API failures (HTML-instead-of-JSON,
         # "Unexpected character (<) at position 0").
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         env:
           ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
           ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
@@ -940,18 +919,20 @@ jobs:
         if: matrix.os_type == 'macos'
         shell: bash
         env:
-          # for updater
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          # no-paywall: updater disabled in tauri.conf.json (no fork TAURI_PRIVATE_KEY
+          # secret). Do not inject the empty signing-key env here — tauri's signer
+          # would try to decode "" and fail with "Missing comment in secret key".
           # for release
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # for macos signing - cert is pre-imported into build keychain above,
           # so we do NOT pass APPLE_CERTIFICATE (which would create a temp keychain
           # that conflicts with our build keychain setup)
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # no-paywall: skip notarization (Apple Development cert is not
+          # notarizable; we only sign). Do NOT pass APPLE_ID/APPLE_PASSWORD/
+          # APPLE_TEAM_ID here — tauri's bundler treats their presence as a
+          # request to notarize and fails with "Team ID must be at least 3
+          # characters" when they are empty.
           # Keep CI=true while allowing Tauri's DMG bundler to render the
           # background image and icon layout.
           # See: https://github.com/tauri-apps/tauri-action/issues/740
@@ -1341,7 +1322,7 @@ jobs:
           security list-keychain -d user -s ~/Library/Keychains/login.keychain-db 2>/dev/null || true
 
       - name: Notarize and staple DMGs (macOS)
-        if: matrix.os_type == 'macos'
+        if: matrix.os_type == 'macos' && false  # no-paywall: skip notarization (Apple Development cert)
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -1371,7 +1352,7 @@ jobs:
           done
 
       - name: Staple .app and rebuild updater tarball (macOS)
-        if: matrix.os_type == 'macos'
+        if: matrix.os_type == 'macos' && false  # no-paywall: skip notarization (Apple Development cert)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
@@ -1554,7 +1535,7 @@ jobs:
 
       - name: Upload to Cloudflare R2 (Windows)
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -1641,7 +1622,7 @@ jobs:
       - name: Upload debug symbols to Sentry (Windows)
         if: matrix.os_type == 'windows'
         continue-on-error: true
-        shell: powershell
+        shell: pwsh
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_ORG: mediar

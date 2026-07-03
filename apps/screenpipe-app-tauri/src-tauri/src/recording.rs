@@ -71,13 +71,9 @@ fn build_config(app: &tauri::AppHandle) -> Result<RecordingConfig, String> {
     Ok(store.to_recording_config(data_dir))
 }
 
-fn require_app_entitlement(store: &SettingsStore) -> Result<(), String> {
-    if store.app_entitled_or_dev() {
-        return Ok(());
-    }
-
-    crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
-    Err("subscription_required: active screenpipe plan required to start recording".to_string())
+fn require_app_entitlement(_store: &SettingsStore) -> Result<(), String> {
+    // no-paywall: bypass is always granted. See store.rs::app_entitled_or_dev.
+    Ok(())
 }
 
 pub fn notify_audio_engine_fallback(store: &SettingsStore) {
@@ -220,17 +216,22 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
     if let WedgeAction::GiveUp { notify } = action {
         error!(
             "db wedge auto-recovery: {} restarts within {:?} did not clear the write wedge — \
-             this looks like on-disk corruption a restart can't repair. Auto-restart suspended; \
-             quit screenpipe and run `screenpipe db recover`.",
+             in-process restarts can't fix this (poisoned WAL-index pinned by a leaked \
+             connection, or on-disk damage). Escalating to app self-relaunch.",
             DB_WEDGE_MAX_RESTARTS, DB_WEDGE_BREAKER_WINDOW
         );
         if notify {
-            // Publish on the event bus; the in-process `db_recovery_notifications`
-            // subscriber turns it into a notification (NOT the `/ws/events`
-            // bridge — the engine is down exactly when this fires). Deduped to
-            // once per episode by the breaker.
-            let evt = screenpipe_events::DbRecoveryEvent::needs_recovery();
-            let _ = screenpipe_events::send_event(evt.event_name(), evt);
+            // In-process restarts are proven futile for this episode — the one
+            // thing that reliably clears process-pinned SQLite state is a full
+            // app relaunch (what users had to do by hand on 2026-07-02).
+            // Rate-limited; when the relaunch budget is spent it falls back to
+            // the `needs_recovery` notification. Deduped to once per episode
+            // by the breaker.
+            crate::db_relaunch::escalate_relaunch(
+                &app,
+                "db wedge persisted across in-process engine restarts",
+            )
+            .await;
         }
         return;
     }
@@ -264,6 +265,11 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
         error!("db wedge auto-recovery: spawn_screenpipe failed: {}", e);
         let evt = screenpipe_events::DbRecoveryEvent::restart_failed();
         let _ = screenpipe_events::send_event(evt.event_name(), evt);
+        // A DB-init failure right after a full pool close means the WAL-index
+        // is pinned by something outside our teardown — count it toward the
+        // app self-relaunch threshold rather than waiting for the health
+        // watchdog to grind through more doomed respawns.
+        crate::db_relaunch::note_respawn_failure(&app, &e).await;
     }
 }
 
@@ -955,8 +961,13 @@ pub async fn spawn_screenpipe(
                         return Ok(());
                     }
                     drop(capture_guard);
-                    // Start capture on existing server
-                    return start_capture_internal(&state, &app).await;
+                    // Start capture on existing server. If this fails before
+                    // start_capture_internal reaches its success cleanup, clear
+                    // startup flags so the next retry is not wedged.
+                    let result = start_capture_internal(&state, &app).await;
+                    state.is_starting.store(false, Ordering::SeqCst);
+                    state.is_starting_capture.store(false, Ordering::SeqCst);
+                    return result;
                 }
                 _ => {
                     warn!("Server exists but not responding, will do full restart");
