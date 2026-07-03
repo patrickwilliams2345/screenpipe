@@ -113,6 +113,23 @@ Replace the `Upload to Cloudflare R2 (macOS)` step with `actions/upload-artifact
 
 The `.app`, `.dmg`, `.tar.gz`, and `.sig` are then downloadable from the Actions run page for 90 days.
 
+### Skip upstream-only website changelog dispatch
+
+The `generate-changelog` job dispatches to `screenpipe/website` with `WEBSITE_REPO_TOKEN`. The fork does not have that upstream website token, so the app build can succeed and the workflow still goes red at the end with:
+
+```text
+Parameter token or opts.auth is required
+```
+
+Gate the job to upstream only:
+
+```yaml
+generate-changelog:
+  needs: [check_commit, publish-tauri]
+  # no-paywall: fork does not have screenpipe/website dispatch credentials.
+  if: github.repository == 'screenpipe/screenpipe' && (github.event_name == 'workflow_dispatch' || needs.check_commit.outputs.should_release == 'true')
+```
+
 ---
 
 ## 4. Workflow: arm64-only + skip notarization

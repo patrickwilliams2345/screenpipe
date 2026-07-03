@@ -1543,7 +1543,8 @@ jobs:
 
   generate-changelog:
     needs: [check_commit, publish-tauri]
-    if: github.event_name == 'workflow_dispatch' || needs.check_commit.outputs.should_release == 'true'
+    # no-paywall: fork does not have screenpipe/website dispatch credentials.
+    if: github.repository == 'screenpipe/screenpipe' && (github.event_name == 'workflow_dispatch' || needs.check_commit.outputs.should_release == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

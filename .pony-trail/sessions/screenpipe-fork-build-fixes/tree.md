@@ -1,0 +1,2 @@
+- 20260703T161619Z-changelog-skip pre: skip upstream website changelog dispatch for fork release workflow
+- 20260703T161619Z-changelog-skip post: generate-changelog gated to upstream only; shellcheck OK; verify PASS=21 FAIL=0 SKIP=0

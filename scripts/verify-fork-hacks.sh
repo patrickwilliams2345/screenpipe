@@ -7,7 +7,7 @@
 # On other machines, those 3 checks SKIP (not FAIL) — set SKIP_PUBKEY=1 to silence.
 
 set -u
-cd "$(git rev-parse --show-toplevel 2>/dev/null)" || cd "$(dirname "$0")/.."
+cd "$(git rev-parse --show-toplevel 2>/dev/null)" || cd "$(dirname "$0")/.." || exit 1
 
 P=0; F=0; S=0
 chk() { if eval "$2"; then echo "PASS: $1"; P=$((P+1)); else echo "FAIL: $1"; F=$((F+1)); fi; }
@@ -33,6 +33,7 @@ chk "showSignedOutToast is no-op" \
 PUBKEY_FILE="$HOME/.tauri/screenpipe-fork.key.pub"
 if [ -f "$PUBKEY_FILE" ]; then
   PUBKEY=$(cat "$PUBKEY_FILE")
+  export PUBKEY
   for f in tauri.prod.conf.json tauri.beta.conf.json tauri.enterprise.conf.json; do
     chk "$f carries fork pubkey" \
       "grep -qF \"\$PUBKEY\" apps/screenpipe-app-tauri/src-tauri/$f"
@@ -50,6 +51,8 @@ chk "upload-artifact step present" \
   "grep -q 'actions/upload-artifact@v4' .github/workflows/release-app.yml"
 chk "TAURI_SIGNING_PRIVATE_KEY in build env" \
   "grep -q 'TAURI_SIGNING_PRIVATE_KEY: \${{ secrets.TAURI_PRIVATE_KEY }}' .github/workflows/release-app.yml"
+chk "generate-changelog gated to upstream repo" \
+  "grep -A3 '^  generate-changelog:' .github/workflows/release-app.yml | grep -q \"github.repository == 'screenpipe/screenpipe'\""
 
 # --- 4. Workflow: arm64-only + skip notarization ---
 # Matrix entries use `target: <triple>` — count non-arm64 target lines (should be 0).
@@ -63,6 +66,7 @@ chk "staple .app step disabled" \
 # --- 5. Fork secrets (requires gh CLI) ---
 if command -v gh >/dev/null 2>&1; then
   SECRETS=$(gh secret list --repo patrickwilliams2345/screenpipe 2>/dev/null || echo "")
+  export SECRETS
   for s in TAURI_PRIVATE_KEY TAURI_KEY_PASSWORD APPLE_CERTIFICATE APPLE_SIGNING_IDENTITY; do
     chk "secret $s present" "echo \"\$SECRETS\" | grep -q \"^$s\\b\""
   done
