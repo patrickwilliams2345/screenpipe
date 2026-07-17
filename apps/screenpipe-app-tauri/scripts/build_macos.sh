@@ -12,7 +12,7 @@ APP_PATH="src-tauri/target/release/bundle/macos/screenpipe - Development.app"
 xattr -cr "$APP_PATH"
 
 # Sign the app manually
-IDENTITY="Apple Development: Louis Beaumont (NJ372MT773)"
+IDENTITY="Apple Development: Patrick Williams (WMYU5WUW3N)"
 codesign --force --deep --sign "$IDENTITY" "$APP_PATH"
 
 echo "Build completed successfully!"
