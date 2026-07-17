@@ -8,7 +8,7 @@ rm -rf src-tauri/target/release/bundle
 bun tauri build --no-sign
 
 # Strip extended attributes from all files in the bundle
-APP_PATH="src-tauri/target/release/bundle/macos/screenpipe - Development.app"
+APP_PATH="src-tauri/target/release/bundle/macos/screenpipe.app"
 xattr -cr "$APP_PATH"
 
 # Sign the app manually
