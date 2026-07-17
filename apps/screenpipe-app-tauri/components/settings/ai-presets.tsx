@@ -688,10 +688,15 @@ const AISection = ({
       }));
     } else {
       // Local custom providers often do not implement browser CORS preflight on /models.
-      const modelsFetchFn =
-        settingsPreset?.provider === "custom" && isLocalhostUrl(settingsPreset?.url)
-          ? tauriFetch
-          : fetch;
+      // Try native fetch first (to bypass Tauri scope limits for custom ports), fall back to tauriFetch if it fails (e.g. CORS).
+      const modelsFetchFn = async (url: string, init?: RequestInit) => {
+        try {
+          return await fetch(url, init);
+        } catch (err) {
+          console.warn("native fetch failed, falling back to tauriFetch:", err);
+          return await tauriFetch(url, init);
+        }
+      };
       try {
         modelsResponse = await modelsFetchFn(modelsUrl, {
           headers,
@@ -964,7 +969,15 @@ const AISection = ({
           break;
         case "custom":
           try {
-            const customFetchFn = isLocalhostUrl(settingsPreset?.url) ? tauriFetch : fetch;
+            // Try native fetch first (to bypass Tauri scope limits for custom ports), fall back to tauriFetch if it fails (e.g. CORS).
+            const customFetchFn = async (url: string, init?: RequestInit) => {
+              try {
+                return await fetch(url, init);
+              } catch (err) {
+                console.warn("native fetch failed for custom models, falling back to tauriFetch:", err);
+                return await tauriFetch(url, init);
+              }
+            };
             const customResponse = await customFetchFn(
               `${settingsPreset?.url}/models`,
               {
